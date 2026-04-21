@@ -1,0 +1,2149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Deadfall // host topology</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0e0a;
+    --bg-2: #0f1510;
+    --bg-3: #141b16;
+    --panel: #0d1410;
+    --border: #1f2e24;
+    --border-hot: #2a3f31;
+    --text: #cfe8d6;
+    --text-dim: #6f8478;
+    --text-faint: #3f5348;
+    --amber: #ffb347;
+    --amber-hot: #ffcf6b;
+    --danger: #ff4757;
+    --danger-soft: #c93442;
+    --accent: #5cffa8;
+    --accent-dim: #2a9e68;
+    --warn: #ffd93d;
+    --private: #7cb9e8;
+    --public: #ff8c6a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background:
+      radial-gradient(ellipse 70% 50% at 30% 20%, rgba(92,255,168,0.035), transparent 60%),
+      radial-gradient(ellipse 50% 40% at 80% 80%, rgba(255,179,71,0.025), transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  body::after {
+    content: '';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(92,255,168,0.015) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(92,255,168,0.015) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  #app {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: 280px 1fr 380px;
+    grid-template-rows: 44px 1fr;
+    height: 100vh;
+    gap: 0;
+  }
+  header {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    padding: 0 18px;
+    background: linear-gradient(90deg, var(--bg-2), var(--bg));
+    border-bottom: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 0.04em;
+  }
+  header .brand {
+    font-weight: 800;
+    font-size: 13px;
+    color: var(--amber);
+    text-transform: uppercase;
+  }
+  header .brand::before {
+    content: '▸';
+    color: var(--accent);
+    margin-right: 8px;
+  }
+  header .divider { color: var(--text-faint); margin: 0 14px; }
+  header .file { color: var(--text-dim); font-size: 11px; }
+  header .stats {
+    margin-left: auto;
+    display: flex;
+    gap: 18px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  header .stats b { color: var(--text); font-weight: 500; }
+  header .stats .warn b { color: var(--danger); }
+
+  .sidebar {
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 16px 14px;
+  }
+  .section-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--text-faint);
+    margin: 0 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px dashed var(--border);
+  }
+  .section-title::before {
+    content: '░ ';
+    color: var(--accent-dim);
+  }
+  .filter-group { margin-bottom: 22px; }
+  .filter-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 0;
+    cursor: pointer;
+    user-select: none;
+  }
+  .filter-row input[type="checkbox"] {
+    appearance: none;
+    width: 12px; height: 12px;
+    border: 1px solid var(--border-hot);
+    background: var(--bg-3);
+    cursor: pointer;
+    position: relative;
+  }
+  .filter-row input[type="checkbox"]:checked {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .filter-row input[type="checkbox"]:checked::after {
+    content: '✓';
+    position: absolute;
+    top: -3px; left: 1px;
+    color: var(--bg);
+    font-size: 10px;
+    font-weight: bold;
+  }
+  .filter-row label { color: var(--text-dim); cursor: pointer; flex: 1; }
+  .filter-row .count { color: var(--text-faint); font-size: 10px; }
+  .filter-row:hover label { color: var(--text); }
+
+  input[type="text"] {
+    width: 100%;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 10px;
+    font-family: inherit;
+    font-size: 11px;
+    outline: none;
+  }
+  input[type="text"]:focus { border-color: var(--accent-dim); }
+
+  .legend { display: flex; flex-direction: column; gap: 6px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text-dim); }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+
+  #graph-wrap {
+    position: relative;
+    background: var(--bg);
+    overflow: hidden;
+  }
+  #graph { width: 100%; height: 100%; cursor: grab; }
+  #graph:active { cursor: grabbing; }
+  .controls {
+    position: absolute;
+    top: 14px; left: 14px;
+    display: flex;
+    gap: 6px;
+    z-index: 5;
+  }
+  .btn {
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 5px 10px;
+    font-family: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn:hover {
+    border-color: var(--accent-dim);
+    color: var(--accent);
+  }
+  .btn.active {
+    background: var(--accent-dim);
+    color: var(--bg);
+    border-color: var(--accent);
+  }
+
+  .graph-overlay {
+    position: absolute;
+    bottom: 14px; left: 14px;
+    font-size: 10px;
+    color: var(--text-faint);
+    background: rgba(10,14,10,0.7);
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    z-index: 5;
+    line-height: 1.6;
+  }
+
+  .detail {
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 16px 16px 40px;
+  }
+  .detail.empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-faint);
+    font-size: 11px;
+    text-align: center;
+    padding: 40px;
+  }
+  .detail.empty::before {
+    content: '// select a node to inspect';
+    white-space: pre-wrap;
+  }
+  .ip-header {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .ip-header .ip {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--amber-hot);
+    letter-spacing: -0.01em;
+  }
+  .ip-header .tag {
+    font-size: 9px;
+    padding: 2px 6px;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .tag.private { color: var(--private); border-color: var(--private); }
+  .tag.public { color: var(--public); border-color: var(--public); }
+  .tag.danger { color: var(--danger); border-color: var(--danger); background: rgba(255,71,87,0.08); }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background: var(--border);
+    margin: 14px 0;
+  }
+  .stat-cell {
+    background: var(--bg-3);
+    padding: 8px 10px;
+  }
+  .stat-cell .label {
+    font-size: 9px;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    letter-spacing: 0.1em;
+  }
+  .stat-cell .val {
+    font-size: 14px;
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  .detail h3 {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--amber);
+    margin: 18px 0 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px dashed var(--border-hot);
+  }
+  .detail h3::before { content: '┣━ '; color: var(--text-faint); }
+
+  .chip-row { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chip {
+    padding: 2px 7px;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+  .chip.encrypted { border-color: var(--accent-dim); color: var(--accent); }
+  .chip.plaintext {
+    border-color: var(--danger-soft);
+    color: var(--danger);
+    background: rgba(255,71,87,0.08);
+  }
+  .chip.plaintext::before { content: '⚠ '; }
+
+  .flow-list { font-size: 11px; }
+  .flow-item {
+    padding: 6px 8px;
+    border-left: 2px solid var(--border);
+    margin-bottom: 4px;
+    background: var(--bg-3);
+    font-size: 10px;
+    cursor: pointer;
+    transition: all 0.1s;
+  }
+  .flow-item:hover {
+    border-left-color: var(--accent);
+    background: var(--bg-2);
+  }
+  .flow-item.plaintext { border-left-color: var(--danger); }
+  .flow-item .peer { color: var(--amber); font-weight: 500; }
+  .flow-item .meta { color: var(--text-faint); font-size: 9px; margin-top: 2px; }
+
+  .whois-box {
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    padding: 10px;
+    font-size: 10px;
+    margin: 8px 0;
+  }
+  .whois-box .row { display: flex; margin: 3px 0; gap: 8px; }
+  .whois-box .k { color: var(--text-faint); min-width: 80px; text-transform: uppercase; letter-spacing: 0.05em; font-size: 9px; }
+  .whois-box .v { color: var(--text); font-size: 10px; }
+  .whois-loading { color: var(--text-faint); font-style: italic; font-size: 10px; }
+
+  .plaintext-sample {
+    background: rgba(255,71,87,0.05);
+    border: 1px solid var(--danger-soft);
+    border-left-width: 3px;
+    padding: 8px 10px;
+    margin: 6px 0;
+    font-size: 10px;
+  }
+  .plaintext-sample .sample-head {
+    color: var(--danger);
+    font-weight: 700;
+    margin-bottom: 4px;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .plaintext-sample .sample-body {
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 120px;
+    overflow-y: auto;
+    background: var(--bg);
+    padding: 6px 8px;
+    border-left: 1px dashed var(--danger-soft);
+  }
+
+  .cred-card {
+    background: linear-gradient(135deg, rgba(255,71,87,0.08), rgba(255,179,71,0.04));
+    border: 1px solid var(--danger-soft);
+    border-left: 3px solid var(--danger);
+    padding: 8px 10px;
+    margin: 6px 0;
+    font-size: 10px;
+    position: relative;
+  }
+  .cred-card::after {
+    content: 'CRED';
+    position: absolute;
+    top: 4px; right: 6px;
+    font-size: 8px;
+    letter-spacing: 0.15em;
+    color: var(--danger);
+    opacity: 0.6;
+    font-weight: 800;
+  }
+  .cred-card .kind {
+    color: var(--amber-hot);
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+  }
+  .cred-card .kind::before {
+    content: '▸ ';
+    color: var(--danger);
+  }
+  .cred-card .flow {
+    color: var(--text-dim);
+    font-size: 9px;
+    margin-bottom: 4px;
+  }
+  .cred-card .field {
+    display: flex;
+    gap: 8px;
+    padding: 2px 0;
+  }
+  .cred-card .field .k {
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-size: 9px;
+    min-width: 64px;
+  }
+  .cred-card .field .v {
+    color: var(--accent);
+    font-family: 'JetBrains Mono', monospace;
+    word-break: break-all;
+    font-weight: 500;
+  }
+  .cred-card .field .v.pw {
+    color: var(--danger);
+    background: rgba(255,71,87,0.12);
+    padding: 0 4px;
+  }
+
+  .finding-card {
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border-hot);
+    padding: 8px 10px;
+    margin: 6px 0;
+    font-size: 10px;
+  }
+  .finding-card .fc-head {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    margin-bottom: 4px;
+  }
+  .finding-card .sev {
+    font-size: 8px;
+    font-weight: 800;
+    letter-spacing: 0.15em;
+    padding: 1px 6px;
+    text-transform: uppercase;
+  }
+  .finding-card .sev.critical { color: #fff; background: var(--danger); }
+  .finding-card .sev.high { color: var(--danger); border: 1px solid var(--danger); }
+  .finding-card .sev.medium { color: var(--amber); border: 1px solid var(--amber); }
+  .finding-card .sev.low { color: var(--warn); border: 1px solid var(--warn); }
+  .finding-card .sev.info { color: var(--text-dim); border: 1px solid var(--border-hot); }
+  .finding-card.critical { border-left-color: var(--danger); background: rgba(255,71,87,0.05); }
+  .finding-card.high { border-left-color: var(--danger-soft); }
+  .finding-card.medium { border-left-color: var(--amber); }
+  .finding-card.low { border-left-color: var(--warn); }
+  .finding-card.info { border-left-color: var(--text-faint); }
+  .finding-card .cat {
+    font-size: 9px;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .finding-card .fc-title {
+    color: var(--amber-hot);
+    font-weight: 700;
+    font-size: 11px;
+    margin-bottom: 4px;
+  }
+  .finding-card .fc-desc {
+    color: var(--text);
+    line-height: 1.55;
+    margin-bottom: 6px;
+  }
+  .finding-card .fc-meta {
+    color: var(--text-faint);
+    font-size: 9px;
+    margin-top: 4px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .finding-card .fc-meta b { color: var(--text-dim); font-weight: 500; }
+  .finding-card .fc-remed {
+    font-size: 9px;
+    color: var(--accent);
+    margin-top: 4px;
+    border-top: 1px dashed var(--border);
+    padding-top: 4px;
+  }
+  .finding-card .fc-remed::before {
+    content: 'fix ▸ ';
+    color: var(--accent-dim);
+    font-weight: 700;
+  }
+  .finding-card .fc-ev {
+    font-family: 'JetBrains Mono', monospace;
+    background: var(--bg);
+    padding: 3px 6px;
+    color: var(--text-dim);
+    word-break: break-all;
+  }
+
+  .sev-pill {
+    display: inline-block;
+    padding: 1px 5px;
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    margin-right: 4px;
+    font-weight: 700;
+  }
+  .sev-pill.critical { color: #fff; background: var(--danger); }
+  .sev-pill.high { color: var(--danger); border: 1px solid var(--danger); }
+  .sev-pill.medium { color: var(--amber); border: 1px solid var(--amber); }
+  .sev-pill.low { color: var(--warn); border: 1px solid var(--warn); }
+  .sev-pill.info { color: var(--text-dim); border: 1px solid var(--border-hot); }
+
+  .cat-filter {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 10px;
+  }
+  .cat-filter .btn { font-size: 9px; padding: 3px 8px; }
+
+  .pkt-table {
+    font-size: 10px;
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .pkt-table th, .pkt-table td {
+    text-align: left;
+    padding: 3px 6px;
+    border-bottom: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    white-space: nowrap;
+  }
+  .pkt-table th {
+    color: var(--text-faint);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 500;
+    background: var(--bg-2);
+    position: sticky;
+    top: 0;
+  }
+  .pkt-table tr.pkt-row { cursor: pointer; transition: background 0.1s; }
+  .pkt-table tr.pkt-row:hover td { background: var(--bg-3); }
+  .pkt-table tr.pkt-row.selected td { background: rgba(92,255,168,0.08); color: var(--accent); }
+  .pkt-table td.preview {
+    color: var(--text-faint);
+    font-size: 9px;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pkt-flag {
+    display: inline-block;
+    font-size: 9px;
+    padding: 0 4px;
+    background: var(--bg-3);
+    border: 1px solid var(--border-hot);
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+  }
+  .pkt-flag.syn { color: var(--accent); border-color: var(--accent-dim); }
+  .pkt-flag.rst { color: var(--danger); border-color: var(--danger-soft); }
+  .pkt-flag.fin { color: var(--amber); border-color: var(--amber); }
+  .pkt-flag.psh { color: var(--warn); }
+
+  .pkt-detail {
+    margin: 8px 0;
+    background: var(--bg-2);
+    border: 1px solid var(--border-hot);
+    padding: 10px;
+  }
+  .pkt-detail-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px dashed var(--border);
+  }
+  .pkt-detail-head .pkid {
+    color: var(--amber-hot);
+    font-weight: 700;
+    font-size: 12px;
+  }
+  .pkt-fields {
+    display: grid;
+    grid-template-columns: 90px 1fr;
+    gap: 4px 10px;
+    font-size: 10px;
+    margin-bottom: 10px;
+  }
+  .pkt-fields .k {
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 9px;
+  }
+  .pkt-fields .v { color: var(--text); }
+  .pkt-fields .v a { color: var(--amber); text-decoration: none; }
+
+  .hexdump {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    background: var(--bg);
+    padding: 8px;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    white-space: pre;
+    overflow-x: auto;
+    line-height: 1.4;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+  .hexdump .hex { color: var(--accent); }
+  .hexdump .ascii { color: var(--amber); }
+  .hexdump .off { color: var(--text-faint); }
+
+  .dump-toggle {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 4px;
+  }
+
+  .nav-crumbs {
+    font-size: 10px;
+    color: var(--text-faint);
+    margin-bottom: 8px;
+  }
+  .nav-crumbs a {
+    color: var(--text-dim);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .nav-crumbs a:hover { color: var(--accent); }
+  .nav-crumbs .sep { margin: 0 6px; color: var(--text-faint); }
+
+  .flow-item { position: relative; }
+  .flow-item .pkt-btn {
+    position: absolute;
+    right: 6px;
+    top: 6px;
+    font-size: 9px;
+    padding: 1px 6px;
+    background: var(--bg-2);
+    border: 1px solid var(--border-hot);
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .flow-item .pkt-btn:hover { color: var(--accent); border-color: var(--accent-dim); }
+
+  .link { cursor: pointer; }
+  .link.highlight-flow { stroke-opacity: 1; stroke-width: 3px !important; }
+
+  .live-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 8px;
+    border: 1px solid var(--danger-soft);
+    color: var(--danger);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    font-weight: 700;
+    margin-left: 12px;
+  }
+  .live-indicator.off {
+    border-color: var(--border-hot);
+    color: var(--text-faint);
+  }
+  .live-indicator.err {
+    border-color: var(--warn);
+    color: var(--warn);
+  }
+  .live-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--danger);
+    box-shadow: 0 0 6px var(--danger);
+    animation: live-pulse 1.2s ease-in-out infinite;
+  }
+  .live-indicator.off .live-dot { background: var(--text-faint); box-shadow: none; animation: none; }
+  .live-indicator.err .live-dot { background: var(--warn); box-shadow: 0 0 6px var(--warn); animation: live-pulse 1.2s ease-in-out infinite; }
+  @keyframes live-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  .live-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 10px;
+  }
+  .live-panel select, .live-panel input[type="text"] {
+    width: 100%;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 6px;
+    font-family: inherit;
+    font-size: 10px;
+  }
+  .live-panel .live-err {
+    color: var(--warn);
+    font-size: 9px;
+    word-break: break-word;
+  }
+  .live-panel .live-save-info {
+    color: var(--text-faint);
+    font-size: 9px;
+    word-break: break-all;
+  }
+  .live-panel .live-save-info.recording { color: var(--danger); }
+  .btn.recording { color: var(--danger); border-color: var(--danger-soft); }
+
+  #modal-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.65);
+    backdrop-filter: blur(2px);
+    z-index: 999;
+    display: none;
+  }
+  .modal {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--panel);
+    border: 1px solid var(--accent-dim);
+    padding: 20px 22px 18px;
+    min-width: 380px;
+    max-width: 520px;
+    z-index: 1000;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.7);
+    display: none;
+    font-family: inherit;
+  }
+  .modal h3 {
+    margin: 0 0 12px;
+    color: var(--amber);
+    font-size: 13px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .modal h3::before { content: '▸ '; color: var(--accent); }
+  .modal .body {
+    color: var(--text);
+    font-size: 11px;
+    line-height: 1.6;
+    margin-bottom: 14px;
+  }
+  .modal .body .path {
+    color: var(--text-faint);
+    word-break: break-all;
+    font-size: 10px;
+    background: var(--bg-3);
+    padding: 6px 8px;
+    margin-top: 6px;
+    border-left: 2px solid var(--accent-dim);
+  }
+  .modal .actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+  .modal .actions .btn.primary {
+    background: var(--accent-dim);
+    color: var(--bg);
+    border-color: var(--accent);
+  }
+  .modal .actions .btn.primary:hover { background: var(--accent); color: var(--bg); }
+  .modal .actions a.btn { text-decoration: none; display: inline-block; }
+  .btn.recording::before {
+    content: '';
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--danger);
+    margin-right: 4px;
+    animation: live-pulse 1.2s ease-in-out infinite;
+    vertical-align: middle;
+  }
+
+  .tooltip {
+    position: absolute;
+    background: var(--bg-2);
+    border: 1px solid var(--accent-dim);
+    padding: 6px 10px;
+    font-size: 10px;
+    pointer-events: none;
+    z-index: 100;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    color: var(--text);
+  }
+
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border-hot); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+
+  .loading-screen {
+    position: fixed; inset: 0;
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 14px;
+    z-index: 1000;
+  }
+  .loading-screen .msg {
+    color: var(--accent);
+    font-size: 14px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+  }
+  .loading-screen .msg::before {
+    content: '▸ ';
+  }
+  .spinner {
+    width: 40px; height: 40px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .link { stroke-opacity: 0.4; transition: stroke-opacity 0.2s; }
+  .link.plaintext { stroke: var(--danger); }
+  .link.encrypted { stroke: var(--accent-dim); }
+  .link.mixed { stroke: var(--amber); }
+  .link.faded { stroke-opacity: 0.05; }
+  .link.highlight { stroke-opacity: 0.9; stroke-width: 2px; }
+
+  .node circle { transition: stroke-width 0.15s; }
+  .node.faded { opacity: 0.2; }
+  .node-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    fill: var(--text-dim);
+    pointer-events: none;
+    text-anchor: middle;
+  }
+  .node.selected circle { stroke: var(--accent) !important; stroke-width: 3px; }
+  .node.selected .node-label { fill: var(--accent); font-weight: 700; }
+
+  .tab-row {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    padding: 6px 12px;
+    background: transparent;
+    border: none;
+    color: var(--text-faint);
+    font-family: inherit;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+  .tab.active { color: var(--amber); border-bottom-color: var(--amber); }
+  .tab:hover:not(.active) { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="loading-screen" id="loading">
+  <div class="spinner"></div>
+  <div class="msg">initializing graph</div>
+</div>
+
+<div id="modal-overlay"></div>
+<div id="save-modal" class="modal"></div>
+
+<div id="app">
+  <header>
+    <div class="brand">Deadfall</div>
+    <span class="divider">//</span>
+    <div class="file" id="file-info">—</div>
+    <div id="live-badge" class="live-indicator off" style="display:none;">
+      <span class="live-dot"></span><span id="live-label">OFFLINE</span>
+    </div>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <aside class="sidebar">
+    <div class="filter-group">
+      <h2 class="section-title">search</h2>
+      <input type="text" id="search" placeholder="filter by ip prefix…">
+    </div>
+
+    <div class="filter-group">
+      <h2 class="section-title">node visibility</h2>
+      <div class="filter-row">
+        <input type="checkbox" id="f-private" checked>
+        <label for="f-private">private (RFC1918)</label>
+        <span class="count" id="c-private">0</span>
+      </div>
+      <div class="filter-row">
+        <input type="checkbox" id="f-public" checked>
+        <label for="f-public">public</label>
+        <span class="count" id="c-public">0</span>
+      </div>
+      <div class="filter-row">
+        <input type="checkbox" id="f-multicast">
+        <label for="f-multicast">multicast/bcast</label>
+        <span class="count" id="c-multicast">0</span>
+      </div>
+    </div>
+
+    <div class="filter-group">
+      <h2 class="section-title">edge filter</h2>
+      <div class="filter-row">
+        <input type="checkbox" id="f-plaintext-only">
+        <label for="f-plaintext-only">only plaintext flows</label>
+      </div>
+      <div class="filter-row">
+        <input type="checkbox" id="f-hide-noise">
+        <label for="f-hide-noise">hide &lt;10 pkt flows</label>
+      </div>
+    </div>
+
+    <div class="filter-group">
+      <h2 class="section-title">legend</h2>
+      <div class="legend">
+        <div class="legend-item"><span class="legend-dot" style="background:var(--private)"></span>private host</div>
+        <div class="legend-item"><span class="legend-dot" style="background:var(--public)"></span>public host</div>
+        <div class="legend-item"><span class="legend-dot" style="background:var(--danger);box-shadow:0 0 8px var(--danger)"></span>has plaintext svc</div>
+        <div class="legend-item"><span class="legend-dot" style="background:var(--text-faint)"></span>multicast/bcast</div>
+      </div>
+      <div style="margin-top:10px; font-size:10px; color:var(--text-faint); line-height:1.6;">
+        <span style="color:var(--danger)">━</span> plaintext edge<br>
+        <span style="color:var(--amber)">━</span> mixed<br>
+        <span style="color:var(--accent-dim)">━</span> encrypted only<br>
+        <i>node size ∝ traffic volume</i>
+      </div>
+    </div>
+
+    <div class="filter-group" id="live-group">
+      <h2 class="section-title">live capture</h2>
+      <div class="live-panel">
+        <select id="live-iface"></select>
+        <input type="text" id="live-bpf" placeholder="BPF filter (optional)">
+        <div style="display:flex; gap:4px;">
+          <button class="btn" id="btn-live-start" style="flex:1;">▶ start</button>
+          <button class="btn" id="btn-live-stop" style="flex:1;" disabled>■ stop</button>
+        </div>
+        <div style="height:1px; background:var(--border); margin:4px 0;"></div>
+        <input type="text" id="live-save-path" placeholder="save to .pcap (optional path)">
+        <div style="display:flex; gap:4px;">
+          <button class="btn" id="btn-live-save" style="flex:1;">● record</button>
+          <a class="btn" id="btn-live-download" href="/api/live/save/download" style="flex:1; text-align:center; text-decoration:none;" target="_blank">⬇ download</a>
+        </div>
+        <div class="live-save-info" id="live-save-info"></div>
+        <div class="live-err" id="live-err"></div>
+      </div>
+    </div>
+
+    <div class="filter-group">
+      <h2 class="section-title">quick actions</h2>
+      <button class="btn" id="btn-plaintext-report" style="width:100%; text-align:left; margin-bottom:4px;">
+        ⚠ view plaintext report
+      </button>
+      <button class="btn" id="btn-creds-report" style="width:100%; text-align:left; margin-bottom:4px;">
+        🔑 view extracted creds
+      </button>
+      <button class="btn" id="btn-findings-report" style="width:100%; text-align:left;">
+        ▣ view security findings
+      </button>
+    </div>
+
+    <div class="filter-group" id="sev-summary" style="display:none;">
+      <h2 class="section-title">finding severity</h2>
+      <div id="sev-bars" style="display:flex; flex-direction:column; gap:4px; font-size:10px;"></div>
+    </div>
+  </aside>
+
+  <div id="graph-wrap">
+    <div class="controls">
+      <button class="btn" id="btn-reset">reset view</button>
+      <button class="btn" id="btn-center">center</button>
+      <button class="btn" id="btn-freeze">freeze sim</button>
+    </div>
+    <svg id="graph"></svg>
+    <div class="graph-overlay">
+      drag: pan · wheel: zoom · click node: inspect · drag node: pin
+    </div>
+  </div>
+
+  <aside class="detail empty" id="detail"></aside>
+</div>
+
+<script>
+let graph = { nodes: [], links: [] };
+let simulation = null;
+let selectedNode = null;
+let filters = {
+  private: true, public: true, multicast: false,
+  plaintextOnly: false, hideNoise: false, search: '',
+};
+let frozen = false;
+const whoisCache = {};
+let _livePoll = null;
+let _viewMode = 'graph';  // 'graph' | 'flow' | 'report' — when non-graph, skip graph rebuilds
+let _lastPacketCount = 0;
+let _lastPacketTs = 0;
+
+const fmtBytes = b => {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
+};
+const fmtNum = n => n.toLocaleString();
+
+async function init() {
+  await refresh();
+  await refreshInterfaces();
+  document.getElementById('loading').style.display = 'none';
+  syncLivePolling();
+}
+
+async function refresh() {
+  const [summaryR, graphR] = await Promise.all([
+    fetch('/api/summary').then(r => r.json()),
+    fetch('/api/graph').then(r => r.json()),
+  ]);
+  renderHeader(summaryR);
+  updateLiveBadge(summaryR.live, summaryR);
+  // Preserve positions from the existing graph so live rebuilds don't jolt.
+  const pos = new Map();
+  (graph.nodes || []).forEach(n => {
+    if (n.x != null) pos.set(n.id, { x: n.x, y: n.y, fx: n.fx, fy: n.fy, vx: n.vx, vy: n.vy });
+  });
+  graph = graphR;
+  graph.nodes.forEach(n => {
+    const p = pos.get(n.id);
+    if (p) Object.assign(n, p);
+  });
+  updateCounts();
+  // Always diff-update: the graph update is position-preserving and the detail
+  // panel is a separate DOM region, so report/flow views don't get clobbered.
+  updateGraph();
+  _findingsData = null;
+}
+
+async function refreshInterfaces() {
+  try {
+    const r = await fetch('/api/live/interfaces').then(r => r.json());
+    const sel = document.getElementById('live-iface');
+    const ifaces = r.interfaces || [];
+    const current = (document.querySelector('#live-iface') || {}).value;
+    sel.innerHTML = ifaces.length
+      ? ifaces.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')
+      : '<option value="">(no interfaces)</option>';
+    if (current && ifaces.includes(current)) sel.value = current;
+  } catch (e) { /* non-fatal */ }
+}
+
+function updateLiveBadge(live, summary) {
+  const badge = document.getElementById('live-badge');
+  const label = document.getElementById('live-label');
+  const errBox = document.getElementById('live-err');
+  const startBtn = document.getElementById('btn-live-start');
+  const stopBtn = document.getElementById('btn-live-stop');
+  if (!live) {
+    badge.style.display = 'none';
+    return;
+  }
+  badge.style.display = '';
+  if (live.error) {
+    badge.className = 'live-indicator err';
+    label.textContent = 'ERROR';
+    errBox.textContent = live.error;
+  } else if (live.running) {
+    badge.className = 'live-indicator';
+    // Compute live packet rate from successive summary snapshots.
+    const now = Date.now() / 1000;
+    let rate = null;
+    if (_lastPacketTs) {
+      const dt = now - _lastPacketTs;
+      if (dt > 0.2) rate = (summary.total_packets - _lastPacketCount) / dt;
+    }
+    _lastPacketTs = now;
+    _lastPacketCount = summary.total_packets;
+    const rateStr = (rate != null && rate >= 0) ? ` · ${rate < 10 ? rate.toFixed(1) : Math.round(rate)} pps` : '';
+    label.textContent = `LIVE ${live.iface || ''}${rateStr}`;
+    errBox.textContent = '';
+  } else {
+    badge.className = 'live-indicator off';
+    label.textContent = 'STOPPED';
+    errBox.textContent = '';
+  }
+  if (startBtn) startBtn.disabled = !!live.running;
+  if (stopBtn) stopBtn.disabled = !live.running;
+  const iface = document.getElementById('live-iface');
+  const bpf = document.getElementById('live-bpf');
+  if (iface && live.iface && !iface.value) iface.value = live.iface;
+  if (bpf && live.bpf != null && !bpf.value) bpf.value = live.bpf;
+
+  const save = live.save || {};
+  const saveBtn = document.getElementById('btn-live-save');
+  const saveInfo = document.getElementById('live-save-info');
+  const savePath = document.getElementById('live-save-path');
+  const dlBtn = document.getElementById('btn-live-download');
+  if (saveBtn) {
+    saveBtn.classList.toggle('recording', !!save.saving);
+    saveBtn.textContent = save.saving ? 'stop recording' : '● record';
+    // Recording requires an active capture so packets actually land on disk.
+    saveBtn.disabled = !live.running && !save.saving;
+  }
+  if (savePath && save.path && !savePath.matches(':focus')) savePath.value = save.path;
+  if (saveInfo) {
+    if (save.saving || save.path) {
+      const bytes = save.bytes_written != null ? fmtBytes(save.bytes_written) : '—';
+      const pkts = save.packets_written != null ? fmtNum(save.packets_written) : '0';
+      saveInfo.className = 'live-save-info' + (save.saving ? ' recording' : '');
+      saveInfo.innerHTML = `${save.saving ? '● recording' : 'stopped'} · ${pkts} pkts · ${bytes}
+        <br><span style="color:var(--text-faint);">${escapeHtml(save.path || '')}</span>`;
+    } else {
+      saveInfo.textContent = '';
+      saveInfo.className = 'live-save-info';
+    }
+  }
+  if (dlBtn) {
+    const canDownload = !!(save.path);
+    dlBtn.style.opacity = canDownload ? '1' : '0.4';
+    dlBtn.style.pointerEvents = canDownload ? 'auto' : 'none';
+  }
+}
+
+function syncLivePolling() {
+  // Poll while a capture is active; stop polling otherwise to save cycles.
+  const badgeVisible = document.getElementById('live-badge').style.display !== 'none';
+  const needPoll = badgeVisible;
+  if (needPoll && !_livePoll) {
+    _livePoll = setInterval(() => refresh().catch(() => {}), 3000);
+  } else if (!needPoll && _livePoll) {
+    clearInterval(_livePoll);
+    _livePoll = null;
+  }
+}
+
+async function liveStart() {
+  const iface = document.getElementById('live-iface').value;
+  const bpf = document.getElementById('live-bpf').value.trim() || null;
+  if (!iface) return;
+  document.getElementById('live-err').textContent = '';
+  try {
+    const r = await fetch('/api/live/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ iface, bpf }),
+    }).then(r => r.json());
+    if (r.error) document.getElementById('live-err').textContent = r.error;
+  } catch (e) {
+    document.getElementById('live-err').textContent = String(e);
+  }
+  await refresh();
+  syncLivePolling();
+}
+
+function showModal(html, opts) {
+  opts = opts || {};
+  const overlay = document.getElementById('modal-overlay');
+  const m = document.getElementById('save-modal');
+  m.innerHTML = html;
+  overlay.style.display = 'block';
+  m.style.display = 'block';
+  overlay.onclick = opts.dismissOnBackdrop === false ? null : closeModal;
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').style.display = 'none';
+  document.getElementById('save-modal').style.display = 'none';
+}
+window.closeModal = closeModal;
+
+async function liveStop() {
+  // Snapshot pre-stop save state so we know whether a pcap was being recorded.
+  let saveBefore = {};
+  try {
+    const st = await fetch('/api/live/status').then(r => r.json());
+    saveBefore = st.save || {};
+  } catch (e) {}
+
+  // If actively recording, ask first — stopping capture also finalizes the pcap.
+  if (saveBefore.saving) {
+    return promptStopWithSave(saveBefore);
+  }
+  // Not recording — stop immediately.
+  await doStop();
+  // If a prior recording from earlier in the session exists on disk, still offer download.
+  if (saveBefore.path) {
+    offerDownload(saveBefore, {title: 'capture stopped'});
+  }
+}
+
+async function doStop() {
+  await fetch('/api/live/stop', { method: 'POST' });
+  await refresh();
+  syncLivePolling();
+}
+
+function promptStopWithSave(save) {
+  const pkts = fmtNum(save.packets_written || 0);
+  const bytes = fmtBytes(save.bytes_written || 0);
+  showModal(`
+    <h3>stop live capture?</h3>
+    <div class="body">
+      Recording in progress — <b>${pkts}</b> pkts · <b>${bytes}</b> written.<br>
+      Stopping the capture will close the pcap file.
+      <div class="path">${escapeHtml(save.path || '')}</div>
+    </div>
+    <div class="actions">
+      <button class="btn" id="m-cancel">keep running</button>
+      <button class="btn" id="m-stop-only">stop, no download</button>
+      <button class="btn primary" id="m-stop-dl">stop &amp; download pcap</button>
+    </div>
+  `, { dismissOnBackdrop: false });
+  document.getElementById('m-cancel').onclick = closeModal;
+  document.getElementById('m-stop-only').onclick = async () => {
+    closeModal();
+    await doStop();
+  };
+  document.getElementById('m-stop-dl').onclick = async () => {
+    await doStop();
+    // Re-fetch save state so we hand the user the final file size in the follow-up modal.
+    let after = save;
+    try {
+      const st = await fetch('/api/live/status').then(r => r.json());
+      after = st.save || save;
+    } catch (e) {}
+    offerDownload(after, { title: 'capture stopped · download pcap', auto: true });
+  };
+}
+
+function offerDownload(save, opts) {
+  opts = opts || {};
+  const title = opts.title || 'download pcap';
+  const pkts = fmtNum(save.packets_written || 0);
+  const bytes = fmtBytes(save.bytes_written || 0);
+  showModal(`
+    <h3>${escapeHtml(title)}</h3>
+    <div class="body">
+      Pcap recorded: <b>${pkts}</b> packets · <b>${bytes}</b>
+      <div class="path">${escapeHtml(save.path || '')}</div>
+    </div>
+    <div class="actions">
+      <button class="btn" id="m-close">close</button>
+      <a class="btn primary" id="m-dl" href="/api/live/save/download" target="_blank">⬇ download</a>
+    </div>
+  `);
+  document.getElementById('m-close').onclick = closeModal;
+  const dl = document.getElementById('m-dl');
+  dl.onclick = () => setTimeout(closeModal, 400);
+  if (opts.auto) {
+    // Trigger the download in a hidden iframe so the dialog stays visible.
+    const f = document.createElement('iframe');
+    f.style.display = 'none';
+    f.src = '/api/live/save/download';
+    document.body.appendChild(f);
+    setTimeout(() => document.body.removeChild(f), 5000);
+  }
+}
+
+async function liveSaveToggle() {
+  const status = await fetch('/api/live/status').then(r => r.json());
+  const saving = (status.save || {}).saving;
+  document.getElementById('live-err').textContent = '';
+  try {
+    if (saving) {
+      await fetch('/api/live/save/stop', { method: 'POST' });
+    } else {
+      const path = document.getElementById('live-save-path').value.trim() || null;
+      const r = await fetch('/api/live/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      }).then(r => r.json());
+      if (r.error) document.getElementById('live-err').textContent = r.error;
+    }
+  } catch (e) {
+    document.getElementById('live-err').textContent = String(e);
+  }
+  await refresh();
+}
+
+function renderHeader(s) {
+  document.getElementById('file-info').textContent = s.file;
+  const statsEl = document.getElementById('stats');
+  const sev = s.findings_by_severity || {};
+  statsEl.innerHTML = `
+    <span>pkts <b>${fmtNum(s.total_packets)}</b></span>
+    <span>hosts <b>${fmtNum(s.host_count)}</b></span>
+    <span>flows <b>${fmtNum(s.flow_count)}</b></span>
+    <span class="warn">plaintext <b>${fmtNum(s.plaintext_flows)}</b></span>
+    <span class="warn">creds <b>${fmtNum(s.credential_count || 0)}</b></span>
+    <span class="warn">findings <b>${fmtNum(s.finding_count || 0)}</b></span>
+    <span>dns <b>${fmtNum(s.dns_query_count)}</b></span>
+    <span>dur <b>${s.duration_sec ? s.duration_sec.toFixed(1) + 's' : '—'}</b></span>
+  `;
+  if (s.finding_count) {
+    const box = document.getElementById('sev-summary');
+    box.style.display = '';
+    const sevs = ['critical','high','medium','low','info'];
+    const max = Math.max(1, ...sevs.map(k => sev[k]||0));
+    document.getElementById('sev-bars').innerHTML = sevs.map(k => {
+      const n = sev[k] || 0;
+      const w = Math.round((n / max) * 100);
+      return `<div style="display:flex; align-items:center; gap:6px; cursor:pointer;" onclick="showFindingsReport('${k}')">
+        <span class="sev-pill ${k}" style="min-width:52px; text-align:center;">${k}</span>
+        <span style="flex:1; background:var(--bg-3); height:6px; position:relative;">
+          <span style="position:absolute; inset:0; width:${w}%; background:var(--${k==='critical'?'danger':k==='high'?'danger-soft':k==='medium'?'amber':k==='low'?'warn':'border-hot'});"></span>
+        </span>
+        <b style="color:var(--text); min-width:24px; text-align:right;">${n}</b>
+      </div>`;
+    }).join('');
+  }
+}
+
+function updateCounts() {
+  let p=0, pub=0, m=0;
+  graph.nodes.forEach(n => {
+    if (n.is_multicast) m++;
+    else if (n.is_private) p++;
+    else pub++;
+  });
+  document.getElementById('c-private').textContent = p;
+  document.getElementById('c-public').textContent = pub;
+  document.getElementById('c-multicast').textContent = m;
+}
+
+let _graphState = null;
+
+function ensureGraphInitialized() {
+  if (_graphState) return;
+  const svg = d3.select('#graph');
+  const wrap = document.getElementById('graph-wrap');
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  svg.attr('viewBox', `0 0 ${W} ${H}`);
+  svg.selectAll('*').remove();
+
+  const root = svg.append('g').attr('class', 'root');
+  // Hold a zoom reference so pan/zoom state survives across refreshes (live-capture
+  // updates must not reset the user's view).
+  const zoom = d3.zoom().scaleExtent([0.1, 8]).on('zoom', e => root.attr('transform', e.transform));
+  svg.call(zoom);
+
+  const linkG = root.append('g').attr('class', 'links');
+  const nodeG = root.append('g').attr('class', 'nodes');
+
+  simulation = d3.forceSimulation([])
+    .force('link', d3.forceLink([]).id(d => d.id)
+      .distance(l => 80 + Math.random() * 30)
+      .strength(0.15))
+    .force('charge', d3.forceManyBody().strength(-180))
+    .force('center', d3.forceCenter(W / 2, H / 2))
+    .force('collision', d3.forceCollide().radius(() => 10))
+    .alphaDecay(0.03);
+
+  // Selecting inside the tick means newly-added lines/nodes are picked up automatically.
+  simulation.on('tick', () => {
+    linkG.selectAll('line')
+      .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    nodeG.selectAll('g.node').attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+
+  svg.on('click', () => selectNode(null));
+
+  _graphState = { svg, root, linkG, nodeG, zoom, W, H };
+}
+
+function resizeGraph() {
+  if (!_graphState) return;
+  const wrap = document.getElementById('graph-wrap');
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  _graphState.W = W; _graphState.H = H;
+  _graphState.svg.attr('viewBox', `0 0 ${W} ${H}`);
+  simulation.force('center', d3.forceCenter(W / 2, H / 2));
+}
+
+function updateGraph() {
+  ensureGraphInitialized();
+  const { linkG, nodeG, W, H } = _graphState;
+
+  const maxBytes = d3.max(graph.nodes, n => n.bytes) || 1;
+  const rScale = d3.scaleSqrt().domain([0, maxBytes]).range([4, 22]);
+
+  const byId = new Map(graph.nodes.map(n => [n.id, n]));
+  graph.links.forEach(l => {
+    const sid = (l.source && l.source.id) || l.source;
+    const tid = (l.target && l.target.id) || l.target;
+    l.source = byId.get(sid) || l.source;
+    l.target = byId.get(tid) || l.target;
+  });
+
+  // Seed positions for nodes that are new this refresh so nothing has to move to
+  // accommodate them. Place them next to an already-positioned peer when possible,
+  // otherwise at the canvas center — the physics engine will NOT be restarted for
+  // live refreshes, so these seeded positions are final until the user reheats.
+  const cx = (W || 1200) / 2, cy = (H || 800) / 2;
+  const peerOf = new Map();
+  graph.links.forEach(l => {
+    if (!peerOf.has(l.source.id)) peerOf.set(l.source.id, l.target);
+    if (!peerOf.has(l.target.id)) peerOf.set(l.target.id, l.source);
+  });
+  graph.nodes.forEach(n => {
+    if (n.x != null && n.y != null) return;
+    const peer = peerOf.get(n.id);
+    if (peer && peer.x != null) {
+      n.x = peer.x + (Math.random() - 0.5) * 40;
+      n.y = peer.y + (Math.random() - 0.5) * 40;
+    } else {
+      n.x = cx + (Math.random() - 0.5) * 120;
+      n.y = cy + (Math.random() - 0.5) * 120;
+    }
+    n.vx = 0; n.vy = 0;
+  });
+
+  const prevNodeCount = (simulation.nodes() || []).length;
+
+  const nodeSel = nodeG.selectAll('g.node').data(graph.nodes, d => d.id);
+  nodeSel.exit().remove();
+  const nodeEnter = nodeSel.enter().append('g')
+    .attr('class', 'node')
+    .call(d3.drag()
+      .on('start', dragStart)
+      .on('drag', dragged)
+      .on('end', dragEnd))
+    .on('click', (e, d) => { e.stopPropagation(); selectNode(d); })
+    .on('mouseover', (e, d) => showTooltip(e, d))
+    .on('mousemove', e => moveTooltip(e))
+    .on('mouseout', hideTooltip);
+  nodeEnter.append('circle');
+  nodeEnter.append('text').attr('class', 'node-label');
+
+  const nodeMerged = nodeEnter.merge(nodeSel);
+  nodeMerged.select('circle')
+    .attr('r', d => rScale(d.bytes))
+    .attr('fill', d => nodeColor(d))
+    .attr('stroke', d => d.has_plaintext ? 'var(--danger)' : 'var(--border-hot)')
+    .attr('stroke-width', d => d.has_plaintext ? 2 : 1)
+    .style('filter', d => d.has_plaintext ? 'drop-shadow(0 0 6px rgba(255,71,87,0.5))' : null);
+  nodeMerged.select('text.node-label')
+    .attr('dy', d => rScale(d.bytes) + 11)
+    .text(d => d.id);
+  nodeMerged.classed('selected', d => selectedNode && d.id === selectedNode.id);
+
+  const linkKey = l => `${(l.source && l.source.id) || l.source}>${(l.target && l.target.id) || l.target}`;
+  const linkSel = linkG.selectAll('line').data(graph.links, linkKey);
+  linkSel.exit().remove();
+  const linkEnter = linkSel.enter().append('line')
+    .on('click', (e, l) => { e.stopPropagation(); selectFlow(l.source.id || l.source, l.target.id || l.target); })
+    .on('mouseover', (e, l) => showLinkTooltip(e, l))
+    .on('mousemove', e => moveTooltip(e))
+    .on('mouseout', hideTooltip);
+  const linkMerged = linkEnter.merge(linkSel);
+  linkMerged
+    .attr('class', l => {
+      const classes = ['link'];
+      const kind = edgeClass(l);
+      if (kind) classes.push(kind);
+      // Preserve flow-inspection highlight across live refreshes.
+      if (_viewMode === 'flow' && _flowNav
+          && (l.source.id || l.source) === _flowNav.src
+          && (l.target.id || l.target) === _flowNav.dst) {
+        classes.push('highlight-flow');
+      }
+      return classes.join(' ');
+    })
+    .attr('stroke-width', l => Math.min(4, Math.log10(l.packets + 1) + 0.5));
+
+  // Stop physics before swapping arrays so a residual alpha doesn't run a tick
+  // against the new data and drift everything. Only the initial build is allowed
+  // to restart the simulation — live refreshes must leave positions untouched.
+  simulation.stop();
+  simulation.nodes(graph.nodes);
+  simulation.force('link').links(graph.links);
+  simulation.force('collision').radius(d => rScale(d.bytes) + 6);
+
+  window._sel = { linkSel: linkMerged, nodeSel: nodeMerged };
+  applyFilters();
+
+  if (prevNodeCount === 0 && !frozen) {
+    simulation.alpha(0.9).restart();
+  } else {
+    // Draw the new nodes/links at their (seeded or preserved) positions without
+    // advancing any physics — pan, zoom, selection, and existing layout are frozen.
+    renderTick();
+  }
+}
+
+function renderTick() {
+  if (!_graphState) return;
+  _graphState.linkG.selectAll('line')
+    .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+    .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+  _graphState.nodeG.selectAll('g.node').attr('transform', d => `translate(${d.x},${d.y})`);
+}
+
+// Back-compat: anything that still calls buildGraph() gets the update path.
+const buildGraph = updateGraph;
+
+function edgeClass(l) {
+  if (l.plaintext) {
+    const enc = l.services.some(s => ['HTTPS','SSH','HTTPS-ALT','IMAPS','POP3S','FTPS','SMTPS','LDAPS','SIPS'].includes(s));
+    return enc ? 'mixed' : 'plaintext';
+  }
+  return l.services.length ? 'encrypted' : '';
+}
+
+function nodeColor(d) {
+  if (d.is_multicast) return 'var(--text-faint)';
+  if (d.is_private) return 'var(--private)';
+  return 'var(--public)';
+}
+
+function applyFilters() {
+  if (!window._sel) return;
+  const { linkSel, nodeSel } = window._sel;
+  const search = filters.search.toLowerCase().trim();
+  const nodeVisible = n => {
+    if (n.is_multicast && !filters.multicast) return false;
+    if (!n.is_multicast && n.is_private && !filters.private) return false;
+    if (!n.is_multicast && !n.is_private && !filters.public) return false;
+    if (search && !n.id.toLowerCase().includes(search)) return false;
+    return true;
+  };
+  nodeSel.style('display', n => nodeVisible(n) ? null : 'none');
+  linkSel.style('display', l => {
+    if (!nodeVisible(l.source) || !nodeVisible(l.target)) return 'none';
+    if (filters.plaintextOnly && !l.plaintext) return 'none';
+    if (filters.hideNoise && l.packets < 10) return 'none';
+    return null;
+  });
+}
+
+function dragStart(e, d) {
+  if (!e.active) simulation.alphaTarget(0.3).restart();
+  d.fx = d.x; d.fy = d.y;
+}
+function dragged(e, d) { d.fx = e.x; d.fy = e.y; }
+function dragEnd(e, d) {
+  if (!e.active) simulation.alphaTarget(0);
+}
+
+const tooltip = document.createElement('div');
+tooltip.className = 'tooltip';
+tooltip.style.display = 'none';
+document.body.appendChild(tooltip);
+function showTooltip(e, d) {
+  tooltip.innerHTML = `
+    <b style="color:var(--amber)">${d.id}</b><br>
+    ${fmtNum(d.packets)} pkts · ${fmtBytes(d.bytes)} · ${d.peer_count} peers
+    ${d.has_plaintext ? '<br><span style="color:var(--danger)">⚠ plaintext services</span>' : ''}
+  `;
+  tooltip.style.display = 'block';
+  moveTooltip(e);
+}
+function moveTooltip(e) {
+  tooltip.style.left = (e.clientX + 12) + 'px';
+  tooltip.style.top = (e.clientY + 12) + 'px';
+}
+function hideTooltip() { tooltip.style.display = 'none'; }
+function showLinkTooltip(e, l) {
+  const src = l.source.id || l.source, dst = l.target.id || l.target;
+  tooltip.innerHTML = `
+    <b style="color:var(--amber)">${src} → ${dst}</b><br>
+    ${fmtNum(l.packets)} pkts · ${fmtBytes(l.bytes)}
+    ${l.services && l.services.length ? '<br>' + l.services.join(', ') : ''}
+    ${l.plaintext ? '<br><span style="color:var(--danger)">⚠ plaintext</span>' : ''}
+    <br><span style="color:var(--text-faint)">click to inspect packets</span>
+  `;
+  tooltip.style.display = 'block';
+  moveTooltip(e);
+}
+
+async function selectNode(node) {
+  selectedNode = node;
+  _viewMode = node ? 'report' : 'graph';
+  d3.selectAll('.node').classed('selected', d => d === node);
+  const panel = document.getElementById('detail');
+  if (!node) {
+    panel.className = 'detail empty';
+    panel.innerHTML = '';
+    return;
+  }
+  panel.className = 'detail';
+  panel.innerHTML = `<div style="color:var(--text-faint); font-size:11px;">loading…</div>`;
+  const [detail, whois] = await Promise.all([
+    fetch('/api/host/' + encodeURIComponent(node.id)).then(r => r.json()),
+    whoisCache[node.id] ? Promise.resolve(whoisCache[node.id]) :
+      fetch('/api/whois/' + encodeURIComponent(node.id)).then(r => r.json()).then(w => (whoisCache[node.id]=w, w)),
+  ]);
+  renderDetail(detail, whois);
+}
+
+function renderDetail(d, w) {
+  const panel = document.getElementById('detail');
+  const tag = d.is_multicast ? '<span class="tag">mcast</span>'
+            : d.is_private ? '<span class="tag private">private</span>'
+            : '<span class="tag public">public</span>';
+  const plaintextTag = d.plaintext_services.length
+    ? '<span class="tag danger">⚠ plaintext</span>' : '';
+
+  const chipSvc = (arr, cls) => arr.length
+    ? arr.map(s => `<span class="chip ${cls}">${s}</span>`).join('')
+    : `<span style="color:var(--text-faint); font-size:10px;">—</span>`;
+
+  const flowItems = (flows, dir) => flows.length
+    ? flows.map(f => `
+      <div class="flow-item ${f.plaintext ? 'plaintext' : ''}" data-peer="${f.peer}" data-dir="${dir}">
+        <button class="pkt-btn" data-peer-pkts="${f.peer}" data-dir="${dir}">▶ packets</button>
+        <div><span style="color:var(--text-faint);">${dir}</span> <span class="peer">${f.peer}</span></div>
+        <div class="meta">
+          ${fmtNum(f.packets)} pkts · ${fmtBytes(f.bytes)}
+          ${f.services.length ? ' · ' + f.services.join(',') : ''}
+          ${f.ports.length ? ' · :' + f.ports.slice(0,5).join(',') : ''}
+        </div>
+      </div>`).join('')
+    : '<div style="color:var(--text-faint); font-size:10px;">none</div>';
+
+  const samplesHtml = d.plaintext_samples.length
+    ? d.plaintext_samples.map(s => `
+      <div class="plaintext-sample">
+        <div class="sample-head">${s.service} · ${s.src} → ${s.dst}:${s.port}</div>
+        <div class="sample-body">${escapeHtml(s.snippet)}</div>
+      </div>`).join('')
+    : '<div style="color:var(--text-faint); font-size:10px;">no captured plaintext samples</div>';
+
+  const credsHtml = (d.credentials || []).length
+    ? d.credentials.map(c => renderCredCard(c)).join('')
+    : '<div style="color:var(--text-faint); font-size:10px;">no credentials extracted for this host</div>';
+
+  const findingsHtml = (d.findings || []).length
+    ? d.findings.map(renderFindingCard).join('')
+    : '<div style="color:var(--text-faint); font-size:10px;">no security findings for this host</div>';
+
+  const riskHtml = d.risk_score
+    ? `<span class="tag danger">risk ${d.risk_score}</span>`
+    : '';
+
+  const whoisHtml = renderWhois(w);
+  const sniList = d.sni_names || [];
+  const dnsList = d.dns_names || [];
+  const chipRow = (arr) => `<div class="chip-row">${arr.map(n => `<span class="chip">${escapeHtml(n)}</span>`).join('')}</div>`;
+  const dnsHtml = (dnsList.length || sniList.length)
+    ? `${dnsList.length ? `<div style="color:var(--text-faint); font-size:9px; margin-bottom:4px; text-transform:uppercase; letter-spacing:0.1em;">dns queries</div>${chipRow(dnsList)}` : ''}
+       ${sniList.length ? `<div style="color:var(--text-faint); font-size:9px; margin:8px 0 4px; text-transform:uppercase; letter-spacing:0.1em;">tls sni</div>${chipRow(sniList)}` : ''}`
+    : '<div style="color:var(--text-faint); font-size:10px;">none observed</div>';
+
+  panel.innerHTML = `
+    <div class="ip-header">
+      <div class="ip">${d.ip}</div>
+      ${tag}
+      ${plaintextTag}
+      ${riskHtml}
+    </div>
+    ${d.mac ? `<div style="font-size:10px; color:var(--text-faint); margin-bottom:6px;">mac: ${d.mac}</div>` : ''}
+
+    <div class="stat-grid">
+      <div class="stat-cell"><div class="label">packets in</div><div class="val">${fmtNum(d.packets_in)}</div></div>
+      <div class="stat-cell"><div class="label">packets out</div><div class="val">${fmtNum(d.packets_out)}</div></div>
+      <div class="stat-cell"><div class="label">bytes in</div><div class="val">${fmtBytes(d.bytes_in)}</div></div>
+      <div class="stat-cell"><div class="label">bytes out</div><div class="val">${fmtBytes(d.bytes_out)}</div></div>
+      <div class="stat-cell"><div class="label">peers</div><div class="val">${d.peer_count}</div></div>
+      <div class="stat-cell"><div class="label">protos</div><div class="val" style="font-size:11px;">${d.protocols.join(' · ') || '—'}</div></div>
+    </div>
+
+    <h3>whois / registration</h3>
+    ${whoisHtml}
+
+    <h3>services — plaintext</h3>
+    <div class="chip-row">${chipSvc(d.plaintext_services, 'plaintext')}</div>
+
+    <h3>services — encrypted</h3>
+    <div class="chip-row">${chipSvc(d.encrypted_services, 'encrypted')}</div>
+
+    <div class="tab-row">
+      <button class="tab active" data-tab="findings">findings (${(d.findings||[]).length})</button>
+      <button class="tab" data-tab="in">inbound (${d.inbound_flows.length})</button>
+      <button class="tab" data-tab="out">outbound (${d.outbound_flows.length})</button>
+      <button class="tab" data-tab="creds">creds (${(d.credentials||[]).length})</button>
+      <button class="tab" data-tab="samples">samples (${d.plaintext_samples.length})</button>
+      <button class="tab" data-tab="dns">names (${dnsList.length + sniList.length})</button>
+    </div>
+
+    <div class="tab-pane" data-pane="findings">${findingsHtml}</div>
+    <div class="tab-pane" data-pane="in" style="display:none;">${flowItems(d.inbound_flows, '←')}</div>
+    <div class="tab-pane" data-pane="out" style="display:none;">${flowItems(d.outbound_flows, '→')}</div>
+    <div class="tab-pane" data-pane="creds" style="display:none;">${credsHtml}</div>
+    <div class="tab-pane" data-pane="samples" style="display:none;">${samplesHtml}</div>
+    <div class="tab-pane" data-pane="dns" style="display:none;">${dnsHtml}</div>
+  `;
+
+  panel.querySelectorAll('.tab').forEach(t => t.addEventListener('click', e => {
+    panel.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    panel.querySelectorAll('.tab-pane').forEach(p => p.style.display = 'none');
+    panel.querySelector(`[data-pane="${t.dataset.tab}"]`).style.display = '';
+  }));
+
+  panel.querySelectorAll('.pkt-btn').forEach(btn => btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const peer = btn.dataset.peerPkts;
+    const dir = btn.dataset.dir;
+    // '←' = inbound flow (peer → this host); '→' = outbound (this host → peer).
+    if (dir === '←') selectFlow(peer, d.ip);
+    else selectFlow(d.ip, peer);
+  }));
+  panel.querySelectorAll('.flow-item').forEach(el => el.addEventListener('click', () => {
+    const peer = graph.nodes.find(n => n.id === el.dataset.peer);
+    if (peer) selectNode(peer);
+  }));
+
+  panel.querySelectorAll('.f-host').forEach(a => a.addEventListener('click', e => {
+    e.preventDefault();
+    const peer = graph.nodes.find(n => n.id === a.dataset.ip);
+    if (peer) selectNode(peer);
+  }));
+}
+
+function renderWhois(w) {
+  if (!w) return '<div class="whois-loading">…</div>';
+  if (w.private) return `<div class="whois-box"><div style="color:var(--text-faint); font-size:10px;">${w.note}</div></div>`;
+  if (w.error) return `<div class="whois-box"><div style="color:var(--danger); font-size:10px;">error: ${escapeHtml(w.error)}</div></div>`;
+  const row = (k, v) => v ? `<div class="row"><div class="k">${k}</div><div class="v">${escapeHtml(String(v))}</div></div>` : '';
+  return `<div class="whois-box">
+    ${row('asn', w.asn)}
+    ${row('org', w.asn_description)}
+    ${row('country', w.asn_country)}
+    ${row('cidr', w.asn_cidr)}
+    ${row('network', w.network_name)}
+    ${row('rdns', w.rdns)}
+  </div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);
+}
+
+function renderCredCard(c) {
+  const f = (k, v, isPw) => v ? `<div class="field"><div class="k">${k}</div><div class="v ${isPw?'pw':''}">${escapeHtml(v)}</div></div>` : '';
+  return `<div class="cred-card">
+    <div class="kind">${escapeHtml(c.kind)}</div>
+    <div class="flow">${c.src} → ${c.dst}:${c.port}</div>
+    ${f('user', c.username, false)}
+    ${f('pass', c.password, true)}
+    ${f('data', c.extra, false)}
+  </div>`;
+}
+
+function renderFindingCard(f) {
+  const hostsHtml = (f.hosts || []).map(h =>
+    `<a href="#" class="f-host" data-ip="${escapeHtml(h)}" style="color:var(--amber); text-decoration:none;">${escapeHtml(h)}</a>`
+  ).join(' · ');
+  return `<div class="finding-card ${f.severity}">
+    <div class="fc-head">
+      <span class="sev ${f.severity}">${f.severity}</span>
+      <span class="cat">${escapeHtml(f.category)}</span>
+      ${f.port ? `<span class="cat">:${f.port}</span>` : ''}
+    </div>
+    <div class="fc-title">${escapeHtml(f.title)}</div>
+    <div class="fc-desc">${escapeHtml(f.description)}</div>
+    ${f.evidence ? `<div class="fc-ev">${escapeHtml(String(f.evidence))}</div>` : ''}
+    <div class="fc-meta">
+      ${hostsHtml ? `<span><b>hosts:</b> ${hostsHtml}</span>` : ''}
+    </div>
+    ${f.remediation ? `<div class="fc-remed">${escapeHtml(f.remediation)}</div>` : ''}
+  </div>`;
+}
+
+let _flowNav = null;
+
+async function selectFlow(src, dst, opts) {
+  opts = opts || {};
+  _viewMode = 'flow';
+  _flowNav = { src, dst };
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  panel.innerHTML = `<div style="color:var(--text-faint); font-size:11px;">loading flow ${src} → ${dst}…</div>`;
+  try {
+    const data = await fetch(`/api/flow/${encodeURIComponent(src)}/${encodeURIComponent(dst)}`).then(r => r.json());
+    if (data.error) {
+      panel.innerHTML = `<div style="color:var(--danger);">${data.error}</div>`;
+      return;
+    }
+    renderFlowView(data, opts);
+  } catch (err) {
+    panel.innerHTML = `<div style="color:var(--danger);">flow load failed: ${escapeHtml(String(err))}</div>`;
+  }
+  if (window._sel && window._sel.linkSel) {
+    window._sel.linkSel.classed('highlight-flow', l =>
+      (l.source.id || l.source) === src && (l.target.id || l.target) === dst);
+  }
+}
+
+function renderFlowView(data, opts) {
+  window._startTs = null;
+  const panel = document.getElementById('detail');
+  const { src, dst, packets, stored, truncated, services, protocols,
+          ports, flow_bytes, flow_packets, plaintext } = data;
+  const crumbs = `<div class="nav-crumbs">
+    <a onclick="selectNodeById('${escapeHtml(src)}')">${escapeHtml(src)}</a>
+    <span class="sep">→</span>
+    <a onclick="selectNodeById('${escapeHtml(dst)}')">${escapeHtml(dst)}</a>
+  </div>`;
+  const plaintextTag = plaintext ? '<span class="tag danger">⚠ plaintext</span>' : '';
+  const rows = packets.map((p, i) => renderPacketRow(p, i)).join('');
+  const storedNote = truncated
+    ? `<span style="color:var(--warn)">⚠ capped at ${stored} packets (PER_FLOW_CAP)</span>`
+    : `${stored} packets stored`;
+  panel.innerHTML = `
+    ${crumbs}
+    <div class="ip-header">
+      <div class="ip" style="font-size:14px;">${escapeHtml(src)} → ${escapeHtml(dst)}</div>
+      ${plaintextTag}
+    </div>
+    <div class="stat-grid">
+      <div class="stat-cell"><div class="label">packets</div><div class="val">${fmtNum(flow_packets)}</div></div>
+      <div class="stat-cell"><div class="label">bytes</div><div class="val">${fmtBytes(flow_bytes)}</div></div>
+      <div class="stat-cell"><div class="label">protos</div><div class="val" style="font-size:11px;">${protocols.join('·')||'—'}</div></div>
+      <div class="stat-cell"><div class="label">services</div><div class="val" style="font-size:11px;">${services.join('·')||'—'}</div></div>
+    </div>
+    <div style="color:var(--text-faint); font-size:10px; margin:4px 0 8px;">${storedNote} · ports: ${ports.slice(0,10).join(', ') || '—'}</div>
+    <h3>packets</h3>
+    <div id="pkt-detail-container"></div>
+    <div style="max-height: 50vh; overflow-y: auto; border:1px solid var(--border);">
+      <table class="pkt-table">
+        <thead>
+          <tr><th>#</th><th>time</th><th>proto</th><th>port</th><th>flags</th><th>size</th><th>preview</th></tr>
+        </thead>
+        <tbody>${rows || '<tr><td colspan="7" style="color:var(--text-faint); padding:12px;">no stored packets (either 0 captured or past PER_FLOW_CAP)</td></tr>'}</tbody>
+      </table>
+    </div>
+  `;
+  panel.querySelectorAll('.pkt-row').forEach(el => el.addEventListener('click', () => {
+    panel.querySelectorAll('.pkt-row').forEach(r => r.classList.remove('selected'));
+    el.classList.add('selected');
+    showPacketDetail(parseInt(el.dataset.pid, 10));
+  }));
+  if (opts.autoSelectFirst && packets.length) {
+    showPacketDetail(packets[0].id);
+    const first = panel.querySelector('.pkt-row'); if (first) first.classList.add('selected');
+  }
+}
+
+function renderPacketRow(p, i) {
+  const t = p.ts ? (p.ts - (window._startTs || p.ts)).toFixed(4) : '—';
+  if (!window._startTs && p.ts) window._startTs = p.ts;
+  const portStr = (p.sport != null && p.dport != null) ? `${p.sport}→${p.dport}`
+                : (p.proto === 'ICMP') ? `t${p.extras.type||0}/c${p.extras.code||0}` : '—';
+  const fl = p.flags_str || '';
+  const flagHtml = fl.split('').map(c => {
+    const cls = ({S:'syn', R:'rst', F:'fin', P:'psh'})[c] || '';
+    return `<span class="pkt-flag ${cls}">${c}</span>`;
+  }).join('');
+  return `<tr class="pkt-row" data-pid="${p.id}">
+    <td style="color:var(--text-faint);">${i+1}</td>
+    <td>${t}</td>
+    <td><span style="color:var(--text-dim);">${escapeHtml(p.proto)}</span>${p.service?` <span style="color:var(--accent);">${escapeHtml(p.service)}</span>`:''}</td>
+    <td>${portStr}</td>
+    <td>${flagHtml || '—'}</td>
+    <td>${fmtBytes(p.size)}</td>
+    <td class="preview">${escapeHtml(p.preview_ascii || '')}</td>
+  </tr>`;
+}
+
+async function showPacketDetail(pid) {
+  const container = document.getElementById('pkt-detail-container');
+  if (!container) return;
+  container.innerHTML = `<div class="pkt-detail"><div style="color:var(--text-faint);">loading packet #${pid}…</div></div>`;
+  try {
+    const p = await fetch('/api/packet/' + pid).then(r => r.json());
+    if (p.error) {
+      container.innerHTML = `<div class="pkt-detail"><div style="color:var(--danger);">${p.error}</div></div>`;
+      return;
+    }
+    renderPacketDetail(p, container);
+  } catch (err) {
+    container.innerHTML = `<div class="pkt-detail"><div style="color:var(--danger);">${escapeHtml(String(err))}</div></div>`;
+  }
+}
+
+function renderPacketDetail(p, container) {
+  const dt = p.ts ? new Date(p.ts * 1000).toISOString().replace('T', ' ').replace('Z', '') : '—';
+  const ports = (p.sport != null && p.dport != null) ? `${p.sport} → ${p.dport}` : '—';
+  const flagDesc = p.flags_str ? `${p.flags_str} (0x${(p.flags||0).toString(16).padStart(2,'0')})` : '—';
+  const truncNote = p.payload_truncated ? `<span style="color:var(--warn);"> (truncated — ${p.payload_len} bytes total)</span>` : '';
+  container.innerHTML = `
+    <div class="pkt-detail">
+      <div class="pkt-detail-head">
+        <span class="pkid">packet #${p.id}</span>
+        <span style="color:var(--text-faint); font-size:10px;">${escapeHtml(dt)}</span>
+      </div>
+      <div class="pkt-fields">
+        <div class="k">src → dst</div><div class="v">
+          <a onclick="selectNodeById('${escapeHtml(p.src)}')">${escapeHtml(p.src)}</a>
+          <span style="color:var(--text-faint);">→</span>
+          <a onclick="selectNodeById('${escapeHtml(p.dst)}')">${escapeHtml(p.dst)}</a>
+        </div>
+        <div class="k">ports</div><div class="v">${ports}</div>
+        <div class="k">proto</div><div class="v">${escapeHtml(p.proto)}${p.service ? ` <span style="color:var(--accent);">(${escapeHtml(p.service)})</span>` : ''}</div>
+        <div class="k">flags</div><div class="v">${escapeHtml(flagDesc)}</div>
+        <div class="k">size</div><div class="v">${fmtBytes(p.size)} on wire</div>
+        <div class="k">payload</div><div class="v">${fmtNum(p.payload_len)} bytes${truncNote}</div>
+        ${p.extras && Object.keys(p.extras).length ? `<div class="k">extras</div><div class="v">${escapeHtml(JSON.stringify(p.extras))}</div>` : ''}
+      </div>
+      <div class="dump-toggle">
+        <button class="btn active" data-view="hex">hex + ascii</button>
+        <button class="btn" data-view="ascii">ascii only</button>
+        <button class="btn" data-view="raw">raw hex</button>
+      </div>
+      <div id="dump-area"></div>
+    </div>
+  `;
+  const bytes = b64ToBytes(p.payload_b64 || '');
+  const dumpArea = container.querySelector('#dump-area');
+  const renderDump = (view) => {
+    if (!bytes.length) {
+      dumpArea.innerHTML = '<div class="hexdump" style="color:var(--text-faint);">no payload</div>';
+      return;
+    }
+    if (view === 'ascii') dumpArea.innerHTML = `<div class="hexdump">${escapeHtml(bytesToAscii(bytes))}</div>`;
+    else if (view === 'raw') dumpArea.innerHTML = `<div class="hexdump"><span class="hex">${bytesToHex(bytes)}</span></div>`;
+    else dumpArea.innerHTML = `<div class="hexdump">${hexdump(bytes)}</div>`;
+  };
+  renderDump('hex');
+  container.querySelectorAll('.dump-toggle .btn').forEach(b => b.addEventListener('click', () => {
+    container.querySelectorAll('.dump-toggle .btn').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    renderDump(b.dataset.view);
+  }));
+}
+
+function b64ToBytes(b64) {
+  if (!b64) return new Uint8Array(0);
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesToHex(b) {
+  let s = '';
+  for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, '0');
+  return s;
+}
+function bytesToAscii(b) {
+  let s = '';
+  for (let i = 0; i < b.length; i++) {
+    const c = b[i];
+    s += (c >= 0x20 && c < 0x7f) ? String.fromCharCode(c) : (c === 0x0a ? '\n' : c === 0x0d ? '' : '.');
+  }
+  return s;
+}
+function hexdump(b) {
+  let out = '';
+  for (let i = 0; i < b.length; i += 16) {
+    const chunk = b.slice(i, i + 16);
+    let hex = '';
+    let asc = '';
+    for (let j = 0; j < 16; j++) {
+      if (j < chunk.length) {
+        hex += chunk[j].toString(16).padStart(2, '0') + ' ';
+        const c = chunk[j];
+        asc += (c >= 0x20 && c < 0x7f) ? String.fromCharCode(c) : '.';
+      } else {
+        hex += '   ';
+        asc += ' ';
+      }
+      if (j === 7) hex += ' ';
+    }
+    out += `<span class="off">${i.toString(16).padStart(6, '0')}</span>  <span class="hex">${hex}</span> <span class="ascii">${escapeHtml(asc)}</span>\n`;
+  }
+  return out;
+}
+function selectNodeById(id) {
+  const n = graph.nodes.find(x => x.id === id);
+  if (n) selectNode(n);
+}
+// Exposed on window because nav-crumb anchors use inline onclick= handlers.
+window.selectNodeById = selectNodeById;
+window.selectFlow = selectFlow;
+
+let _findingsData = null;
+async function showFindingsReport(filterSev) {
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  if (!_findingsData) {
+    panel.innerHTML = '<div style="color:var(--text-faint);">loading findings…</div>';
+    _findingsData = await fetch('/api/findings').then(r => r.json());
+  }
+  const d = _findingsData;
+  const all = d.findings || [];
+  let shown = all;
+  if (filterSev && typeof filterSev === 'string') {
+    shown = all.filter(f => f.severity === filterSev);
+  }
+  const byCat = {};
+  for (const f of shown) { (byCat[f.category] = byCat[f.category] || []).push(f); }
+  const sevCounts = d.severity_counts || {};
+  const sevButtons = ['critical','high','medium','low','info'].map(s => {
+    const n = sevCounts[s] || 0;
+    const active = filterSev === s ? 'active' : '';
+    return `<button class="btn ${active}" data-sev="${s}" style="font-size:9px;">${s} · ${n}</button>`;
+  }).join('');
+  const catSections = Object.keys(byCat).sort().map(cat => {
+    const items = byCat[cat].map(renderFindingCard).join('');
+    return `<h3>${escapeHtml(cat)} (${byCat[cat].length})</h3>${items}`;
+  }).join('');
+  panel.innerHTML = `
+    <div class="ip-header"><div class="ip" style="color:var(--danger)">▣ security findings</div></div>
+    <div style="color:var(--text-dim); font-size:11px; margin-bottom:10px;">
+      ${all.length} findings across ${(d.categories||[]).length} categories
+    </div>
+    <div class="cat-filter">
+      <button class="btn ${!filterSev ? 'active' : ''}" data-sev="">all · ${all.length}</button>
+      ${sevButtons}
+    </div>
+    ${shown.length ? catSections : '<div style="color:var(--text-faint); padding:12px 0;">no findings match this filter.</div>'}
+  `;
+  panel.querySelectorAll('[data-sev]').forEach(b => b.addEventListener('click', e => {
+    e.preventDefault();
+    showFindingsReport(b.dataset.sev || null);
+  }));
+  panel.querySelectorAll('.f-host').forEach(a => a.addEventListener('click', e => {
+    e.preventDefault();
+    const peer = graph.nodes.find(n => n.id === a.dataset.ip);
+    if (peer) selectNode(peer);
+  }));
+}
+
+async function showCredsReport() {
+  const data = await fetch('/api/credentials').then(r => r.json());
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  const creds = data.credentials || [];
+
+  const byKind = {};
+  for (const c of creds) {
+    byKind[c.kind] = byKind[c.kind] || [];
+    byKind[c.kind].push(c);
+  }
+  const sections = Object.keys(byKind).sort().map(kind => {
+    const items = byKind[kind].map(renderCredCard).join('');
+    return `<h3>${kind} (${byKind[kind].length})</h3>${items}`;
+  }).join('');
+
+  panel.innerHTML = `
+    <div class="ip-header"><div class="ip" style="color:var(--danger)">🔑 extracted credentials</div></div>
+    <div style="color:var(--text-dim); font-size:11px; margin-bottom:10px;">
+      ${creds.length} credential artifacts found across ${Object.keys(byKind).length} service types
+    </div>
+    ${creds.length ? sections : '<div style="color:var(--text-faint); padding:12px 0;">no credentials extracted — either no plaintext auth flows were captured or extractors didn\'t match the payload format.</div>'}
+  `;
+}
+
+async function showPlaintextReport() {
+  const data = await fetch('/api/plaintext').then(r => r.json());
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  const flowsHtml = data.flows.length
+    ? data.flows.slice(0, 50).map(f => `
+      <div class="flow-item plaintext" data-peer="${f.src}">
+        <div><span class="peer">${f.src}</span> → <span class="peer">${f.dst}</span></div>
+        <div class="meta">${f.services.join(',')} · ${fmtNum(f.packets)} pkts · ${fmtBytes(f.bytes)} · :${f.ports.join(',')}</div>
+      </div>`).join('')
+    : '<div style="color:var(--text-faint)">no plaintext flows detected.</div>';
+  const samplesHtml = data.samples.length
+    ? data.samples.slice(0, 20).map(s => `
+      <div class="plaintext-sample">
+        <div class="sample-head">${s.service} · ${s.src} → ${s.dst}:${s.port}</div>
+        <div class="sample-body">${escapeHtml(s.snippet)}</div>
+      </div>`).join('')
+    : '<div style="color:var(--text-faint)">no captured samples.</div>';
+  panel.innerHTML = `
+    <div class="ip-header"><div class="ip" style="color:var(--danger)">⚠ plaintext report</div></div>
+    <div style="color:var(--text-dim); font-size:11px; margin-bottom:10px;">
+      ${data.flows.length} flows · ${data.samples.length} sample payloads captured
+    </div>
+    <h3>flows</h3>
+    <div class="flow-list">${flowsHtml}</div>
+    <h3>payload samples</h3>
+    ${samplesHtml}
+  `;
+  panel.querySelectorAll('.flow-item').forEach(el => el.addEventListener('click', () => {
+    const peer = graph.nodes.find(n => n.id === el.dataset.peer);
+    if (peer) selectNode(peer);
+  }));
+}
+
+document.getElementById('search').addEventListener('input', e => {
+  filters.search = e.target.value; applyFilters();
+});
+['private','public','multicast'].forEach(k => {
+  document.getElementById('f-' + k).addEventListener('change', e => {
+    filters[k] = e.target.checked; applyFilters();
+  });
+});
+document.getElementById('f-plaintext-only').addEventListener('change', e => {
+  filters.plaintextOnly = e.target.checked; applyFilters();
+});
+document.getElementById('f-hide-noise').addEventListener('change', e => {
+  filters.hideNoise = e.target.checked; applyFilters();
+});
+document.getElementById('btn-reset').addEventListener('click', () => {
+  d3.select('#graph').transition().duration(400).call(
+    d3.zoom().transform, d3.zoomIdentity
+  );
+});
+document.getElementById('btn-center').addEventListener('click', () => {
+  if (simulation) simulation.alpha(0.5).restart();
+});
+document.getElementById('btn-freeze').addEventListener('click', e => {
+  frozen = !frozen;
+  e.target.classList.toggle('active', frozen);
+  e.target.textContent = frozen ? 'unfreeze sim' : 'freeze sim';
+  if (frozen) simulation.stop(); else simulation.alpha(0.3).restart();
+});
+document.getElementById('btn-plaintext-report').addEventListener('click', () => { _viewMode = 'report'; showPlaintextReport(); });
+document.getElementById('btn-creds-report').addEventListener('click', () => { _viewMode = 'report'; showCredsReport(); });
+document.getElementById('btn-findings-report').addEventListener('click', () => { _viewMode = 'report'; showFindingsReport(null); });
+document.getElementById('btn-live-start').addEventListener('click', liveStart);
+document.getElementById('btn-live-stop').addEventListener('click', liveStop);
+document.getElementById('btn-live-save').addEventListener('click', liveSaveToggle);
+
+window.addEventListener('resize', () => {
+  resizeGraph();
+});
+
+init();
+</script>
+</body>
+</html>
