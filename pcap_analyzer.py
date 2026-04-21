@@ -354,10 +354,7 @@ WEAK_TLS_CIPHER_SUITES = {
     0x0019: "EXPORT_DH_anon_DES40_CBC_SHA",
     0x001A: "DH_anon_DES_CBC_SHA",
     0x001B: "DH_anon_3DES_EDE_CBC_SHA",
-    0x002F: "",  # placeholder; RSA_WITH_AES_128_CBC_SHA is not weak by default
 }
-# Prune the empty placeholder used only for readability above.
-WEAK_TLS_CIPHER_SUITES = {k: v for k, v in WEAK_TLS_CIPHER_SUITES.items() if v}
 
 DEFAULT_CREDENTIALS = {
     ("admin",     "admin"),       ("admin",     "password"),  ("admin",     ""),
@@ -1179,7 +1176,6 @@ class PcapAnalysis:
                 hosts=[dst], port=port, evidence=srv[:160],
                 remediation="ServerTokens Prod / server_tokens off / remove X-Powered-By.",
                 key=("http-server", dst, srv[:80]))
-        # Admin / panel paths — useful recon target indicator
         path_m = re.match(r"(?:GET|POST|PUT|DELETE|HEAD) (\S+)", text)
         if path_m:
             path = path_m.group(1)
@@ -1291,7 +1287,6 @@ class PcapAnalysis:
                     pass
 
     def _d_irc_c2(self, src, dst, port, payload):
-        # Trigger on text that looks IRC-y; skip obvious non-text payloads fast.
         if len(payload) < 6 or payload[0] > 0x7f:
             return
         try:
@@ -1438,9 +1433,6 @@ class PcapAnalysis:
                 pos += l
 
     def _d_rdp(self, src, dst, dport, payload):
-        # X.224 Connection Request carries negotiation data; scapy won't give us flags
-        # for free. We flag the existence of RDP and, when possible, the Standard
-        # Security (RDP-level encryption only) request type.
         self._add_finding("info", "rdp",
             "RDP traffic observed",
             f"{src} → {dst}:{dport} Remote Desktop. Verify NLA is required and patch level "
@@ -1448,7 +1440,6 @@ class PcapAnalysis:
             hosts=[src, dst], port=dport,
             remediation="Require NLA (CredSSP); disable RDP Security Layer 0 (Standard); patch BlueKeep.",
             key=("rdp", dst))
-        # Presence of "Cookie: mstshash=" in plaintext X.224 Connection Request
         if b"Cookie: mstshash=" in payload[:64]:
             try:
                 m = re.search(rb"Cookie: mstshash=([^\r\n]+)", payload[:128])
@@ -1466,8 +1457,7 @@ class PcapAnalysis:
                 pass
 
     def _d_vnc_none(self, src, dst, payload):
-        # After RFB ProtocolVersion exchange, server sends SecurityTypes:
-        # [1-byte count][count × 1-byte type]. Type 1 = None.
+        # RFB SecurityTypes: [count][types...]; count=1, type=1 = "None" (no auth).
         if len(payload) >= 2 and payload[0] == 1 and payload[1] == 1:
             self._add_finding("critical", "weak-auth",
                 "VNC server with no authentication (type 'None')",
@@ -1496,13 +1486,11 @@ class PcapAnalysis:
             key=("nfs", dst))
 
     def _d_heartbleed(self, src, dst, port, payload):
-        # Heartbleed: TLS record type 24 (heartbeat) with payload length > actual data.
-        # Classic exploit requests ~16000-byte response.
+        # TLS heartbeat (type 24) advertising payload_length > record_length = Heartbleed.
         if len(payload) < 8:
             return
         if payload[0] == 0x18 and payload[1] == 0x03 and payload[2] in (0x01, 0x02, 0x03):
             rec_len = (payload[3] << 8) | payload[4]
-            # Heartbeat message: type (1) + payload_length (2) + payload + padding.
             if rec_len < 30 and len(payload) >= 8 and payload[5] == 0x01:
                 hb_len = (payload[6] << 8) | payload[7]
                 if hb_len > rec_len:
