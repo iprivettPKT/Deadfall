@@ -1201,7 +1201,6 @@ async function liveStop() {
   if (saveBefore.saving) {
     return promptStopWithSave(saveBefore);
   }
-  // Not recording — stop immediately.
   await doStop();
   // If a prior recording from earlier in the session exists on disk, still offer download.
   if (saveBefore.path) {
