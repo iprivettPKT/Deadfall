@@ -33,6 +33,13 @@ a prioritized list of pentester-relevant findings in one pass.
   optionally record to pcap, and hit stop to get a save prompt.
 - **Security findings report** — all findings grouped by severity and
   category, filterable, with clickable host links back into the graph.
+- **Attack-path analyzer** — derives offensive playbooks from the active
+  findings (NTLM relay, mitm6 → AD takeover, Kerberoasting, GPP
+  cpassword decrypt, cloud IMDS SSRF, EternalBlue, web-exploit
+  follow-through, ICS/OT direct control, exposed-management-plane RCE,
+  Heartbleed, credential spray, session hijacking, and more). Each path
+  lists affected hosts, numbered step-by-step commands, and the tools
+  you'd reach for.
 
 ## Install
 
@@ -252,6 +259,7 @@ vulnerability evidence with no access control.
 | `GET /api/plaintext` | all plaintext flows + captured payload samples |
 | `GET /api/credentials` | all extracted credential artifacts |
 | `GET /api/findings` | all findings, filterable by `?severity=`, `?category=`, `?host=` |
+| `GET /api/attack-paths` | ranked attack-path playbooks derived from current findings |
 | `GET /api/live/status` | live capture + recording state |
 | `GET /api/live/interfaces` | list available capture interfaces |
 | `POST /api/live/start` | body `{iface, bpf?}` |
