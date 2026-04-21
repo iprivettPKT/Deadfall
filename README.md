@@ -189,6 +189,36 @@ User-Agent matches for **sqlmap**, **Nikto**, **Nmap NSE**, **masscan**,
 - Tech-stack disclosure headers (X-Powered-By, X-AspNet-Version,
   X-AspNetMvc-Version, X-Generator).
 
+### Cloud
+
+- **Cloud-service fingerprints** (AWS / Azure / GCP) — S3, EC2, STS,
+  IAM, API Gateway, Lambda, DynamoDB, Secrets Manager, ECR, Azure Blob,
+  Files, Queue, Key Vault, SQL Database, ACR, Entra ID, GCS, App Engine,
+  Cloud Run, Artifact Registry, GCR, Firebase. Matched on HTTP `Host:`
+  and TLS SNI. Secrets Manager / Key Vault / IAM / STS / IMDS raised
+  to `high` severity.
+- **IMDSv1 requests (AWS)** — `169.254.169.254/latest/meta-data/`
+  without `X-aws-ec2-metadata-token` header = SSRF-reachable instance
+  credentials. IMDSv2 (token-authenticated) logged as info.
+- **GCP IMDS probes** without `Metadata-Flavor: Google`.
+- **Azure IMDS probes** without `Metadata: true`.
+- **AWS Sigv4** — attributes cloud API calls to an access key id.
+- **Secret / key material leaked in plaintext HTTP**:
+  AWS access keys (AKIA/ASIA/…), AWS secret keys, AWS session tokens,
+  GCP service-account JSON keys, Google API keys (`AIza…`),
+  Azure Storage connection strings, Azure SAS tokens,
+  GitHub classic + fine-grained PATs (`ghp_…`, `github_pat_…`),
+  GitLab PATs (`glpat-…`), Slack tokens (`xox[baprs]-…`),
+  Slack + Discord webhook URLs, Stripe keys (`sk_live_…`),
+  Twilio SIDs, npm tokens, PyPI tokens, PEM/OpenSSH private keys,
+  JWTs (with `alg=none` and short-HMAC escalations),
+  generic `api_key=` / `x-api-key:` / `access_token=` patterns.
+- **Kubernetes service-account JWT** — extracts `namespace/service-
+  account` from the decoded token payload.
+- **GraphQL introspection** (`__schema` queries).
+- **OAuth code / id_token / access_token in URL query strings**
+  (leaks via Referer / proxy logs / browser history).
+
 ### Banner / version disclosure
 
 FTP 220 banner (with specific alarms for **vsftpd 2.3.4 backdoor**

