@@ -7,7 +7,7 @@ runs a battery of pentester-oriented security detectors, and serves an
 interactive UI.
 
 Usage:
-    python3 pcap_analyzer.py capture.pcap
+    python3 deadfall.py capture.pcap
     # then open http://127.0.0.1:5000
 
 Author: built for Isaac @ Packetlabs
