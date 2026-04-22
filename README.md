@@ -58,17 +58,17 @@ Npcap (Windows) and raw-socket privileges (root / `CAP_NET_RAW`).
 ### File mode
 
 ```bash
-python3 pcap_analyzer.py path/to/capture.pcap
+python3 deadfall.py path/to/capture.pcap
 # open http://127.0.0.1:5000
 ```
 
 ### Live mode
 
 ```bash
-sudo python3 pcap_analyzer.py --live eth0
-sudo python3 pcap_analyzer.py --live eth0 --bpf "tcp port 445 or port 88"
-sudo python3 pcap_analyzer.py --live eth0 --save-to /pentest/run1.pcap
-python3 pcap_analyzer.py --list-ifaces
+sudo python3 deadfall.py --live eth0
+sudo python3 deadfall.py --live eth0 --bpf "tcp port 445 or port 88"
+sudo python3 deadfall.py --live eth0 --save-to /pentest/run1.pcap
+python3 deadfall.py --list-ifaces
 ```
 
 In the UI you can start/stop captures, toggle ● record, type a BPF
@@ -303,7 +303,7 @@ vulnerability evidence with no access control.
 
 ## Architecture notes
 
-- `pcap_analyzer.py` — single-file Flask backend with `PcapAnalysis`
+- `deadfall.py` — single-file Flask backend with `PcapAnalysis`
   (one streaming pass over the capture, or a live sniff thread)
   feeding dicts of hosts / flows / findings. `LiveCapture` wraps
   `scapy.sniff()` with a pcap writer for recording.
@@ -323,7 +323,7 @@ vulnerability evidence with no access control.
 - In-memory analysis, one PCAP per process. Not multi-tenant.
 - No build step on the frontend — keep CDN d3 and inline CSS/JS.
 - Plaintext vs encrypted classification lives in `PLAINTEXT_PORTS` /
-  `ENCRYPTED_PORTS` dicts near the top of `pcap_analyzer.py`.
+  `ENCRYPTED_PORTS` dicts near the top of `deadfall.py`.
 - Web-attack patterns live in `WEB_ATTACK_PATTERNS`; ICS ports in
   `ICS_PORTS`; insecure mgmt surfaces in `INSECURE_MANAGEMENT_PORTS`;
   default creds in `DEFAULT_CREDENTIALS`. Add to those tables to
@@ -332,7 +332,7 @@ vulnerability evidence with no access control.
 ## Known issues
 
 - Scapy's IPv6 route enumeration crashes in some Linux containers.
-  The rtnetlink monkeypatch at the top of `pcap_analyzer.py` works
+  The rtnetlink monkeypatch at the top of `deadfall.py` works
   around it — don't remove it.
 - Live capture needs raw-socket privileges; on failure the error is
   surfaced in the UI's LIVE badge (and in `/api/live/status`).
