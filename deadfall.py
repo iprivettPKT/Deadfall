@@ -2957,6 +2957,16 @@ class PcapAnalysis:
         self.icmp_targets = defaultdict(set)
         self.flow_ts = defaultdict(list)
         self.ntlm_messages = []
+        # Assembled, hashcat-ready NetNTLM hashes (Type 2 challenge paired with the
+        # Type 3 response on the same connection). _ntlm_challenges holds the most
+        # recent Type 2 server challenge per connection, keyed by direction-agnostic
+        # endpoint set, so a later Type 3 on that connection can be completed.
+        self.ntlm_hashes = []
+        self._ntlm_hash_seen = set()
+        self._ntlm_challenges = {}
+        # LLMNR / NBT-NS / mDNS query names — the resolution traffic Responder poisons.
+        self.poisonable_queries = []
+        self._poison_seen = set()
         self.smb1_flows = set()
         self.weak_tls_flows = set()
 
@@ -3926,8 +3936,42 @@ class PcapAnalysis:
                 "hostname": hostname, "vendor_class": vendor_class,
             }
 
+    def _record_poisonable(self, src, proto, name):
+        """Track a name-resolution query an attacker could answer (Responder targets)."""
+        if not name:
+            return
+        name = name.strip().rstrip(".")
+        if not name or name in ("*", "\x01\x02__MSBROWSE__\x02"):
+            return
+        k = (src, proto, name.lower())
+        if k in self._poison_seen:
+            return
+        self._poison_seen.add(k)
+        self.poisonable_queries.append({"src": src, "proto": proto, "name": name})
+
+    @staticmethod
+    def _dns_first_qname(payload):
+        """Parse the first QNAME from a DNS-wire payload (LLMNR/mDNS share the format)."""
+        try:
+            if len(payload) < 13:
+                return None
+            i, labels = 12, []
+            while i < len(payload):
+                ln = payload[i]
+                if ln == 0 or ln > 63:
+                    break
+                i += 1
+                labels.append(payload[i:i + ln].decode("ascii", errors="replace"))
+                i += ln
+                if len(labels) > 12:
+                    break
+            return ".".join(labels) if labels else None
+        except Exception:
+            return None
+
     def _d_name_resolution(self, src, dst, dport, payload):
         if dport == 5355:
+            self._record_poisonable(src, "LLMNR", self._dns_first_qname(payload))
             self._add_finding("high", "spoofable-resolution",
                 "LLMNR queries observed",
                 f"{src} performs LLMNR name resolution. Responder/Inveigh can trivially answer these "
@@ -3945,6 +3989,7 @@ class PcapAnalysis:
                     qname = dec.rstrip(b"\x00 ").decode("ascii", errors="replace")
                 except Exception:
                     qname = None
+            self._record_poisonable(src, "NBT-NS", qname)
             self._add_finding("high", "spoofable-resolution",
                 "NBT-NS queries observed",
                 f"{src} performs NetBIOS name-service broadcasts. Poison with Responder (-I iface) "
@@ -3970,6 +4015,7 @@ class PcapAnalysis:
                     if not h.get("nbns_name"):
                         h["nbns_name"] = name
         elif dport == 5353:
+            self._record_poisonable(src, "mDNS", self._dns_first_qname(payload))
             self._add_finding("medium", "spoofable-resolution",
                 "mDNS queries observed",
                 f"{src} uses multicast DNS on the local segment. Same-subnet attacker can impersonate services.",
@@ -4028,46 +4074,100 @@ class PcapAnalysis:
                 remediation="Inspect DNS egress; restrict recursive resolvers; log and alert on >30-char labels.",
                 key=("dns-tunnel", src, label[:12]))
 
-    def _d_ntlm(self, src, dst, port, payload):
+    def _conn_key(self, src, sport, dst, dport):
+        """Direction-agnostic key for a TCP connection — the Type 2 (server→client)
+        and Type 3 (client→server) of one NTLM handshake map to the same key."""
+        return frozenset({(src, sport), (dst, dport)})
+
+    def _d_ntlm(self, src, dst, sport, dport, payload):
+        """Locate a raw NTLMSSP token in a payload (SMB/MSSQL/LDAP) and ingest it."""
         idx = payload.find(b"NTLMSSP\x00")
         if idx < 0:
             return
-        if idx + 12 > len(payload):
+        if (dport in (139, 445)) or (sport in (139, 445)):
+            proto = "SMB"
+        elif (dport in (389, 636)) or (sport in (389, 636)):
+            proto = "LDAP"
+        elif dport == 1433 or sport == 1433:
+            proto = "MSSQL"
+        else:
+            proto = "raw"
+        connkey = self._conn_key(src, sport, dst, dport)
+        self._ingest_ntlm(connkey, src, dst, dport, proto, payload[idx:])
+
+    def _d_http_ntlm(self, src, dst, sport, dport, http_text):
+        """NTLM/Negotiate carried in HTTP auth headers (WPAD, web auth, WinRM).
+        Authorization/Proxy-Authorization carry Type 1/3 (client→server);
+        WWW-Authenticate/Proxy-Authenticate carry Type 2 (server→client)."""
+        for m in re.finditer(
+                r'(?im)^(?:Authorization|WWW-Authenticate|Proxy-Authorization|Proxy-Authenticate):'
+                r'\s*(?:NTLM|Negotiate)\s+([A-Za-z0-9+/=]{8,})\s*$', http_text):
+            try:
+                blob = base64.b64decode(m.group(1), validate=False)
+            except Exception:
+                continue
+            i = blob.find(b"NTLMSSP\x00")
+            if i < 0:
+                continue
+            connkey = self._conn_key(src, sport, dst, dport)
+            self._ingest_ntlm(connkey, src, dst, dport, "HTTP", blob[i:])
+
+    def _ingest_ntlm(self, connkey, src, dst, port, proto, blob):
+        """Process one NTLMSSP message (blob starts at the 'NTLMSSP\\x00' signature).
+        Type 2 challenges are cached per connection; Type 3 responses are paired with
+        the cached challenge to emit a complete, hashcat-crackable NetNTLM hash."""
+        if len(blob) < 12:
             return
         try:
-            mtype = struct.unpack_from("<I", payload, idx + 8)[0]
+            mtype = struct.unpack_from("<I", blob, 8)[0]
         except Exception:
             return
         if mtype not in (1, 2, 3):
             return
-        info = {"src": src, "dst": dst, "port": port, "type": mtype}
-        if mtype == 3 and idx + 64 <= len(payload):
+        info = {"src": src, "dst": dst, "port": port, "proto": proto, "type": mtype}
+        if mtype == 2 and len(blob) >= 32:
+            try:
+                challenge = blob[24:32]
+                info["challenge"] = challenge.hex()
+                self._ntlm_challenges[connkey] = challenge.hex()
+                self._add_finding("high", "ntlm-capture",
+                    "NTLMSSP Type 2 challenge issued",
+                    f"Server {src}:{port} issued NTLM challenge {challenge.hex()} ({proto}). Combined with "
+                    f"a Type 3 response this yields a crackable hash.",
+                    hosts=[src, dst], port=port, evidence=challenge.hex(),
+                    remediation="See NTLMSSP Type 3 finding.",
+                    key=("ntlm2", src, dst, challenge.hex()))
+            except Exception:
+                pass
+        elif mtype == 3 and len(blob) >= 64:
             def sec_buf(off):
-                ln, _mx, boff = struct.unpack_from("<HHI", payload, idx + off)
-                start = idx + boff
-                return payload[start:start + ln]
+                ln, _mx, boff = struct.unpack_from("<HHI", blob, off)
+                return blob[boff:boff + ln]
             try:
                 lm_resp = sec_buf(12)
                 nt_resp = sec_buf(20)
-                dom = sec_buf(28)
-                user = sec_buf(36)
-                host = sec_buf(44)
-                flags = struct.unpack_from("<I", payload, idx + 60)[0]
+                flags = struct.unpack_from("<I", blob, 60)[0]
                 enc = "utf-16-le" if (flags & 0x00000001) else "latin1"
-                domain = dom.decode(enc, errors="replace")
-                username = user.decode(enc, errors="replace")
-                workstation = host.decode(enc, errors="replace")
+                domain = sec_buf(28).decode(enc, errors="replace")
+                username = sec_buf(36).decode(enc, errors="replace")
+                workstation = sec_buf(44).decode(enc, errors="replace")
                 info.update({
                     "user": username, "domain": domain, "workstation": workstation,
                     "nt_resp_len": len(nt_resp), "lm_resp_len": len(lm_resp),
                     "nt_resp_hex": nt_resp.hex(),
                 })
                 ntlmv2 = len(nt_resp) > 24
+                challenge = self._ntlm_challenges.get(connkey)
+                self._assemble_ntlm_hash(src, dst, port, proto, username, domain,
+                                         workstation, lm_resp, nt_resp, ntlmv2, challenge)
                 self._add_finding("critical", "ntlm-capture",
-                    f"NTLMSSP Type 3 captured — {domain}\\{username} ({'v2' if ntlmv2 else 'v1'})",
-                    f"Auth response {src} → {dst}:{port}. Pair with the Type 2 server challenge "
-                    f"(look in this same flow) to yield a hashcat-crackable hash. "
-                    f"NTLMv1 = SMB relay + instantly crackable; NTLMv2 = offline crack with rockyou/rules.",
+                    f"NTLMSSP Type 3 captured — {domain}\\{username} ({'v2' if ntlmv2 else 'v1'}, {proto})",
+                    f"Auth response {src} → {dst}:{port}. "
+                    + ("Paired with its Type 2 challenge → a hashcat-crackable hash is in the AD/hashes tab. "
+                       if challenge else
+                       "No Type 2 challenge was seen on this connection, so the hash can't be completed "
+                       "(challenge likely in an earlier/unmatched segment). ")
+                    + "NTLMv1 = SMB relay + instantly crackable; NTLMv2 = offline crack with rockyou/rules.",
                     hosts=[src, dst], port=port,
                     evidence=f"{domain}\\{username} @ {workstation}",
                     remediation="Enforce SMB signing, disable NTLMv1, restrict NTLM via GPO, prefer Kerberos.",
@@ -4078,20 +4178,37 @@ class PcapAnalysis:
                                      extra=f"workstation={workstation} nt={nt_resp.hex()[:48]}…")
             except Exception:
                 pass
-        elif mtype == 2 and idx + 32 <= len(payload):
-            try:
-                challenge = payload[idx + 24:idx + 32]
-                info["challenge"] = challenge.hex()
-                self._add_finding("high", "ntlm-capture",
-                    "NTLMSSP Type 2 challenge issued",
-                    f"Server {src}:{port} issued NTLM challenge {challenge.hex()}. Combined with "
-                    f"a Type 3 response this yields a crackable hash.",
-                    hosts=[src, dst], port=port, evidence=challenge.hex(),
-                    remediation="See NTLMSSP Type 3 finding.",
-                    key=("ntlm2", src, dst, challenge.hex()))
-            except Exception:
-                pass
         self.ntlm_messages.append(info)
+
+    def _assemble_ntlm_hash(self, src, dst, port, proto, username, domain,
+                            workstation, lm_resp, nt_resp, ntlmv2, challenge):
+        """Build a hashcat-format NetNTLM string from a paired challenge + response.
+        v2 (mode 5600): user::domain:challenge:NTproofstr:blob
+        v1 (mode 5500): user::domain:lmresp:ntresp:challenge"""
+        if not challenge or not username:
+            return
+        if ntlmv2:
+            if len(nt_resp) < 16:
+                return
+            ntproof = nt_resp[:16].hex()
+            blob = nt_resp[16:].hex()
+            hashcat = f"{username}::{domain}:{challenge}:{ntproof}:{blob}"
+            mode, label = 5600, "NetNTLMv2"
+        else:
+            if len(nt_resp) != 24:
+                return
+            hashcat = f"{username}::{domain}:{lm_resp.hex()}:{nt_resp.hex()}:{challenge}"
+            mode, label = 5500, "NetNTLMv1"
+        dkey = (label, username, domain, hashcat)
+        if dkey in self._ntlm_hash_seen:
+            return
+        self._ntlm_hash_seen.add(dkey)
+        self.ntlm_hashes.append({
+            "type": label, "mode": mode, "proto": proto,
+            "user": username, "domain": domain, "workstation": workstation,
+            "src": src, "dst": dst, "port": port,
+            "challenge": challenge, "hashcat": hashcat,
+        })
 
     def _d_kerberos(self, src, dst, port, payload):
         # ASN.1 tag [0] INTEGER for enctype: a0 03 02 01 XX. 0x01/0x03=DES, 0x17=RC4 — all roastable.
@@ -4960,7 +5077,7 @@ class PcapAnalysis:
 
             if payload_bytes:
                 try:
-                    self._d_ntlm(src, dst, dport, payload_bytes)
+                    self._d_ntlm(src, dst, sport, dport, payload_bytes)
                     if dport == 88 or sport == 88:
                         self._d_kerberos(src, dst, 88, payload_bytes)
                     if dport in (139, 445) or sport in (139, 445):
@@ -4978,6 +5095,7 @@ class PcapAnalysis:
                             http_text = payload_bytes[:4096].decode("utf-8", errors="replace")
                             http_port = dport if dport in (80, 8080, 8000, 8888) else sport
                             self._d_http_payload(src, dst, http_port, http_text)
+                            self._d_http_ntlm(src, dst, sport, dport, http_text)
                             self._d_binary_secrets(src, dst, http_port, payload_bytes[:8192])
                             # Responses originate from the server; key hygiene checks off the server side.
                             if http_text.startswith("HTTP/"):
@@ -5726,6 +5844,44 @@ def api_credentials():
     if not analysis:
         return jsonify({"error": "no pcap loaded"}), 404
     return jsonify({"credentials": analysis.credentials})
+
+
+@app.route("/api/auth")
+def api_auth():
+    """AD / NTLM recon loot: assembled hashcat hashes, captured usernames, and the
+    LLMNR/NBT-NS/mDNS queries an attacker could poison (Responder targets)."""
+    if not analysis:
+        return jsonify({"error": "no pcap loaded"}), 404
+    with analysis.lock:
+        hashes = list(analysis.ntlm_hashes)
+        poison = list(analysis.poisonable_queries)
+        msgs = list(analysis.ntlm_messages)
+    ntlmv2 = [h for h in hashes if h["mode"] == 5600]
+    ntlmv1 = [h for h in hashes if h["mode"] == 5500]
+    # Type 3 messages whose hash couldn't be completed (no paired challenge seen).
+    have = {(h["user"], h["domain"]) for h in hashes}
+    seen_users, users = set(), []
+    for m in msgs:
+        if m.get("type") != 3 or not m.get("user"):
+            continue
+        key = (m.get("domain", ""), m["user"])
+        if key in seen_users:
+            continue
+        seen_users.add(key)
+        users.append({
+            "user": m["user"], "domain": m.get("domain", ""),
+            "workstation": m.get("workstation", ""), "proto": m.get("proto", ""),
+            "src": m.get("src"), "dst": m.get("dst"), "port": m.get("port"),
+            "has_hash": (m["user"], m.get("domain", "")) in have,
+        })
+    return jsonify({
+        "ntlmv2": ntlmv2, "ntlmv1": ntlmv1,
+        "users": users, "poisonable": poison,
+        "counts": {
+            "ntlmv2": len(ntlmv2), "ntlmv1": len(ntlmv1),
+            "users": len(users), "poisonable": len(poison),
+        },
+    })
 
 
 @app.route("/api/http")

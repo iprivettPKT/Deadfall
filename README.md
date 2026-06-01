@@ -22,12 +22,25 @@ a prioritized list of pentester-relevant findings in one pass.
 
 - **Interactive host graph** — every IP is a node, every flow is an edge.
   Node radius scales with traffic volume, red glow marks plaintext services,
-  edge color encodes plaintext / mixed / encrypted.
-- **Click any node** for a detail panel: in/out packet and byte counters,
-  WHOIS + reverse DNS, listening vs connecting ports, services observed,
-  DNS and TLS SNI names, inbound/outbound flow list, captured plaintext
-  samples, extracted credentials, and per-host security findings with a
-  risk score.
+  edge color encodes plaintext / mixed / encrypted. Pan/zoom with on-screen
+  zoom controls and a fit-to-view button; drag the divider to resize the
+  detail panel.
+- **Device identity** — nodes are labeled by OUI vendor (embedded table +
+  Wireshark `manuf` when present), inferred device type, and hostnames
+  harvested from DHCP, mDNS, NBT-NS, SSDP, and reverse DNS, so the graph
+  reads as real devices instead of bare IPs.
+- **Threat-intel reputation** — public IPs are checked against offline
+  reputation feeds; flagged nodes get a red glow and a tag in the tooltip
+  and detail panel.
+- **Quick graph denoise** — a noise-threshold slider hides low-volume flows
+  live, a "hide orphan nodes" toggle drops the disconnected-dot cloud that
+  filtering leaves behind, and a one-click **✨ denoise** button applies
+  sensible defaults (and reframes the graph) in one shot.
+- **Click any node** for a detail panel: device identity chips, in/out
+  packet and byte counters, WHOIS + reverse DNS, listening vs connecting
+  ports, services observed, DNS and TLS SNI names, inbound/outbound flow
+  list, captured plaintext samples, extracted credentials, reputation tags,
+  and per-host security findings with a risk score.
 - **Click any edge** for a per-flow packet inspector: sortable table of
   packets (relative time, flag chips, preview), and full hex/ASCII dump
   for any packet you click.
@@ -43,6 +56,16 @@ a prioritized list of pentester-relevant findings in one pass.
   Heartbleed, credential spray, session hijacking, and more). Each path
   lists affected hosts, numbered step-by-step commands, and the tools
   you'd reach for.
+- **AD / hashes tab** — a Responder-style loot view. Pairs each NTLMSSP
+  Type 2 challenge with its Type 3 response on the same connection and
+  emits ready-to-crack hashcat strings (NetNTLMv2 `-m 5600`, NetNTLMv1
+  `-m 5500`) with per-hash and copy-all buttons, captured from SMB **and**
+  HTTP (`Authorization`/`WWW-Authenticate: NTLM`). Also lists bare
+  usernames seen without a paired challenge and the LLMNR/NBT-NS/mDNS
+  queries an attacker could poison.
+- **HTTP transaction feed** — a global, searchable feed of paired
+  request/response transactions across every host, filterable by substring
+  or host IP.
 
 ## Install
 
@@ -97,9 +120,12 @@ evidence, and a remediation suggestion.
 
 ### LAN / Active Directory
 
-- **NTLMSSP capture** — NTLMv1/v2 Type 2 (challenge) and Type 3
-  (response) with `DOMAIN\user@workstation` extraction; each saved
-  alongside the credential record for hashcat work.
+- **NTLMSSP capture + hash assembly** — NTLMv1/v2 Type 2 (challenge) and
+  Type 3 (response) with `DOMAIN\user@workstation` extraction, over SMB,
+  LDAP, MSSQL, and HTTP (base64 `Authorization`/`WWW-Authenticate: NTLM`).
+  Type 2 and Type 3 are paired per connection into complete,
+  hashcat-crackable NetNTLMv2 (`-m 5600`) / NetNTLMv1 (`-m 5500`) strings,
+  surfaced in the **AD / hashes** tab.
 - **LLMNR / NBT-NS / mDNS poisoning opportunities** — any broadcast
   name resolution from a client, flagged with Responder guidance.
 - **WPAD lookups** (DNS and NBT-NS) — classic NTLM-relay foothold.
@@ -291,6 +317,8 @@ vulnerability evidence with no access control.
 | `GET /api/whois/<ip>` | RDAP whois + rDNS (cached) |
 | `GET /api/plaintext` | all plaintext flows + captured payload samples |
 | `GET /api/credentials` | all extracted credential artifacts |
+| `GET /api/auth` | assembled NetNTLM hashcat hashes, captured usernames, and poisonable LLMNR/NBT-NS/mDNS queries |
+| `GET /api/http` | global feed of paired HTTP request/response transactions (`?q=`, `?host=`, `?limit=`) |
 | `GET /api/findings` | all findings, filterable by `?severity=`, `?category=`, `?host=` |
 | `GET /api/attack-paths` | ranked attack-path playbooks derived from current findings |
 | `GET /api/live/status` | live capture + recording state |

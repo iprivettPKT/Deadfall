@@ -165,6 +165,30 @@
   .filter-row .count { color: var(--text-faint); font-size: 10px; }
   .filter-row:hover label { color: var(--text); }
 
+  /* Noise-threshold slider — matches the green/amber theme. */
+  .slider-row { display: block; margin: 8px 0; }
+  .slider-row .slider-head {
+    display: flex; align-items: center; justify-content: space-between;
+    color: var(--text-dim); user-select: none;
+  }
+  .slider-row .slider-head .count { color: var(--amber); font-size: 10px; }
+  input[type="range"] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 3px; margin-top: 8px;
+    background: var(--border-hot); border-radius: 2px; cursor: pointer;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--accent); border: 1px solid var(--bg);
+    box-shadow: 0 0 6px rgba(92,255,168,0.6); cursor: pointer;
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--accent); border: 1px solid var(--bg);
+    box-shadow: 0 0 6px rgba(92,255,168,0.6); cursor: pointer;
+  }
+
   input[type="text"] {
     width: 100%;
     background: var(--bg-3);
@@ -1137,9 +1161,16 @@
         <input type="checkbox" id="f-plaintext-only">
         <label for="f-plaintext-only">only plaintext flows</label>
       </div>
+      <div class="slider-row">
+        <div class="slider-head">
+          <label for="f-noise-threshold" style="cursor:pointer;">noise threshold</label>
+          <span class="count" id="noise-threshold-val">≥ 1 pkt</span>
+        </div>
+        <input type="range" id="f-noise-threshold" min="1" max="500" value="1" step="1">
+      </div>
       <div class="filter-row">
-        <input type="checkbox" id="f-hide-noise">
-        <label for="f-hide-noise">hide &lt;10 pkt flows</label>
+        <input type="checkbox" id="f-hide-orphans">
+        <label for="f-hide-orphans">hide orphan nodes</label>
       </div>
     </div>
 
@@ -1196,8 +1227,14 @@
       <button class="btn" id="btn-http-feed" style="width:100%; text-align:left; margin-bottom:4px;">
         🌐 http requests / responses
       </button>
-      <button class="btn" id="btn-lan-only" style="width:100%; text-align:left;">
+      <button class="btn" id="btn-auth-loot" style="width:100%; text-align:left; margin-bottom:4px;">
+        🔓 AD / hashes
+      </button>
+      <button class="btn" id="btn-lan-only" style="width:100%; text-align:left; margin-bottom:4px;">
         🏠 graph LAN only
+      </button>
+      <button class="btn" id="btn-denoise" style="width:100%; text-align:left;">
+        ✨ denoise
       </button>
     </div>
 
@@ -1235,7 +1272,7 @@ let simulation = null;
 let selectedNode = null;
 let filters = {
   private: true, public: true, multicast: false,
-  plaintextOnly: false, hideNoise: false, search: '',
+  plaintextOnly: false, noiseThreshold: 1, hideOrphans: false, search: '',
 };
 let frozen = false;
 const whoisCache = {};
@@ -1861,11 +1898,17 @@ function fitGraphToView() {
   if (!_graphState) return;
   const { svg, zoom, W, H } = _graphState;
   const nodes = (simulation && simulation.nodes()) || [];
-  // Honor filter visibility — don't fit to hidden nodes.
+  // Honor filter visibility — don't fit to hidden nodes. applyFilters() is the
+  // single source of truth (category + search + threshold + orphan hiding), so
+  // we read the display state it set rather than re-deriving the rules here.
+  const hidden = new Set();
+  if (window._sel) {
+    window._sel.nodeSel.each(function (n) {
+      if (this.style.display === 'none') hidden.add(n.id);
+    });
+  }
   const visible = nodes.filter(n => {
-    if (n.is_multicast && !filters.multicast) return false;
-    if (!n.is_multicast && n.is_private && !filters.private) return false;
-    if (!n.is_multicast && !n.is_private && !filters.public) return false;
+    if (hidden.has(n.id)) return false;
     return n.x != null && n.y != null;
   });
   if (!visible.length) return;
@@ -1889,20 +1932,36 @@ function applyFilters() {
   if (!window._sel) return;
   const { linkSel, nodeSel } = window._sel;
   const search = filters.search.toLowerCase().trim();
-  const nodeVisible = n => {
+  // Base visibility: category + search. Orphan-hiding is layered on top, since
+  // it depends on which edges survive the threshold/plaintext filters.
+  const baseVisible = n => {
     if (n.is_multicast && !filters.multicast) return false;
     if (!n.is_multicast && n.is_private && !filters.private) return false;
     if (!n.is_multicast && !n.is_private && !filters.public) return false;
     if (search && !n.id.toLowerCase().includes(search)) return false;
     return true;
   };
+  const edgeVisible = l => {
+    if (!baseVisible(l.source) || !baseVisible(l.target)) return false;
+    if (filters.plaintextOnly && !l.plaintext) return false;
+    if (l.packets < filters.noiseThreshold) return false;
+    return true;
+  };
+  // If hiding orphans, a node stays only if it has at least one visible edge.
+  let connected = null;
+  if (filters.hideOrphans) {
+    connected = new Set();
+    graph.links.forEach(l => {
+      if (edgeVisible(l)) { connected.add(l.source.id || l.source); connected.add(l.target.id || l.target); }
+    });
+  }
+  const nodeVisible = n => {
+    if (!baseVisible(n)) return false;
+    if (connected && !connected.has(n.id)) return false;
+    return true;
+  };
   nodeSel.style('display', n => nodeVisible(n) ? null : 'none');
-  linkSel.style('display', l => {
-    if (!nodeVisible(l.source) || !nodeVisible(l.target)) return 'none';
-    if (filters.plaintextOnly && !l.plaintext) return 'none';
-    if (filters.hideNoise && l.packets < 10) return 'none';
-    return null;
-  });
+  linkSel.style('display', l => edgeVisible(l) ? null : 'none');
 }
 
 function dragStart(e, d) {
@@ -2606,6 +2665,108 @@ function renderHttpTxn(t) {
     </div>`;
 }
 
+// Copy text to clipboard with a brief "copied ✓" flash on the triggering button.
+function copyText(text, btn) {
+  const flash = () => {
+    if (!btn) return;
+    const orig = btn.textContent;
+    btn.textContent = 'copied ✓';
+    setTimeout(() => { btn.textContent = orig; }, 1200);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(flash, flash);
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta); flash();
+  }
+}
+
+async function showAuthLoot() {
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  panel.innerHTML = '<div style="color:var(--text-faint); font-size:11px;">loading AD / NTLM loot…</div>';
+  let data;
+  try {
+    data = await fetch('/api/auth').then(r => r.json());
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--danger);">auth loot load failed: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  const c = data.counts || {};
+
+  // One hashcat hash: identity line + meta + the crackable string with a copy button.
+  const hashCard = h => `
+    <div style="border:1px solid var(--border); border-left:2px solid var(--danger); padding:8px 10px; margin-bottom:8px;">
+      <div style="color:var(--amber); font-weight:600;">${escapeHtml(h.domain || '.')}\\${escapeHtml(h.user)}
+        <span style="color:var(--text-faint); font-weight:400;">@ ${escapeHtml(h.workstation || '?')}</span></div>
+      <div style="color:var(--text-faint); font-size:10px; margin:2px 0 6px;">
+        ${h.src} → ${h.dst}:${h.port} · ${escapeHtml(h.proto)}</div>
+      <div style="display:flex; gap:6px; align-items:flex-start;">
+        <pre class="http-pre" style="flex:1; margin:0; white-space:pre-wrap; word-break:break-all; user-select:all;">${escapeHtml(h.hashcat)}</pre>
+        <button class="btn" style="flex-shrink:0;" onclick='copyText(${JSON.stringify(h.hashcat)}, this)'>copy</button>
+      </div>
+    </div>`;
+
+  const hashSection = (title, mode, list) => {
+    if (!list.length) return '';
+    const all = list.map(h => h.hashcat).join('\n');
+    return `
+      <div style="display:flex; align-items:center; justify-content:space-between; margin:14px 0 6px;">
+        <h3 style="margin:0;">${title} <span style="color:var(--text-faint); font-weight:400;">— hashcat -m ${mode} (${list.length})</span></h3>
+        <button class="btn" onclick='copyText(${JSON.stringify(all)}, this)'>copy all</button>
+      </div>
+      ${list.map(hashCard).join('')}`;
+  };
+
+  // Usernames seen in Type 3 messages we couldn't complete into a hash.
+  const orphanUsers = (data.users || []).filter(u => !u.has_hash);
+  const usersHtml = orphanUsers.length ? `
+    <h3 style="margin:14px 0 6px;">usernames (no paired challenge) <span style="color:var(--text-faint); font-weight:400;">(${orphanUsers.length})</span></h3>
+    <div style="font-size:11px; color:var(--text-dim);">
+      ${orphanUsers.map(u => `<div style="padding:3px 0; border-bottom:1px solid var(--border);">
+        <span style="color:var(--amber);">${escapeHtml(u.domain || '.')}\\${escapeHtml(u.user)}</span>
+        <span style="color:var(--text-faint);"> @ ${escapeHtml(u.workstation || '?')} · ${u.src} → ${u.dst}:${u.port} · ${escapeHtml(u.proto)}</span>
+      </div>`).join('')}
+    </div>` : '';
+
+  // Poisonable name-resolution queries, grouped by protocol (Responder targets).
+  const poison = data.poisonable || [];
+  const byProto = {};
+  poison.forEach(p => { (byProto[p.proto] = byProto[p.proto] || []).push(p); });
+  const poisonHtml = poison.length ? `
+    <h3 style="margin:14px 0 6px;">poisonable queries <span style="color:var(--text-faint); font-weight:400;">— Responder/Inveigh targets (${poison.length})</span></h3>
+    ${Object.keys(byProto).sort().map(proto => `
+      <div style="margin-bottom:8px;">
+        <div style="color:var(--accent); font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">${escapeHtml(proto)} (${byProto[proto].length})</div>
+        ${byProto[proto].map(p => `<div style="font-size:11px; padding:2px 0; border-bottom:1px solid var(--border);">
+          <span style="color:var(--text-faint);">${p.src}</span>
+          <span style="color:var(--text-faint);"> → </span>
+          <span style="color:var(--amber);">${escapeHtml(p.name)}</span>
+        </div>`).join('')}
+      </div>`).join('')}` : '';
+
+  const empty = (!c.ntlmv2 && !c.ntlmv1 && !orphanUsers.length && !poison.length)
+    ? `<div style="color:var(--text-faint); padding:14px 0;">no NTLM auth or poisonable name-resolution traffic captured. SMB/HTTP NTLM handshakes and LLMNR/NBT-NS/mDNS queries appear here.</div>`
+    : '';
+
+  panel.innerHTML = `
+    <div class="ip-header"><div class="ip" style="color:var(--danger);">🔓 AD / hashes</div></div>
+    <div style="color:var(--text-dim); font-size:11px; margin-bottom:6px;">
+      ${c.ntlmv2 || 0} NetNTLMv2 · ${c.ntlmv1 || 0} NetNTLMv1 · ${orphanUsers.length} bare usernames · ${c.poisonable || 0} poisonable queries
+    </div>
+    <div style="color:var(--text-faint); font-size:10px; margin-bottom:10px;">
+      crack offline: <code>hashcat -m 5600 hashes.txt rockyou.txt</code> (v2) · <code>-m 5500</code> (v1)
+    </div>
+    ${empty}
+    ${hashSection('NetNTLMv2', 5600, data.ntlmv2 || [])}
+    ${hashSection('NetNTLMv1', 5500, data.ntlmv1 || [])}
+    ${usersHtml}
+    ${poisonHtml}
+  `;
+}
+
 async function showCredsReport() {
   const data = await fetch('/api/credentials').then(r => r.json());
   const panel = document.getElementById('detail');
@@ -2676,8 +2837,53 @@ document.getElementById('search').addEventListener('input', e => {
 document.getElementById('f-plaintext-only').addEventListener('change', e => {
   filters.plaintextOnly = e.target.checked; applyFilters();
 });
-document.getElementById('f-hide-noise').addEventListener('change', e => {
-  filters.hideNoise = e.target.checked; applyFilters();
+// Noise-threshold slider — re-filters live as you drag. Keeps the sidebar,
+// the filters state, and the denoise button label in sync via syncDenoiseUI().
+document.getElementById('f-noise-threshold').addEventListener('input', e => {
+  filters.noiseThreshold = parseInt(e.target.value, 10) || 1;
+  syncDenoiseUI();
+  applyFilters();
+});
+document.getElementById('f-hide-orphans').addEventListener('change', e => {
+  filters.hideOrphans = e.target.checked; applyFilters();
+});
+
+// Reflect filters.{noiseThreshold,hideOrphans,multicast} back into the controls.
+function syncDenoiseUI() {
+  const t = filters.noiseThreshold;
+  document.getElementById('noise-threshold-val').textContent = '≥ ' + t + ' pkt' + (t === 1 ? '' : 's');
+  document.getElementById('f-noise-threshold').value = t;
+  document.getElementById('f-hide-orphans').checked = filters.hideOrphans;
+  document.getElementById('f-multicast').checked = filters.multicast;
+}
+
+// One-click denoise: aggressive defaults (≥25 pkt flows, hide orphans, drop
+// multicast). Click again to restore the pre-denoise state.
+let _denoiseSaved = null;
+document.getElementById('btn-denoise').addEventListener('click', () => {
+  const btn = document.getElementById('btn-denoise');
+  if (_denoiseSaved) {
+    filters.noiseThreshold = _denoiseSaved.noiseThreshold;
+    filters.hideOrphans    = _denoiseSaved.hideOrphans;
+    filters.multicast      = _denoiseSaved.multicast;
+    _denoiseSaved = null;
+    btn.classList.remove('active');
+    btn.textContent = '✨ denoise';
+  } else {
+    _denoiseSaved = {
+      noiseThreshold: filters.noiseThreshold,
+      hideOrphans: filters.hideOrphans,
+      multicast: filters.multicast,
+    };
+    filters.noiseThreshold = 25;
+    filters.hideOrphans = true;
+    filters.multicast = false;
+    btn.classList.add('active');
+    btn.textContent = '✨ denoised ✓ — click to restore';
+  }
+  syncDenoiseUI();
+  applyFilters();
+  if (typeof fitGraphToView === 'function') fitGraphToView();
 });
 document.getElementById('btn-reset').addEventListener('click', () => {
   d3.select('#graph').transition().duration(400).call(
@@ -2698,6 +2904,7 @@ document.getElementById('btn-creds-report').addEventListener('click', () => { _v
 document.getElementById('btn-findings-report').addEventListener('click', () => { _viewMode = 'report'; showFindingsReport(null); });
 document.getElementById('btn-attack-paths').addEventListener('click', () => { _viewMode = 'report'; showAttackPaths(); });
 document.getElementById('btn-http-feed').addEventListener('click', () => { _viewMode = 'report'; showHttpFeed(); });
+document.getElementById('btn-auth-loot').addEventListener('click', () => { _viewMode = 'report'; showAuthLoot(); });
 // LAN-only is a toggle: first press hides public/multicast; second press restores
 // whatever the user had selected previously. Button gets an .active class while
 // LAN-only is engaged so the state is visible at a glance.
