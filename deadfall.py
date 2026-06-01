@@ -20,6 +20,7 @@ import ipaddress
 import json
 import math
 import os
+import pickle
 import re
 import socket
 import struct
@@ -3025,6 +3026,7 @@ class PcapAnalysis:
     def __init__(self, pcap_path=None, source_label=None):
         self.pcap_path = pcap_path
         self.source_label = source_label or (os.path.basename(pcap_path) if pcap_path else "live")
+        self.source_files = [pcap_path] if pcap_path else []
         self.lock = threading.RLock()
         self.hosts = {}
         self.flows = {}
@@ -3265,11 +3267,11 @@ class PcapAnalysis:
             }
         return self.flows[key]
 
-    def parse(self, progress_cb=None):
-        if not self.pcap_path:
-            return
+    def _parse_one(self, path, progress_cb=None):
+        """Stream a single pcap into the accumulators. Does NOT finalize — so
+        several files can be merged into one analysis before rollup."""
         try:
-            with PcapReader(self.pcap_path) as pcap:
+            with PcapReader(path) as pcap:
                 for pkt in pcap:
                     try:
                         self._process_packet(pkt)
@@ -3281,10 +3283,79 @@ class PcapAnalysis:
                     if progress_cb and self.total_packets % 5000 == 0:
                         progress_cb(self.total_packets)
         except Exception as e:
-            print(f"[!] PCAP read error: {e}", file=sys.stderr)
+            print(f"[!] PCAP read error ({path}): {e}", file=sys.stderr)
+
+    def parse(self, progress_cb=None):
+        if not self.pcap_path:
+            return
+        self._parse_one(self.pcap_path, progress_cb)
         if progress_cb:
             progress_cb(self.total_packets)
         self._finalize()
+
+    def parse_many(self, paths, progress_cb=None, file_cb=None):
+        """Merge several pcaps into one analysis (one host graph), then finalize once."""
+        self.source_files = list(paths)
+        for p in paths:
+            if file_cb:
+                file_cb(p)
+            self._parse_one(p, progress_cb)
+        if progress_cb:
+            progress_cb(self.total_packets)
+        self._finalize()
+
+    # ----- Save / load analysis state -------------------------------------
+    # Pickle the post-parse serving state so a multi-day engagement survives a
+    # restart. Runtime-only fields (lock, thread pool) and transient parse-time
+    # accumulators (scan/beacon trackers — already rolled into findings) are
+    # dropped on save and recreated empty on load.
+    STATE_VERSION = 1
+    _NO_PICKLE = (
+        "lock", "_whois_pool", "_whois_inflight_lock", "_whois_inflight",
+        "scan_pairs", "scan_dport_by_dst", "icmp_targets", "flow_ts",
+        "_dhcp_by_mac", "_ntlm_challenges",
+        "_finding_seen", "_cred_seen", "_sni_seen",
+        "_ntlm_hash_seen", "_krb_hash_seen", "_poison_seen",
+    )
+
+    def __getstate__(self):
+        d = dict(self.__dict__)
+        for k in self._NO_PICKLE:
+            d.pop(k, None)
+        d["_state_version"] = self.STATE_VERSION
+        return d
+
+    def __setstate__(self, state):
+        state.pop("_state_version", None)
+        self.__dict__.update(state)
+        # Recreate runtime-only bits.
+        self.lock = threading.RLock()
+        self._whois_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="whois")
+        self._whois_inflight = set()
+        self._whois_inflight_lock = threading.Lock()
+        # Transient parse accumulators — empty; parsing is finished for a loaded state.
+        self.scan_pairs = defaultdict(set)
+        self.scan_dport_by_dst = defaultdict(lambda: defaultdict(set))
+        self.icmp_targets = defaultdict(set)
+        self.flow_ts = defaultdict(list)
+        self._dhcp_by_mac = {}
+        self._ntlm_challenges = {}
+        for s in ("_finding_seen", "_cred_seen", "_sni_seen",
+                  "_ntlm_hash_seen", "_krb_hash_seen", "_poison_seen"):
+            setattr(self, s, set())
+
+    def save_state(self, path):
+        with self.lock:
+            with open(path, "wb") as f:
+                pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def load_state(cls, path):
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        if not isinstance(obj, cls):
+            raise ValueError("not a Deadfall analysis state file")
+        return obj
 
     def ingest_live_packet(self, pkt):
         try:
@@ -6520,13 +6591,44 @@ def api_live_save_download():
                      mimetype="application/vnd.tcpdump.pcap")
 
 
+def _expand_pcap_args(args):
+    """Turn a mix of files and directories into an ordered, deduped pcap file list.
+    Directories are scanned (non-recursively) for *.pcap / *.pcapng / *.cap."""
+    exts = (".pcap", ".pcapng", ".cap")
+    files, seen = [], set()
+
+    def add(p):
+        rp = os.path.abspath(p)
+        if rp not in seen:
+            seen.add(rp)
+            files.append(p)
+
+    for a in args:
+        if os.path.isdir(a):
+            for name in sorted(os.listdir(a)):
+                full = os.path.join(a, name)
+                if os.path.isfile(full) and name.lower().endswith(exts):
+                    add(full)
+        elif os.path.isfile(a):
+            add(a)
+        else:
+            print(f"[!] skipping (not found): {a}", file=sys.stderr)
+    return files
+
+
 def main():
     ap = argparse.ArgumentParser(description="Deadfall — interactive PCAP host graph + security scan")
-    ap.add_argument("pcap", nargs="?", help="path to pcap/pcapng file (omit when using --live)")
+    ap.add_argument("pcap", nargs="*",
+                    help="one or more pcap/pcapng files, or directories to scan for them "
+                         "(omit when using --live or --load-state)")
     ap.add_argument("--live", metavar="IFACE", help="capture live from interface instead of a file")
     ap.add_argument("--bpf", metavar="FILTER", help="BPF capture filter (live mode)")
     ap.add_argument("--save-to", metavar="PATH",
                     help="save the live capture to this pcap file (live mode only)")
+    ap.add_argument("--save-state", metavar="PATH",
+                    help="after parsing, save the analysis to PATH so it can be reloaded later")
+    ap.add_argument("--load-state", metavar="PATH",
+                    help="load a previously saved analysis instead of parsing pcaps")
     ap.add_argument("--list-ifaces", action="store_true", help="list available capture interfaces and exit")
     ap.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
     ap.add_argument("--port", type=int, default=5000, help="bind port (default: 5000)")
@@ -6537,27 +6639,52 @@ def main():
             print(name)
         return
 
-    if not args.pcap and not args.live:
-        ap.error("either PCAP path or --live IFACE is required")
-    if args.pcap and args.live:
-        ap.error("pass either a PCAP path OR --live, not both")
+    modes = sum(bool(x) for x in (args.pcap, args.live, args.load_state))
+    if modes == 0:
+        ap.error("provide pcap file(s)/dir, --live IFACE, or --load-state PATH")
+    if modes > 1:
+        ap.error("pick one source: pcap file(s), --live, or --load-state")
 
     global analysis
 
-    if args.pcap:
-        if not os.path.exists(args.pcap):
-            print(f"[!] file not found: {args.pcap}", file=sys.stderr)
+    if args.load_state:
+        if not os.path.exists(args.load_state):
+            print(f"[!] state file not found: {args.load_state}", file=sys.stderr)
             sys.exit(1)
-        analysis = PcapAnalysis(args.pcap)
-        print(f"[*] parsing {args.pcap} ...")
+        print(f"[*] loading analysis state from {args.load_state} ...")
+        try:
+            analysis = PcapAnalysis.load_state(args.load_state)
+        except Exception as e:
+            print(f"[!] could not load state: {e}", file=sys.stderr)
+            sys.exit(1)
+        s = analysis.summary()
+        print(f"    hosts: {s['host_count']}  flows: {s['flow_count']}  findings: {s['finding_count']}")
+    elif args.pcap:
+        files = _expand_pcap_args(args.pcap)
+        if not files:
+            print(f"[!] no pcap files found in: {', '.join(args.pcap)}", file=sys.stderr)
+            sys.exit(1)
+        label = (os.path.basename(files[0]) if len(files) == 1
+                 else f"{len(files)} captures")
+        analysis = PcapAnalysis(source_label=label)
+        print(f"[*] parsing {len(files)} file(s) ...")
         t0 = time.time()
 
         def progress(n):
             sys.stdout.write(f"\r[*] processed {n} packets")
             sys.stdout.flush()
 
-        analysis.parse(progress_cb=progress)
+        def on_file(p):
+            sys.stdout.write(f"\n[*] {p}\n")
+
+        analysis.parse_many(files, progress_cb=progress, file_cb=on_file)
         print(f"\n[+] done in {time.time() - t0:.2f}s")
+        if args.save_state:
+            try:
+                analysis.save_state(args.save_state)
+                print(f"[+] saved analysis state to {args.save_state}")
+            except Exception as e:
+                print(f"[!] could not save state: {e}", file=sys.stderr)
         s = analysis.summary()
         sev = s["findings_by_severity"]
         print(f"    hosts: {s['host_count']}  flows: {s['flow_count']}  "
@@ -6566,8 +6693,6 @@ def main():
               f"(crit={sev['critical']} high={sev['high']} med={sev['medium']} "
               f"low={sev['low']} info={sev['info']})")
     else:
-        if args.save_to is None and args.pcap is None:
-            pass  # no-op, just clarifying the CLI validation already happened
         analysis = PcapAnalysis(source_label=f"live:{args.live}")
         live_capture.configure(analysis, args.live, args.bpf)
         if args.save_to:
