@@ -1230,6 +1230,9 @@
       <button class="btn" id="btn-auth-loot" style="width:100%; text-align:left; margin-bottom:4px;">
         🔓 AD / hashes
       </button>
+      <button class="btn" id="btn-export" style="width:100%; text-align:left; margin-bottom:4px;">
+        📦 export loot
+      </button>
       <button class="btn" id="btn-lan-only" style="width:100%; text-align:left; margin-bottom:4px;">
         🏠 graph LAN only
       </button>
@@ -2767,6 +2770,59 @@ async function showAuthLoot() {
   `;
 }
 
+async function showExport() {
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  panel.innerHTML = '<div style="color:var(--text-faint); font-size:11px;">tallying loot…</div>';
+  let c;
+  try {
+    c = await fetch('/api/export/counts').then(r => r.json());
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--danger);">export tally failed: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  // [endpoint, label, count, hashcat/usage hint]
+  const items = [
+    ['netntlmv2',       'NetNTLMv2 hashes',  c.netntlmv2,  'hashcat -m 5600'],
+    ['netntlmv1',       'NetNTLMv1 hashes',  c.netntlmv1,  'hashcat -m 5500'],
+    ['krb5tgs',         'Kerberoast (TGS)',  c.krb5tgs,    'hashcat -m 13100'],
+    ['krb5asrep',       'AS-REP roast',      c.krb5asrep,  'hashcat -m 18200'],
+    ['users',           'usernames',         c.users,      'spray / enum list'],
+    ['credentials.csv', 'credentials',       c.credentials,'CSV'],
+    ['findings.csv',    'findings',          c.findings,   'CSV'],
+    ['hosts.csv',       'host inventory',    c.hosts,      'CSV'],
+    ['report.md',       'engagement report', null,         'Markdown'],
+  ];
+  const rows = items.map(([kind, label, count, hint]) => {
+    const dim = (count === 0);
+    return `
+      <div style="display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid var(--border); ${dim ? 'opacity:0.45;' : ''}">
+        <div style="flex:1;">
+          <span style="color:var(--text);">${label}</span>
+          ${count !== null ? `<span style="color:var(--amber); margin-left:6px;">${count}</span>` : ''}
+          <span style="color:var(--text-faint); font-size:10px; margin-left:6px;">${escapeHtml(hint)}</span>
+        </div>
+        <a class="btn" href="/api/export/${kind}" download ${dim ? 'style="pointer-events:none;"' : ''}>download</a>
+      </div>`;
+  }).join('');
+  panel.innerHTML = `
+    <div class="ip-header"><div class="ip" style="color:var(--accent);">📦 export loot</div></div>
+    <div style="color:var(--text-dim); font-size:11px; margin-bottom:10px;">
+      Pull captured loot in tool-ready formats. Hash files feed hashcat directly; CSVs and the
+      Markdown report drop into your deliverable.
+    </div>
+    <a class="btn" href="/api/export/all.zip" download
+       style="display:block; text-align:center; padding:8px; margin-bottom:12px; background:var(--accent); color:var(--bg); border-color:var(--accent);">
+       ⬇ download all (zip)
+    </a>
+    ${rows}
+    <div style="color:var(--text-faint); font-size:10px; margin-top:12px;">
+      Empty artifacts are dimmed and excluded from the zip. Crack example:
+      <code>hashcat -m 5600 netntlmv2.txt rockyou.txt -r rules/best64.rule</code>
+    </div>
+  `;
+}
+
 async function showCredsReport() {
   const data = await fetch('/api/credentials').then(r => r.json());
   const panel = document.getElementById('detail');
@@ -2905,6 +2961,7 @@ document.getElementById('btn-findings-report').addEventListener('click', () => {
 document.getElementById('btn-attack-paths').addEventListener('click', () => { _viewMode = 'report'; showAttackPaths(); });
 document.getElementById('btn-http-feed').addEventListener('click', () => { _viewMode = 'report'; showHttpFeed(); });
 document.getElementById('btn-auth-loot').addEventListener('click', () => { _viewMode = 'report'; showAuthLoot(); });
+document.getElementById('btn-export').addEventListener('click', () => { _viewMode = 'report'; showExport(); });
 // LAN-only is a toggle: first press hides public/multicast; second press restores
 // whatever the user had selected previously. Button gets an .active class while
 // LAN-only is engaged so the state is visible at a glance.

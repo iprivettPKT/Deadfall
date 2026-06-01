@@ -14,6 +14,8 @@ Author: built for Isaac @ Packetlabs
 """
 import argparse
 import base64
+import csv
+import io
 import ipaddress
 import json
 import math
@@ -25,10 +27,11 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor
 
-from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
+from flask import Flask, Response, jsonify, render_template, request, send_file, send_from_directory
 
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
@@ -5225,6 +5228,203 @@ class PcapAnalysis:
         else:
             self._store_packet(ts, src, dst, f"IP/{proto_num}", size)
 
+    # ----- Engagement loot export -----------------------------------------
+    # Each builder returns a UTF-8 string. export_artifact() maps a kind name to
+    # (filename, mimetype, bytes); export_all_zip() bundles everything. All read
+    # under self.lock so exports are consistent against a live capture.
+
+    EXPORT_KINDS = (
+        "netntlmv2", "netntlmv1", "krb5tgs", "krb5asrep", "users",
+        "credentials.csv", "findings.csv", "hosts.csv", "report.md",
+    )
+
+    def _export_label(self):
+        base = re.sub(r"[^A-Za-z0-9_.-]", "_", self.source_label or "capture")
+        return base or "capture"
+
+    def _build_netntlm(self, mode):
+        lines = [h["hashcat"] for h in getattr(self, "ntlm_hashes", [])
+                 if h.get("mode") == mode]
+        return "\n".join(lines) + ("\n" if lines else "")
+
+    def _build_krb(self, label):
+        lines = [h["hashcat"] for h in getattr(self, "krb_hashes", [])
+                 if h.get("type") == label]
+        return "\n".join(lines) + ("\n" if lines else "")
+
+    def _build_users(self):
+        users = set()
+        for h in getattr(self, "ntlm_hashes", []):
+            if h.get("user"):
+                users.add(h["user"])
+        for m in self.ntlm_messages:
+            if m.get("type") == 3 and m.get("user"):
+                users.add(m["user"])
+        for c in self.credentials:
+            u = c.get("username")
+            if u:
+                users.add(u.split("\\", 1)[-1])  # strip DOMAIN\ prefix
+        users = sorted(u for u in users if u and u not in ("*", ""))
+        return "\n".join(users) + ("\n" if users else "")
+
+    def _build_credentials_csv(self):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["kind", "username", "password", "src", "dst", "port", "extra"])
+        for c in self.credentials:
+            w.writerow([c.get("kind", ""), c.get("username") or "", c.get("password") or "",
+                        c.get("src", ""), c.get("dst", ""), c.get("port", ""), c.get("extra") or ""])
+        return buf.getvalue()
+
+    def _build_findings_csv(self):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["id", "severity", "category", "title", "hosts", "port", "evidence", "remediation"])
+        for f in self.findings:
+            w.writerow([f.get("id", ""), f.get("severity", ""), f.get("category", ""),
+                        f.get("title", ""), ";".join(f.get("hosts", [])),
+                        f.get("port") if f.get("port") is not None else "",
+                        f.get("evidence") or "", f.get("remediation") or ""])
+        return buf.getvalue()
+
+    def _build_hosts_csv(self):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["ip", "mac", "vendor", "device_type", "hostname", "is_private",
+                    "ports_listening", "protocols", "plaintext_services", "whois_org",
+                    "whois_country", "reputation_tags", "malicious", "risk_score",
+                    "packets_in", "packets_out", "bytes_in", "bytes_out"])
+        for ip, h in sorted(self.hosts.items()):
+            if h.get("is_multicast") or ip in ("0.0.0.0", "255.255.255.255", "::"):
+                continue
+            w.writerow([
+                ip, h.get("mac") or "", h.get("vendor") or "", h.get("device_type") or "",
+                h.get("hostname") or pick_hostname(h) or "",
+                "yes" if h.get("is_private") else "no",
+                " ".join(str(p) for p in sorted(h.get("ports_listening", []))[:60]),
+                " ".join(sorted(h.get("protocols", []))),
+                " ".join(sorted(h.get("plaintext_services", []))),
+                h.get("whois_org") or "", h.get("whois_country") or "",
+                ";".join(h.get("reputation_tags", [])),
+                "yes" if h.get("malicious") else "no",
+                h.get("risk_score", 0),
+                h.get("packets_in", 0), h.get("packets_out", 0),
+                h.get("bytes_in", 0), h.get("bytes_out", 0),
+            ])
+        return buf.getvalue()
+
+    def _build_report_md(self):
+        sev_order = ["critical", "high", "medium", "low", "info"]
+        by_sev = {s: [] for s in sev_order}
+        for f in self.findings:
+            by_sev.setdefault(f.get("severity", "info"), []).append(f)
+        n_v2 = sum(1 for h in getattr(self, "ntlm_hashes", []) if h.get("mode") == 5600)
+        n_v1 = sum(1 for h in getattr(self, "ntlm_hashes", []) if h.get("mode") == 5500)
+        n_krb = len(getattr(self, "krb_hashes", []))
+        live_hosts = [ip for ip, h in self.hosts.items()
+                      if not h.get("is_multicast") and ip not in ("0.0.0.0", "255.255.255.255", "::")]
+        out = []
+        out.append(f"# Deadfall report — {self.source_label}\n")
+        out.append("## Summary\n")
+        out.append(f"- Hosts: {len(live_hosts)}")
+        out.append(f"- Flows: {len(self.flows)}")
+        out.append(f"- Findings: {len(self.findings)} "
+                   + ", ".join(f"{len(by_sev[s])} {s}" for s in sev_order if by_sev.get(s)))
+        out.append(f"- Captured credentials: {len(self.credentials)}")
+        out.append(f"- NetNTLM hashes: {n_v2} v2, {n_v1} v1 · Kerberos roast: {n_krb}\n")
+        out.append("## Findings\n")
+        for s in sev_order:
+            items = by_sev.get(s) or []
+            if not items:
+                continue
+            out.append(f"### {s.upper()} ({len(items)})\n")
+            for f in items:
+                hosts = ", ".join(f.get("hosts", [])) or "—"
+                port = f":{f['port']}" if f.get("port") is not None else ""
+                out.append(f"- **{f.get('title','')}** — `{hosts}{port}` _(category: {f.get('category','')})_")
+                if f.get("description"):
+                    out.append(f"  - {f['description']}")
+                if f.get("evidence"):
+                    out.append(f"  - Evidence: `{str(f['evidence'])[:300]}`")
+                if f.get("remediation"):
+                    out.append(f"  - Remediation: {f['remediation']}")
+            out.append("")
+        if self.credentials:
+            out.append("## Captured credentials\n")
+            for c in self.credentials:
+                up = c.get("username") or ""
+                if c.get("password"):
+                    up += f" / {c['password']}"
+                out.append(f"- `{c.get('kind','')}` {up} ({c.get('src','')} → {c.get('dst','')}:{c.get('port','')})"
+                           + (f" — {c['extra']}" if c.get("extra") else ""))
+            out.append("")
+        return "\n".join(out) + "\n"
+
+    def export_artifact(self, kind):
+        """Return (filename, mimetype, data_bytes) for a single artifact, or None."""
+        with self.lock:
+            builders = {
+                "netntlmv2":        (lambda: self._build_netntlm(5600),  "netntlmv2.txt", "text/plain"),
+                "netntlmv1":        (lambda: self._build_netntlm(5500),  "netntlmv1.txt", "text/plain"),
+                "krb5tgs":          (lambda: self._build_krb("krb5tgs"),  "krb5tgs.txt",   "text/plain"),
+                "krb5asrep":        (lambda: self._build_krb("krb5asrep"),"krb5asrep.txt", "text/plain"),
+                "users":            (self._build_users,            "users.txt",        "text/plain"),
+                "credentials.csv":  (self._build_credentials_csv,  "credentials.csv",  "text/csv"),
+                "findings.csv":     (self._build_findings_csv,     "findings.csv",     "text/csv"),
+                "hosts.csv":        (self._build_hosts_csv,        "hosts.csv",         "text/csv"),
+                "report.md":        (self._build_report_md,        "report.md",        "text/markdown"),
+            }
+            spec = builders.get(kind)
+            if not spec:
+                return None
+            build, fname, mime = spec
+            return (fname, mime, build().encode("utf-8"))
+
+    def export_all_zip(self):
+        """Bundle every non-empty artifact into a zip; return (filename, bytes)."""
+        label = self._export_label()
+        buf = io.BytesIO()
+        with self.lock:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for kind in self.EXPORT_KINDS:
+                    art = None
+                    builders = {
+                        "netntlmv2": lambda: self._build_netntlm(5600),
+                        "netntlmv1": lambda: self._build_netntlm(5500),
+                        "krb5tgs":   lambda: self._build_krb("krb5tgs"),
+                        "krb5asrep": lambda: self._build_krb("krb5asrep"),
+                        "users":           self._build_users,
+                        "credentials.csv": self._build_credentials_csv,
+                        "findings.csv":    self._build_findings_csv,
+                        "hosts.csv":       self._build_hosts_csv,
+                        "report.md":       self._build_report_md,
+                    }
+                    data = builders[kind]()
+                    # Skip empty hash/user lists; always include CSVs + report.
+                    if not data.strip() and kind in ("netntlmv2", "netntlmv1", "krb5tgs", "krb5asrep", "users"):
+                        continue
+                    fname = kind if "." in kind else kind + ".txt"
+                    zf.writestr(f"{label}/{fname}", data)
+        return (f"deadfall-loot-{label}.zip", buf.getvalue())
+
+    def export_counts(self):
+        """Per-artifact line/row counts for the export UI."""
+        with self.lock:
+            return {
+                "netntlmv2": sum(1 for h in getattr(self, "ntlm_hashes", []) if h.get("mode") == 5600),
+                "netntlmv1": sum(1 for h in getattr(self, "ntlm_hashes", []) if h.get("mode") == 5500),
+                "krb5tgs":   sum(1 for h in getattr(self, "krb_hashes", []) if h.get("type") == "krb5tgs"),
+                "krb5asrep": sum(1 for h in getattr(self, "krb_hashes", []) if h.get("type") == "krb5asrep"),
+                "users":     len(set(filter(None, (
+                                 [h.get("user") for h in getattr(self, "ntlm_hashes", [])]
+                                 + [m.get("user") for m in self.ntlm_messages if m.get("type") == 3]
+                                 + [(c.get("username") or "").split("\\", 1)[-1] for c in self.credentials])))),
+                "credentials": len(self.credentials),
+                "findings":  len(self.findings),
+                "hosts":     sum(1 for ip, h in self.hosts.items()
+                                 if not h.get("is_multicast") and ip not in ("0.0.0.0", "255.255.255.255", "::")),
+            }
+
     def _finalize(self):
         # Roll up device identity for every host.
         for ip, h in self.hosts.items():
@@ -5882,6 +6082,34 @@ def api_auth():
             "users": len(users), "poisonable": len(poison),
         },
     })
+
+
+@app.route("/api/export/counts")
+def api_export_counts():
+    if not analysis:
+        return jsonify({"error": "no pcap loaded"}), 404
+    return jsonify(analysis.export_counts())
+
+
+@app.route("/api/export/all.zip")
+def api_export_all():
+    if not analysis:
+        return jsonify({"error": "no pcap loaded"}), 404
+    fname, data = analysis.export_all_zip()
+    return Response(data, mimetype="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+@app.route("/api/export/<kind>")
+def api_export_kind(kind):
+    if not analysis:
+        return jsonify({"error": "no pcap loaded"}), 404
+    art = analysis.export_artifact(kind)
+    if not art:
+        return jsonify({"error": f"unknown export kind '{kind}'"}), 404
+    fname, mime, data = art
+    return Response(data, mimetype=mime,
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 @app.route("/api/http")
