@@ -58,14 +58,27 @@
     z-index: 0;
   }
 
+  :root { --detail-w: 380px; }
   #app {
     position: relative;
     z-index: 1;
     display: grid;
-    grid-template-columns: 280px 1fr 380px;
+    grid-template-columns: 280px 1fr 5px var(--detail-w);
     grid-template-rows: 44px 1fr;
     height: 100vh;
     gap: 0;
+  }
+  #detail-resizer {
+    background: var(--border);
+    cursor: ew-resize;
+    transition: background 0.1s;
+    user-select: none;
+    touch-action: none;          /* let pointer events drive the drag uninterrupted */
+    z-index: 6;
+  }
+  #detail-resizer:hover,
+  #detail-resizer.dragging {
+    background: var(--accent);
   }
   header {
     grid-column: 1 / -1;
@@ -182,6 +195,50 @@
     gap: 6px;
     z-index: 5;
   }
+  .zoom-controls {
+    position: absolute;
+    bottom: 14px; right: 14px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    z-index: 5;
+    user-select: none;
+  }
+  .zoom-controls .zbtn {
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 14px;
+    line-height: 1;
+    width: 30px;
+    height: 28px;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s;
+    padding: 0;
+  }
+  .zoom-controls .zbtn:last-child { border-bottom: none; }
+  .zoom-controls .zbtn:hover { background: var(--bg-2); color: var(--accent); }
+  .zoom-controls .zbtn:active { background: var(--bg-1); }
+  .zoom-controls .zlabel {
+    font-size: 9px;
+    color: var(--text-faint);
+    text-align: center;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    font-family: 'JetBrains Mono', monospace;
+    background: transparent;
+    border-left: none;
+    border-right: none;
+    border-top: none;
+    width: 30px;
+  }
+  .zoom-controls .zlabel:hover { color: var(--accent); }
   .btn {
     background: var(--bg-3);
     border: 1px solid var(--border);
@@ -925,8 +982,85 @@
     pointer-events: none;
     text-anchor: middle;
   }
+  .tag.rep-mal {
+    background: rgba(255,71,87,0.18);
+    color: var(--danger);
+    border-color: var(--danger);
+    font-weight: 600;
+  }
+  .tag.rep-info {
+    background: rgba(255,170,0,0.18);
+    color: var(--amber);
+    border-color: var(--amber);
+  }
+  .http-feed { display: flex; flex-direction: column; gap: 10px; }
+  .http-txn {
+    border: 1px solid var(--border);
+    background: var(--bg-2);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .http-txn-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--bg-3);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    border-bottom: 1px solid var(--border);
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .http-txn-head > span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .http-txn-body {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0;
+  }
+  .http-side {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;        /* allow shrinking inside grid */
+  }
+  .http-side + .http-side { border-left: 1px solid var(--border); }
+  .http-side-label {
+    padding: 4px 8px;
+    font-size: 9px;
+    color: var(--text-faint);
+    letter-spacing: 0.1em;
+    background: var(--bg-3);
+    border-bottom: 1px solid var(--border);
+  }
+  .http-pre {
+    margin: 0;
+    padding: 8px 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text);
+    background: var(--bg);
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow-y: auto;
+    max-height: 320px;       /* keep cards manageable; pre is scrollable */
+    overflow-x: hidden;
+  }
+  .node-label.primary {
+    font-size: 10px;
+    font-weight: 600;
+    fill: var(--text);
+  }
+  .node-label.ip {
+    font-size: 9px;
+    fill: var(--text-faint);
+  }
   .node.selected circle { stroke: var(--accent) !important; stroke-width: 3px; }
   .node.selected .node-label { fill: var(--accent); font-weight: 700; }
+  .node.selected .node-label.ip { fill: var(--accent); }
 
   .tab-row {
     display: flex;
@@ -1056,8 +1190,14 @@
       <button class="btn" id="btn-findings-report" style="width:100%; text-align:left; margin-bottom:4px;">
         ▣ view security findings
       </button>
-      <button class="btn" id="btn-attack-paths" style="width:100%; text-align:left;">
+      <button class="btn" id="btn-attack-paths" style="width:100%; text-align:left; margin-bottom:4px;">
         ▲ attack paths
+      </button>
+      <button class="btn" id="btn-http-feed" style="width:100%; text-align:left; margin-bottom:4px;">
+        🌐 http requests / responses
+      </button>
+      <button class="btn" id="btn-lan-only" style="width:100%; text-align:left;">
+        🏠 graph LAN only
       </button>
     </div>
 
@@ -1074,11 +1214,18 @@
       <button class="btn" id="btn-freeze">freeze sim</button>
     </div>
     <svg id="graph"></svg>
+    <div class="zoom-controls" title="zoom controls">
+      <button class="zbtn" id="zoom-in" title="zoom in (or scroll wheel)">+</button>
+      <button class="zlabel" id="zoom-level" title="click to reset to 100%">100%</button>
+      <button class="zbtn" id="zoom-out" title="zoom out">−</button>
+      <button class="zbtn" id="zoom-fit" title="fit graph to view" style="font-size:11px;">⤢</button>
+    </div>
     <div class="graph-overlay">
       drag: pan · wheel: zoom · click node: inspect · drag node: pin
     </div>
   </div>
 
+  <div id="detail-resizer" title="drag to resize"></div>
   <aside class="detail empty" id="detail"></aside>
 </div>
 
@@ -1134,7 +1281,17 @@ async function refresh() {
   // panel is a separate DOM region, so report/flow views don't get clobbered.
   updateGraph();
   _findingsData = null;
+  // File-mode self-poll: while WHOIS lookups are still resolving in the background,
+  // keep pulling /api/graph so labels light up as ASN/country data lands. The
+  // live-capture path (_livePoll) already handles its own polling, so don't double up.
+  if (!_livePoll && summaryR.whois_pending > 0) {
+    if (_whoisPoll) clearTimeout(_whoisPoll);
+    _whoisPoll = setTimeout(() => refresh().catch(() => {}), 3000);
+  } else if (_whoisPoll) {
+    clearTimeout(_whoisPoll); _whoisPoll = null;
+  }
 }
+let _whoisPoll = null;
 
 async function refreshInterfaces() {
   try {
@@ -1435,8 +1592,21 @@ function ensureGraphInitialized() {
   const root = svg.append('g').attr('class', 'root');
   // Hold a zoom reference so pan/zoom state survives across refreshes (live-capture
   // updates must not reset the user's view).
-  const zoom = d3.zoom().scaleExtent([0.1, 8]).on('zoom', e => root.attr('transform', e.transform));
+  const zoomLevelEl = document.getElementById('zoom-level');
+  const zoom = d3.zoom().scaleExtent([0.1, 8]).on('zoom', e => {
+    root.attr('transform', e.transform);
+    if (zoomLevelEl) zoomLevelEl.textContent = Math.round(e.transform.k * 100) + '%';
+  });
   svg.call(zoom);
+
+  // Wheel-based zoom is handled by d3.zoom directly; buttons drive zoom programmatically
+  // through .scaleBy / .transform so the % indicator stays in sync via the zoom handler above.
+  const zoomBy = factor => svg.transition().duration(180).call(zoom.scaleBy, factor);
+  document.getElementById('zoom-in').onclick = () => zoomBy(1.4);
+  document.getElementById('zoom-out').onclick = () => zoomBy(1/1.4);
+  document.getElementById('zoom-level').onclick = () =>
+    svg.transition().duration(220).call(zoom.transform, d3.zoomIdentity);
+  document.getElementById('zoom-fit').onclick = () => fitGraphToView();
 
   const linkG = root.append('g').attr('class', 'links');
   const nodeG = root.append('g').attr('class', 'nodes');
@@ -1525,18 +1695,48 @@ function updateGraph() {
     .on('mousemove', e => moveTooltip(e))
     .on('mouseout', hideTooltip);
   nodeEnter.append('circle');
-  nodeEnter.append('text').attr('class', 'node-label');
+  nodeEnter.append('text').attr('class', 'node-label primary');
+  nodeEnter.append('text').attr('class', 'node-label ip');
 
   const nodeMerged = nodeEnter.merge(nodeSel);
   nodeMerged.select('circle')
     .attr('r', d => rScale(d.bytes))
     .attr('fill', d => nodeColor(d))
-    .attr('stroke', d => d.has_plaintext ? 'var(--danger)' : 'var(--border-hot)')
-    .attr('stroke-width', d => d.has_plaintext ? 2 : 1)
-    .style('filter', d => d.has_plaintext ? 'drop-shadow(0 0 6px rgba(255,71,87,0.5))' : null);
-  nodeMerged.select('text.node-label')
+    .attr('stroke', d => d.malicious ? 'var(--danger)'
+                       : d.has_plaintext ? 'var(--danger)'
+                       : 'var(--border-hot)')
+    .attr('stroke-width', d => d.malicious ? 3 : (d.has_plaintext ? 2 : 1))
+    .style('filter', d => d.malicious ? 'drop-shadow(0 0 10px rgba(255,71,87,0.95))'
+                        : d.has_plaintext ? 'drop-shadow(0 0 6px rgba(255,71,87,0.5))'
+                        : null);
+  // Render / refresh the warning halo for malicious hosts.
+  nodeMerged.each(function (d) {
+    const sel = d3.select(this);
+    let halo = sel.select('circle.mal-halo');
+    if (d.malicious) {
+      if (halo.empty()) {
+        halo = sel.insert('circle', 'circle').attr('class', 'mal-halo');
+      }
+      halo.attr('r', rScale(d.bytes) + 5)
+          .attr('fill', 'none')
+          .attr('stroke', 'var(--danger)')
+          .attr('stroke-width', 1)
+          .attr('stroke-dasharray', '3 3')
+          .attr('opacity', 0.6);
+    } else if (!halo.empty()) {
+      halo.remove();
+    }
+  });
+  nodeMerged.select('text.node-label.primary')
     .attr('dy', d => rScale(d.bytes) + 11)
-    .text(d => d.id);
+    .text(d => bestName(d));
+  nodeMerged.select('text.node-label.ip')
+    .attr('dy', d => rScale(d.bytes) + 22)
+    .text(d => bestName(d) ? d.id + whoisSuffix(d) : '');
+  // When no friendly name exists, the primary label becomes "IP (org · CC)" directly.
+  nodeMerged.select('text.node-label.primary')
+    .filter(d => !bestName(d))
+    .text(d => d.id + whoisSuffix(d));
   nodeMerged.classed('selected', d => selectedNode && d.id === selectedNode.id);
 
   const linkKey = l => `${(l.source && l.source.id) || l.source}>${(l.target && l.target.id) || l.target}`;
@@ -1608,6 +1808,83 @@ function nodeColor(d) {
   return 'var(--public)';
 }
 
+// Best-known short name for a node. Returns null when only the IP is known
+// (caller falls back to the IP).
+function bestName(d) {
+  if (!d) return null;
+  const h = d.hostname;
+  if (h && h.length) {
+    // Strip trailing .local / "." and keep the leftmost label so long mDNS
+    // names like Android_Q4TQF1BP.local fit the node.
+    const s = h.replace(/\.local$/i, '').replace(/\.$/, '');
+    const lead = s.split('.')[0];
+    // If lead is too short or stripped to nothing, use the whole thing.
+    if (lead && lead.length >= 3) return lead;
+    return s || h;
+  }
+  if (d.vendor) {
+    // "(randomized MAC)" is uninformative — fall through to device_type / IP.
+    if (d.vendor.startsWith('(')) return d.device_type || null;
+    return d.vendor;
+  }
+  if (d.device_type) return d.device_type;
+  // WHOIS org is a decent fallback for raw public IPs with no other identity.
+  if (d.whois_org) return shortOrg(d.whois_org);
+  return null;
+}
+
+// Compact form for an ASN org string ("GOOGLE - Google LLC" → "Google",
+// "CLOUDFLARENET - Cloudflare, Inc." → "Cloudflare"). RDAP's asn_description
+// uses inconsistent shapes; we strip the leading uppercase ASN-handle token
+// when it's followed by a Title-case real name, then peel common Inc/LLC/etc.
+function shortOrg(s) {
+  if (!s) return null;
+  let t = s.replace(/^[A-Z0-9][A-Z0-9-]*(\s+-\s+|\s+)(?=[A-Z][a-z])/, '').trim();
+  t = t.replace(/,?\s+(Inc\.?|LLC|Ltd\.?|Limited|Corp\.?|Corporation|S\.A\.|GmbH|B\.V\.|Co\.,?\s*Ltd\.?|PBC|SAS|SARL)\.?$/i, '').trim();
+  t = t.replace(/,+$/, '').trim();
+  if (!t) t = s;
+  if (t.length > 22) t = t.slice(0, 22) + '…';
+  return t;
+}
+
+// Suffix appended to the IP line for public hosts: "(Org · CC)".
+function whoisSuffix(d) {
+  if (!d || d.is_private || d.is_multicast) return '';
+  const org = d.whois_org ? shortOrg(d.whois_org) : null;
+  const cc  = d.whois_country || null;
+  if (!org && !cc) return '';
+  if (org && cc) return ` (${org} · ${cc})`;
+  return ` (${org || cc})`;
+}
+
+function fitGraphToView() {
+  if (!_graphState) return;
+  const { svg, zoom, W, H } = _graphState;
+  const nodes = (simulation && simulation.nodes()) || [];
+  // Honor filter visibility — don't fit to hidden nodes.
+  const visible = nodes.filter(n => {
+    if (n.is_multicast && !filters.multicast) return false;
+    if (!n.is_multicast && n.is_private && !filters.private) return false;
+    if (!n.is_multicast && !n.is_private && !filters.public) return false;
+    return n.x != null && n.y != null;
+  });
+  if (!visible.length) return;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of visible) {
+    if (n.x < minX) minX = n.x;
+    if (n.y < minY) minY = n.y;
+    if (n.x > maxX) maxX = n.x;
+    if (n.y > maxY) maxY = n.y;
+  }
+  const pad = 60;
+  const dx = (maxX - minX) || 1, dy = (maxY - minY) || 1;
+  const scale = Math.min(8, Math.max(0.1, 0.9 / Math.max(dx / (W - 2*pad), dy / (H - 2*pad))));
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const tx = W / 2 - cx * scale, ty = H / 2 - cy * scale;
+  svg.transition().duration(280)
+     .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+}
+
 function applyFilters() {
   if (!window._sel) return;
   const { linkSel, nodeSel } = window._sel;
@@ -1642,10 +1919,28 @@ tooltip.className = 'tooltip';
 tooltip.style.display = 'none';
 document.body.appendChild(tooltip);
 function showTooltip(e, d) {
+  const name = bestName(d);
+  const idLine = name
+    ? `<b style="color:var(--amber)">${name}</b> <span style="color:var(--text-faint)">${d.id}${whoisSuffix(d)}</span>`
+    : `<b style="color:var(--amber)">${d.id}${whoisSuffix(d)}</b>`;
+  const idBits = [];
+  if (d.vendor && !d.vendor.startsWith('(')) idBits.push(d.vendor);
+  if (d.device_type) idBits.push(d.device_type);
+  if (d.hostname && d.hostname !== name) idBits.push(d.hostname);
+  if (d.whois_org) idBits.push('asn: ' + d.whois_org);
+  if (d.rdns_name && d.rdns_name !== d.hostname) idBits.push('rdns: ' + d.rdns_name);
+  const idLine2 = idBits.length
+    ? `<div style="color:var(--text-dim); font-size:10px; margin-top:2px;">${idBits.join(' · ')}</div>` : '';
+  const malLine = (d.malicious && d.reputation_tags && d.reputation_tags.length)
+    ? `<div style="color:var(--danger); font-weight:600; margin-top:4px;">⚠ flagged: ${d.reputation_tags.join(', ')}</div>`
+    : (d.reputation_tags && d.reputation_tags.length
+        ? `<div style="color:var(--amber); margin-top:4px;">ℹ ${d.reputation_tags.join(', ')}</div>` : '');
   tooltip.innerHTML = `
-    <b style="color:var(--amber)">${d.id}</b><br>
-    ${fmtNum(d.packets)} pkts · ${fmtBytes(d.bytes)} · ${d.peer_count} peers
-    ${d.has_plaintext ? '<br><span style="color:var(--danger)">⚠ plaintext services</span>' : ''}
+    ${idLine}
+    ${idLine2}
+    ${malLine}
+    <div style="margin-top:4px;">${fmtNum(d.packets)} pkts · ${fmtBytes(d.bytes)} · ${d.peer_count} peers</div>
+    ${d.has_plaintext ? '<div style="color:var(--danger)">⚠ plaintext services</div>' : ''}
   `;
   tooltip.style.display = 'block';
   moveTooltip(e);
@@ -1742,6 +2037,30 @@ function renderDetail(d, w) {
        ${sniList.length ? `<div style="color:var(--text-faint); font-size:9px; margin:8px 0 4px; text-transform:uppercase; letter-spacing:0.1em;">tls sni</div>${chipRow(sniList)}` : ''}`
     : '<div style="color:var(--text-faint); font-size:10px;">none observed</div>';
 
+  // Device identity strip — hostname (large), then a row of small chips for
+  // vendor / device-type / each raw source (DHCP / mDNS / NBT-NS / SSDP / rDNS).
+  const deviceChips = [];
+  if (d.vendor)            deviceChips.push(`<span class="tag" title="OUI vendor">${d.vendor}</span>`);
+  if (d.device_type)       deviceChips.push(`<span class="tag" title="inferred device type">${d.device_type}</span>`);
+  if (d.dhcp_hostname)     deviceChips.push(`<span class="tag" title="DHCP option 12">DHCP: ${d.dhcp_hostname}</span>`);
+  if (d.dhcp_vendor_class) deviceChips.push(`<span class="tag" title="DHCP option 60">class: ${d.dhcp_vendor_class}</span>`);
+  if (d.mdns_local_name)   deviceChips.push(`<span class="tag" title="mDNS .local">mDNS: ${d.mdns_local_name}</span>`);
+  if (d.nbns_name)         deviceChips.push(`<span class="tag" title="NetBIOS NS">NBNS: ${d.nbns_name}</span>`);
+  if (d.ssdp_server)       deviceChips.push(`<span class="tag" title="SSDP Server header">SSDP: ${d.ssdp_server}</span>`);
+  if (d.rdns_name)         deviceChips.push(`<span class="tag" title="reverse DNS">rDNS: ${d.rdns_name}</span>`);
+  if (d.whois_org)         deviceChips.push(`<span class="tag" title="RDAP ASN org">ASN: ${d.whois_org}${d.whois_asn ? ' ('+d.whois_asn+')' : ''}</span>`);
+  if (d.whois_country)     deviceChips.push(`<span class="tag" title="RDAP country">${d.whois_country}</span>`);
+  if (d.reputation_tags && d.reputation_tags.length) {
+    const cls = d.malicious ? 'rep-mal' : 'rep-info';
+    for (const t of d.reputation_tags) {
+      deviceChips.push(`<span class="tag ${cls}" title="offline reputation feed hit">${escapeHtml(t)}</span>`);
+    }
+  }
+  const deviceLine = (d.hostname || d.vendor || d.device_type)
+    ? `<div style="font-size:13px; color:var(--text); margin:2px 0 4px;">
+         ${d.hostname ? `<b>${d.hostname}</b>` : (d.vendor || d.device_type || '')}
+       </div>` : '';
+
   panel.innerHTML = `
     <div class="ip-header">
       <div class="ip">${d.ip}</div>
@@ -1749,6 +2068,8 @@ function renderDetail(d, w) {
       ${plaintextTag}
       ${riskHtml}
     </div>
+    ${deviceLine}
+    ${deviceChips.length ? `<div class="chip-row" style="margin-bottom:6px;">${deviceChips.join('')}</div>` : ''}
     ${d.mac ? `<div style="font-size:10px; color:var(--text-faint); margin-bottom:6px;">mac: ${d.mac}</div>` : ''}
 
     <div class="stat-grid">
@@ -2199,6 +2520,92 @@ function renderAttackPathCard(p) {
   </div>`;
 }
 
+// Renders the global HTTP req/resp feed. Each card shows one transaction
+// with the request body on the left and the response on the right, monospace.
+let _httpFilter = { q: "", host: "" };
+async function showHttpFeed() {
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  panel.innerHTML = '<div style="color:var(--text-faint); font-size:11px;">loading HTTP transactions…</div>';
+  const params = new URLSearchParams();
+  if (_httpFilter.q)    params.set('q', _httpFilter.q);
+  if (_httpFilter.host) params.set('host', _httpFilter.host);
+  params.set('limit', '500');
+  let data;
+  try {
+    data = await fetch('/api/http?' + params.toString()).then(r => r.json());
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--danger);">HTTP feed load failed: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  const txns = data.transactions || [];
+  const rowsHtml = txns.length
+    ? txns.map(renderHttpTxn).join('')
+    : `<div style="color:var(--text-faint); padding:14px 0;">no HTTP transactions ${
+        (_httpFilter.q || _httpFilter.host) ? 'match the current filter' : 'in this capture (HTTPS-only traffic is invisible here)'
+      }.</div>`;
+  panel.innerHTML = `
+    <div class="ip-header"><div class="ip" style="color:var(--accent);">🌐 http transactions</div></div>
+    <div style="color:var(--text-dim); font-size:11px; margin-bottom:8px;">
+      ${data.shown} shown / ${data.total} total captured
+    </div>
+    <div style="display:flex; gap:6px; margin-bottom:10px;">
+      <input id="http-q" placeholder="filter substring (URL, header, body)" value="${escapeHtml(_httpFilter.q)}"
+             style="flex:1; background:var(--bg-3); border:1px solid var(--border); color:var(--text); padding:5px 8px; font-family:inherit; font-size:11px;">
+      <input id="http-host" placeholder="host IP (client or server)" value="${escapeHtml(_httpFilter.host)}"
+             style="width:180px; background:var(--bg-3); border:1px solid var(--border); color:var(--text); padding:5px 8px; font-family:inherit; font-size:11px;">
+      <button class="btn" id="http-apply">apply</button>
+      <button class="btn" id="http-clear">clear</button>
+    </div>
+    <div class="http-feed">${rowsHtml}</div>
+  `;
+  document.getElementById('http-apply').onclick = () => {
+    _httpFilter.q    = document.getElementById('http-q').value.trim();
+    _httpFilter.host = document.getElementById('http-host').value.trim();
+    showHttpFeed();
+  };
+  document.getElementById('http-clear').onclick = () => {
+    _httpFilter = { q: "", host: "" };
+    showHttpFeed();
+  };
+  // Enter in either input triggers apply.
+  ['http-q','http-host'].forEach(id => {
+    document.getElementById(id).addEventListener('keydown', e => {
+      if (e.key === 'Enter') document.getElementById('http-apply').click();
+    });
+  });
+}
+
+function renderHttpTxn(t) {
+  const req = t.request || '(request not captured)';
+  const res = t.response || '(response not captured)';
+  // First line of request: "METHOD path HTTP/1.x"
+  const reqFirst = (t.request || '').split('\r\n', 1)[0] || '(no request)';
+  // First line of response: "HTTP/1.x 200 OK"
+  const resFirst = (t.response || '').split('\r\n', 1)[0] || '(no response)';
+  const tsStr = t.response_ts ? new Date(t.response_ts * 1000).toISOString().replace('T',' ').replace('Z','') : '';
+  return `
+    <div class="http-txn">
+      <div class="http-txn-head">
+        <span style="color:var(--text-faint); font-size:10px;">${escapeHtml(tsStr)}</span>
+        <span style="color:var(--amber); cursor:pointer;" onclick="_httpFilter.host='${t.client}'; showHttpFeed();">${t.client}:${t.client_port}</span>
+        <span style="color:var(--text-faint);">→</span>
+        <span style="color:var(--amber); cursor:pointer;" onclick="_httpFilter.host='${t.server}'; showHttpFeed();">${t.server}:${t.server_port}</span>
+        <span style="margin-left:auto; color:var(--text-dim); font-size:10px;">${escapeHtml(reqFirst.slice(0,80))} — ${escapeHtml(resFirst.slice(0,60))}</span>
+      </div>
+      <div class="http-txn-body">
+        <div class="http-side">
+          <div class="http-side-label">REQUEST</div>
+          <pre class="http-pre">${escapeHtml(req)}</pre>
+        </div>
+        <div class="http-side">
+          <div class="http-side-label">RESPONSE</div>
+          <pre class="http-pre">${escapeHtml(res)}</pre>
+        </div>
+      </div>
+    </div>`;
+}
+
 async function showCredsReport() {
   const data = await fetch('/api/credentials').then(r => r.json());
   const panel = document.getElementById('detail');
@@ -2290,6 +2697,47 @@ document.getElementById('btn-plaintext-report').addEventListener('click', () => 
 document.getElementById('btn-creds-report').addEventListener('click', () => { _viewMode = 'report'; showCredsReport(); });
 document.getElementById('btn-findings-report').addEventListener('click', () => { _viewMode = 'report'; showFindingsReport(null); });
 document.getElementById('btn-attack-paths').addEventListener('click', () => { _viewMode = 'report'; showAttackPaths(); });
+document.getElementById('btn-http-feed').addEventListener('click', () => { _viewMode = 'report'; showHttpFeed(); });
+// LAN-only is a toggle: first press hides public/multicast; second press restores
+// whatever the user had selected previously. Button gets an .active class while
+// LAN-only is engaged so the state is visible at a glance.
+let _lanOnlySaved = null;
+document.getElementById('btn-lan-only').addEventListener('click', () => {
+  const btn = document.getElementById('btn-lan-only');
+  // Force back to the graph view regardless of which way we're toggling.
+  _viewMode = 'graph';
+  selectedNode = null;
+  document.getElementById('detail').className = 'detail empty';
+  document.getElementById('detail').innerHTML = '';
+
+  if (_lanOnlySaved) {
+    // Toggle OFF — restore the previous filter state.
+    filters.private    = _lanOnlySaved.private;
+    filters.public     = _lanOnlySaved.public;
+    filters.multicast  = _lanOnlySaved.multicast;
+    _lanOnlySaved = null;
+    btn.classList.remove('active');
+    btn.textContent = '🏠 graph LAN only';
+  } else {
+    // Toggle ON — remember current filters, then constrain to private RFC1918.
+    _lanOnlySaved = {
+      private: filters.private,
+      public: filters.public,
+      multicast: filters.multicast,
+    };
+    filters.private = true;
+    filters.public = false;
+    filters.multicast = false;
+    btn.classList.add('active');
+    btn.textContent = '🏠 LAN only ✓ — click to restore';
+  }
+  // Sync the filter checkboxes so the sidebar reflects the new state.
+  document.getElementById('f-private').checked   = filters.private;
+  document.getElementById('f-public').checked    = filters.public;
+  document.getElementById('f-multicast').checked = filters.multicast;
+  applyFilters();
+  if (typeof fitGraphToView === 'function') fitGraphToView();
+});
 document.getElementById('btn-live-start').addEventListener('click', liveStart);
 document.getElementById('btn-live-stop').addEventListener('click', liveStop);
 document.getElementById('btn-live-save').addEventListener('click', liveSaveToggle);
@@ -2297,6 +2745,58 @@ document.getElementById('btn-live-save').addEventListener('click', liveSaveToggl
 window.addEventListener('resize', () => {
   resizeGraph();
 });
+
+// Resizable right detail panel. Drag-handle column between graph and detail
+// drives --detail-w; CSS grid does the rest. Width persists per browser.
+(function setupDetailResizer() {
+  const r = document.getElementById('detail-resizer');
+  if (!r) return;
+  const MIN = 240, MAX_FRACTION = 0.85;
+  // Restore last user-chosen width.
+  const saved = parseInt(localStorage.getItem('deadfall_detail_w') || '', 10);
+  if (saved && saved >= MIN && saved <= window.innerWidth * MAX_FRACTION) {
+    document.documentElement.style.setProperty('--detail-w', saved + 'px');
+  }
+  let dragging = false, startX = 0, startW = 0, rafPending = false;
+  function curWidth() {
+    const v = getComputedStyle(document.documentElement).getPropertyValue('--detail-w');
+    return parseInt(v, 10) || 380;
+  }
+  r.addEventListener('pointerdown', e => {
+    dragging = true;
+    startX = e.clientX;
+    startW = curWidth();
+    r.classList.add('dragging');
+    try { r.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+  });
+  r.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    const w = Math.max(MIN, Math.min(window.innerWidth * MAX_FRACTION, startW - dx));
+    document.documentElement.style.setProperty('--detail-w', w + 'px');
+    if (!rafPending) {
+      rafPending = true;
+      requestAnimationFrame(() => { rafPending = false; resizeGraph(); });
+    }
+  });
+  function stop(e) {
+    if (!dragging) return;
+    dragging = false;
+    r.classList.remove('dragging');
+    try { r.releasePointerCapture(e.pointerId); } catch (_) {}
+    localStorage.setItem('deadfall_detail_w', String(curWidth()));
+    resizeGraph();
+  }
+  r.addEventListener('pointerup', stop);
+  r.addEventListener('pointercancel', stop);
+  // Double-click resets to default 380px.
+  r.addEventListener('dblclick', () => {
+    document.documentElement.style.setProperty('--detail-w', '380px');
+    localStorage.removeItem('deadfall_detail_w');
+    resizeGraph();
+  });
+})();
 
 init();
 </script>
