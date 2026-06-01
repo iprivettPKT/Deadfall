@@ -599,6 +599,100 @@ def pick_hostname(host):
             or None)
 
 
+# ---------------------------------------------------------------------------
+# Minimal DER/ASN.1 reader — just enough to pull roastable material out of
+# Kerberos AS-REP / TGS-REP messages. Returns None on anything malformed or
+# truncated rather than guessing, so we never emit a bad hash.
+# ---------------------------------------------------------------------------
+
+def _der_tlv(data, pos=0):
+    """Read one DER tag-length-value at pos. Returns (tag, value_bytes, end) or None.
+    Returns None if the declared length runs past the buffer (truncated capture)."""
+    if pos + 2 > len(data):
+        return None
+    tag = data[pos]
+    pos += 1
+    ln = data[pos]
+    pos += 1
+    if ln & 0x80:
+        n = ln & 0x7F
+        if n == 0 or pos + n > len(data):
+            return None
+        ln = int.from_bytes(data[pos:pos + n], "big")
+        pos += n
+    if pos + ln > len(data):
+        return None  # truncated — refuse to parse a partial value
+    return tag, data[pos:pos + ln], pos + ln
+
+
+def _der_children(value):
+    """Iterate the TLV children of a constructed value. Stops cleanly on garbage."""
+    out, pos = [], 0
+    while pos < len(value):
+        r = _der_tlv(value, pos)
+        if r is None:
+            break
+        tag, v, pos = r
+        out.append((tag, v))
+    return out
+
+
+def _der_find(children, tag):
+    for t, v in children:
+        if t == tag:
+            return v
+    return None
+
+
+def _der_unwrap(value):
+    """Unwrap a single inner TLV (used for [n] context tags wrapping one element)."""
+    r = _der_tlv(value, 0)
+    return r[1] if r else None
+
+
+def _der_string(ctx_value):
+    """A [n] context tag wrapping a KerberosString (GeneralString/IA5/etc.)."""
+    inner = _der_unwrap(ctx_value)
+    if inner is None:
+        return None
+    try:
+        return inner.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _der_principal(ctx_value):
+    """A [n] context tag wrapping PrincipalName SEQUENCE; join name-string with '/'."""
+    seq = _der_unwrap(ctx_value)
+    if seq is None:
+        return None
+    name_string = _der_find(_der_children(seq), 0xA1)  # [1] name-string
+    if name_string is None:
+        return None
+    seq_of = _der_unwrap(name_string)  # SEQUENCE OF KerberosString
+    if seq_of is None:
+        return None
+    parts = [v.decode("utf-8", errors="replace") for _t, v in _der_children(seq_of)]
+    return "/".join(p for p in parts if p) or None
+
+
+def _der_encrypted_part(ctx_value):
+    """A [n] context tag wrapping EncryptedData SEQUENCE. Returns (etype, cipher_bytes)."""
+    seq = _der_unwrap(ctx_value)
+    if seq is None:
+        return None
+    kids = _der_children(seq)
+    etype_ctx = _der_find(kids, 0xA0)   # [0] etype INTEGER
+    cipher_ctx = _der_find(kids, 0xA2)  # [2] cipher OCTET STRING
+    if etype_ctx is None or cipher_ctx is None:
+        return None
+    etype_int = _der_unwrap(etype_ctx)
+    cipher = _der_unwrap(cipher_ctx)
+    if etype_int is None or cipher is None:
+        return None
+    return int.from_bytes(etype_int, "big"), cipher
+
+
 PLAINTEXT_PORTS = {
     21: "FTP",
     23: "TELNET",
@@ -2967,6 +3061,10 @@ class PcapAnalysis:
         self.ntlm_hashes = []
         self._ntlm_hash_seen = set()
         self._ntlm_challenges = {}
+        # Roastable Kerberos hashes: AS-REP (krb5asrep, -m 18200) and service-ticket
+        # TGS-REP (krb5tgs, -m 13100), extracted for RC4 (etype 23).
+        self.krb_hashes = []
+        self._krb_hash_seen = set()
         # LLMNR / NBT-NS / mDNS query names — the resolution traffic Responder poisons.
         self.poisonable_queries = []
         self._poison_seen = set()
@@ -4240,6 +4338,77 @@ class PcapAnalysis:
                 hosts=[src, dst], port=port,
                 remediation="Audit userAccountControl for DONT_REQ_PREAUTH flag.",
                 key=("asrep", src, dst))
+        self._d_krb_roast(src, dst, port, payload)
+
+    def _d_krb_roast(self, src, dst, port, payload):
+        """Extract roastable hashes from a Kerberos AS-REP (app tag 0x6b) or
+        TGS-REP (0x6d). Only RC4 (etype 23) is emitted — the classic roast format.
+        Needs the full message in one segment; truncated DER is refused by _der_tlv."""
+        # KDC-REP starts at offset 0 (UDP) or after the 4-byte TCP length prefix.
+        for start in (0, 4):
+            if start < len(payload) and payload[start] in (0x6B, 0x6D):
+                break
+        else:
+            return
+        app = _der_tlv(payload, start)
+        if app is None:
+            return
+        app_tag, app_val, _ = app
+        kdc_rep = _der_unwrap(app_val)  # KDC-REP SEQUENCE
+        if kdc_rep is None:
+            return
+        kids = _der_children(kdc_rep)
+        crealm = _der_string(_der_find(kids, 0xA3) or b"")        # [3] crealm
+        user = _der_principal(_der_find(kids, 0xA4) or b"")       # [4] cname
+        if app_tag == 0x6B:  # AS-REP — roast the KDC-REP enc-part ([6], user's key)
+            ep = _der_find(kids, 0xA6)
+            enc = _der_encrypted_part(ep) if ep else None
+            if not enc or not user or not crealm:
+                return
+            self._emit_krb_hash("krb5asrep", 18200, enc, user, crealm, None, src, dst, port)
+        elif app_tag == 0x6D:  # TGS-REP — roast the *ticket's* enc-part (service key)
+            ticket_ctx = _der_find(kids, 0xA5)  # [5] ticket
+            ticket_app = _der_unwrap(ticket_ctx) if ticket_ctx else None  # [APPLICATION 1]
+            tkt_seq = _der_unwrap(ticket_app) if ticket_app else None
+            if tkt_seq is None:
+                return
+            tk = _der_children(tkt_seq)
+            realm = _der_string(_der_find(tk, 0xA1) or b"") or crealm    # ticket realm
+            spn = _der_principal(_der_find(tk, 0xA2) or b"")             # ticket sname (SPN)
+            ep = _der_find(tk, 0xA3)
+            enc = _der_encrypted_part(ep) if ep else None
+            if not enc or not realm or not spn:
+                return
+            self._emit_krb_hash("krb5tgs", 13100, enc, user or spn, realm, spn, src, dst, port)
+
+    def _emit_krb_hash(self, label, mode, enc, user, realm, spn, src, dst, port):
+        etype, cipher = enc
+        if etype != 23 or len(cipher) < 17:   # RC4-HMAC: cipher = checksum(16) + edata
+            return
+        checksum = cipher[:16].hex()
+        edata = cipher[16:].hex()
+        if label == "krb5asrep":
+            hashcat = f"$krb5asrep$23${user}@{realm}:{checksum}${edata}"
+        else:  # krb5tgs (kerberoast)
+            hashcat = f"$krb5tgs$23$*{user}${realm}${spn}*${checksum}${edata}"
+        dkey = (label, hashcat)
+        if dkey in self._krb_hash_seen:
+            return
+        self._krb_hash_seen.add(dkey)
+        self.krb_hashes.append({
+            "type": label, "mode": mode, "etype": etype,
+            "user": user, "realm": realm, "spn": spn,
+            "src": src, "dst": dst, "port": port, "hashcat": hashcat,
+        })
+        roast = "AS-REP roastable" if label == "krb5asrep" else "Kerberoastable"
+        self._add_finding("high", "kerberos-weak",
+            f"{roast} hash captured — {spn or user}@{realm}",
+            f"RC4 {label} extracted from {src} → {dst}:{port}. Crack offline with "
+            f"hashcat -m {mode}. Ready-to-crack string is in the AD/hashes tab and loot export.",
+            hosts=[src, dst], port=port, evidence=f"{user}@{realm}" + (f" SPN={spn}" if spn else ""),
+            remediation="Use AES-only service accounts (disable RC4); long random gMSA/service passwords; "
+                        "set DONT_REQ_PREAUTH off for AS-REP roast exposure.",
+            key=(label, user, realm, spn))
 
     def _d_smb(self, src, dst, port, payload):
         if port not in (139, 445):
@@ -6108,6 +6277,7 @@ def api_auth():
         hashes = list(analysis.ntlm_hashes)
         poison = list(analysis.poisonable_queries)
         msgs = list(analysis.ntlm_messages)
+        krb = list(analysis.krb_hashes)
     ntlmv2 = [h for h in hashes if h["mode"] == 5600]
     ntlmv1 = [h for h in hashes if h["mode"] == 5500]
     # Type 3 messages whose hash couldn't be completed (no paired challenge seen).
@@ -6126,11 +6296,15 @@ def api_auth():
             "src": m.get("src"), "dst": m.get("dst"), "port": m.get("port"),
             "has_hash": (m["user"], m.get("domain", "")) in have,
         })
+    krb5tgs = [h for h in krb if h["type"] == "krb5tgs"]
+    krb5asrep = [h for h in krb if h["type"] == "krb5asrep"]
     return jsonify({
         "ntlmv2": ntlmv2, "ntlmv1": ntlmv1,
+        "krb5tgs": krb5tgs, "krb5asrep": krb5asrep,
         "users": users, "poisonable": poison,
         "counts": {
             "ntlmv2": len(ntlmv2), "ntlmv1": len(ntlmv1),
+            "krb5tgs": len(krb5tgs), "krb5asrep": len(krb5asrep),
             "users": len(users), "poisonable": len(poison),
         },
     })

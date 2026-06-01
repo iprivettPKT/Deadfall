@@ -2723,6 +2723,29 @@ async function showAuthLoot() {
       ${list.map(hashCard).join('')}`;
   };
 
+  // Kerberos roast hashes ($krb5asrep$ / $krb5tgs$) share the copy UI.
+  const krbCard = h => `
+    <div style="border:1px solid var(--border); border-left:2px solid var(--danger); padding:8px 10px; margin-bottom:8px;">
+      <div style="color:var(--amber); font-weight:600;">${escapeHtml(h.spn || h.user || '?')}
+        <span style="color:var(--text-faint); font-weight:400;">@ ${escapeHtml(h.realm || '?')}</span></div>
+      <div style="color:var(--text-faint); font-size:10px; margin:2px 0 6px;">
+        ${h.src} → ${h.dst}:${h.port} · RC4</div>
+      <div style="display:flex; gap:6px; align-items:flex-start;">
+        <pre class="http-pre" style="flex:1; margin:0; white-space:pre-wrap; word-break:break-all; user-select:all;">${escapeHtml(h.hashcat)}</pre>
+        <button class="btn" style="flex-shrink:0;" onclick='copyText(${JSON.stringify(h.hashcat)}, this)'>copy</button>
+      </div>
+    </div>`;
+  const krbSection = (title, mode, list) => {
+    if (!list.length) return '';
+    const all = list.map(h => h.hashcat).join('\n');
+    return `
+      <div style="display:flex; align-items:center; justify-content:space-between; margin:14px 0 6px;">
+        <h3 style="margin:0;">${title} <span style="color:var(--text-faint); font-weight:400;">— hashcat -m ${mode} (${list.length})</span></h3>
+        <button class="btn" onclick='copyText(${JSON.stringify(all)}, this)'>copy all</button>
+      </div>
+      ${list.map(krbCard).join('')}`;
+  };
+
   // Usernames seen in Type 3 messages we couldn't complete into a hash.
   const orphanUsers = (data.users || []).filter(u => !u.has_hash);
   const usersHtml = orphanUsers.length ? `
@@ -2750,21 +2773,23 @@ async function showAuthLoot() {
         </div>`).join('')}
       </div>`).join('')}` : '';
 
-  const empty = (!c.ntlmv2 && !c.ntlmv1 && !orphanUsers.length && !poison.length)
-    ? `<div style="color:var(--text-faint); padding:14px 0;">no NTLM auth or poisonable name-resolution traffic captured. SMB/HTTP NTLM handshakes and LLMNR/NBT-NS/mDNS queries appear here.</div>`
+  const empty = (!c.ntlmv2 && !c.ntlmv1 && !c.krb5tgs && !c.krb5asrep && !orphanUsers.length && !poison.length)
+    ? `<div style="color:var(--text-faint); padding:14px 0;">no NTLM/Kerberos auth or poisonable name-resolution traffic captured. SMB/HTTP NTLM handshakes, Kerberos AS-REP/TGS-REP, and LLMNR/NBT-NS/mDNS queries appear here.</div>`
     : '';
 
   panel.innerHTML = `
     <div class="ip-header"><div class="ip" style="color:var(--danger);">🔓 AD / hashes</div></div>
     <div style="color:var(--text-dim); font-size:11px; margin-bottom:6px;">
-      ${c.ntlmv2 || 0} NetNTLMv2 · ${c.ntlmv1 || 0} NetNTLMv1 · ${orphanUsers.length} bare usernames · ${c.poisonable || 0} poisonable queries
+      ${c.ntlmv2 || 0} NetNTLMv2 · ${c.ntlmv1 || 0} NetNTLMv1 · ${c.krb5tgs || 0} Kerberoast · ${c.krb5asrep || 0} AS-REP · ${orphanUsers.length} bare usernames · ${c.poisonable || 0} poisonable queries
     </div>
     <div style="color:var(--text-faint); font-size:10px; margin-bottom:10px;">
-      crack offline: <code>hashcat -m 5600 hashes.txt rockyou.txt</code> (v2) · <code>-m 5500</code> (v1)
+      crack offline: <code>-m 5600</code> (NTLMv2) · <code>-m 5500</code> (NTLMv1) · <code>-m 13100</code> (kerberoast) · <code>-m 18200</code> (AS-REP)
     </div>
     ${empty}
     ${hashSection('NetNTLMv2', 5600, data.ntlmv2 || [])}
     ${hashSection('NetNTLMv1', 5500, data.ntlmv1 || [])}
+    ${krbSection('Kerberoast (TGS-REP)', 13100, data.krb5tgs || [])}
+    ${krbSection('AS-REP roast', 18200, data.krb5asrep || [])}
     ${usersHtml}
     ${poisonHtml}
   `;
