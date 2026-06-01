@@ -2971,6 +2971,9 @@ class PcapAnalysis:
         self.poisonable_queries = []
         self._poison_seen = set()
         self.smb1_flows = set()
+        # SMB2 servers keyed by IP -> {signing_required: bool, port}. Servers with
+        # signing not required are NTLM-relay targets (exported as relay-targets.txt).
+        self.smb_servers = {}
         self.weak_tls_flows = set()
 
         self.packets = {}
@@ -4250,7 +4253,10 @@ class PcapAnalysis:
                 hosts=[src, dst], port=port,
                 remediation="Disable SMB1 everywhere (Remove-WindowsFeature FS-SMB1 / reg smb1 0).",
                 key=("smb1", src, dst))
-        elif b"\xfeSMB" in payload[:8] or b"\xfeSMB" in payload[4:16]:
+        else:
+            idx = payload.find(b"\xfeSMB")
+            if idx < 0:
+                return
             self._add_finding("info", "smb",
                 "SMB2/3 traffic observed",
                 f"SMB2/3 between {src} and {dst}:{port}. Verify message signing is REQUIRED "
@@ -4258,6 +4264,40 @@ class PcapAnalysis:
                 hosts=[src, dst], port=port,
                 remediation="RequireSecuritySignature=1 via GPO on both client and server.",
                 key=("smb2", src, dst))
+            self._d_smb2_signing(src, dst, port, payload, idx)
+
+    def _d_smb2_signing(self, src, dst, port, payload, idx):
+        """From an SMB2 NEGOTIATE *response*, read the server's SecurityMode and
+        classify it as signing-required or relayable. SMB2 header is 64 bytes;
+        Command is at +12, Flags at +16 (bit0 = response), and the NEGOTIATE
+        Response body's SecurityMode (2 bytes) sits at +64+2."""
+        try:
+            if idx + 68 > len(payload):
+                return
+            command = struct.unpack_from("<H", payload, idx + 12)[0]
+            flags = struct.unpack_from("<I", payload, idx + 16)[0]
+            if command != 0x0000 or not (flags & 0x00000001):  # NEGOTIATE response only
+                return
+            secmode = struct.unpack_from("<H", payload, idx + 66)[0]
+            required = bool(secmode & 0x0002)  # SMB2_NEGOTIATE_SIGNING_REQUIRED
+        except Exception:
+            return
+        server = src  # a NEGOTIATE response originates from the server
+        prev = self.smb_servers.get(server)
+        # Don't downgrade a "required" verdict if a later odd packet says otherwise.
+        if prev is not None and prev.get("signing_required"):
+            return
+        self.smb_servers[server] = {"signing_required": required, "port": port}
+        if not required:
+            self._add_finding("high", "smb",
+                "SMB signing NOT required (NTLM-relay target)",
+                f"SMB server {server}:{port} negotiated signing as not-required "
+                f"(SecurityMode=0x{secmode:04x}). It accepts unsigned SMB, so a coerced "
+                f"NetNTLM auth can be relayed straight to it with ntlmrelayx.",
+                hosts=[server], port=port, evidence=f"SecurityMode=0x{secmode:04x}",
+                remediation="Set 'Microsoft network server: Digitally sign communications "
+                            "(always)' = Enabled (RequireSecuritySignature=1) via GPO.",
+                key=("smb-norelaysign", server))
 
     def _d_tls(self, src, dst, port, payload):
         if len(payload) < 11:
@@ -5235,8 +5275,15 @@ class PcapAnalysis:
 
     EXPORT_KINDS = (
         "netntlmv2", "netntlmv1", "krb5tgs", "krb5asrep", "users",
-        "credentials.csv", "findings.csv", "hosts.csv", "report.md",
+        "relay-targets", "credentials.csv", "findings.csv", "hosts.csv", "report.md",
     )
+
+    def _build_relay_targets(self):
+        """SMB servers that negotiated signing as not-required — one IP per line,
+        ready for `ntlmrelayx -tf relay-targets.txt`."""
+        targets = sorted(ip for ip, s in getattr(self, "smb_servers", {}).items()
+                         if not s.get("signing_required"))
+        return "\n".join(targets) + ("\n" if targets else "")
 
     def _export_label(self):
         base = re.sub(r"[^A-Za-z0-9_.-]", "_", self.source_label or "capture")
@@ -5369,6 +5416,7 @@ class PcapAnalysis:
                 "krb5tgs":          (lambda: self._build_krb("krb5tgs"),  "krb5tgs.txt",   "text/plain"),
                 "krb5asrep":        (lambda: self._build_krb("krb5asrep"),"krb5asrep.txt", "text/plain"),
                 "users":            (self._build_users,            "users.txt",        "text/plain"),
+                "relay-targets":    (self._build_relay_targets,    "relay-targets.txt","text/plain"),
                 "credentials.csv":  (self._build_credentials_csv,  "credentials.csv",  "text/csv"),
                 "findings.csv":     (self._build_findings_csv,     "findings.csv",     "text/csv"),
                 "hosts.csv":        (self._build_hosts_csv,        "hosts.csv",         "text/csv"),
@@ -5394,14 +5442,16 @@ class PcapAnalysis:
                         "krb5tgs":   lambda: self._build_krb("krb5tgs"),
                         "krb5asrep": lambda: self._build_krb("krb5asrep"),
                         "users":           self._build_users,
+                        "relay-targets":   self._build_relay_targets,
                         "credentials.csv": self._build_credentials_csv,
                         "findings.csv":    self._build_findings_csv,
                         "hosts.csv":       self._build_hosts_csv,
                         "report.md":       self._build_report_md,
                     }
                     data = builders[kind]()
-                    # Skip empty hash/user lists; always include CSVs + report.
-                    if not data.strip() and kind in ("netntlmv2", "netntlmv1", "krb5tgs", "krb5asrep", "users"):
+                    # Skip empty hash/user/target lists; always include CSVs + report.
+                    if not data.strip() and kind in (
+                            "netntlmv2", "netntlmv1", "krb5tgs", "krb5asrep", "users", "relay-targets"):
                         continue
                     fname = kind if "." in kind else kind + ".txt"
                     zf.writestr(f"{label}/{fname}", data)
@@ -5419,6 +5469,8 @@ class PcapAnalysis:
                                  [h.get("user") for h in getattr(self, "ntlm_hashes", [])]
                                  + [m.get("user") for m in self.ntlm_messages if m.get("type") == 3]
                                  + [(c.get("username") or "").split("\\", 1)[-1] for c in self.credentials])))),
+                "relay_targets": sum(1 for s in getattr(self, "smb_servers", {}).values()
+                                     if not s.get("signing_required")),
                 "credentials": len(self.credentials),
                 "findings":  len(self.findings),
                 "hosts":     sum(1 for ip, h in self.hosts.items()

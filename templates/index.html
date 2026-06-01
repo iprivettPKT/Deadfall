@@ -2788,6 +2788,7 @@ async function showExport() {
     ['krb5tgs',         'Kerberoast (TGS)',  c.krb5tgs,    'hashcat -m 13100'],
     ['krb5asrep',       'AS-REP roast',      c.krb5asrep,  'hashcat -m 18200'],
     ['users',           'usernames',         c.users,      'spray / enum list'],
+    ['relay-targets',   'SMB relay targets', c.relay_targets, 'ntlmrelayx -tf'],
     ['credentials.csv', 'credentials',       c.credentials,'CSV'],
     ['findings.csv',    'findings',          c.findings,   'CSV'],
     ['hosts.csv',       'host inventory',    c.hosts,      'CSV'],
