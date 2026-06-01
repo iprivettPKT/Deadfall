@@ -3089,6 +3089,12 @@ class PcapAnalysis:
         self.PER_FLOW_CAP = 2000
         self.PAYLOAD_CAP = 2048
 
+        # TCP reassembly buffers, keyed per directional connection
+        # (src, sport, dst, dport) -> {next, data, pending, capped}. Transient
+        # parse-time state (not pickled) that lets auth detectors see messages
+        # spanning multiple segments (multi-segment NTLM / large Kerberos tickets).
+        self._reasm = {}
+
     def _get_host(self, ip):
         if ip not in self.hosts:
             self.hosts[ip] = {
@@ -3312,7 +3318,7 @@ class PcapAnalysis:
     STATE_VERSION = 1
     _NO_PICKLE = (
         "lock", "_whois_pool", "_whois_inflight_lock", "_whois_inflight",
-        "scan_pairs", "scan_dport_by_dst", "icmp_targets", "flow_ts",
+        "scan_pairs", "scan_dport_by_dst", "icmp_targets", "flow_ts", "_reasm",
         "_dhcp_by_mac", "_ntlm_challenges",
         "_finding_seen", "_cred_seen", "_sni_seen",
         "_ntlm_hash_seen", "_krb_hash_seen", "_poison_seen",
@@ -3338,6 +3344,7 @@ class PcapAnalysis:
         self.scan_dport_by_dst = defaultdict(lambda: defaultdict(set))
         self.icmp_targets = defaultdict(set)
         self.flow_ts = defaultdict(list)
+        self._reasm = {}
         self._dhcp_by_mac = {}
         self._ntlm_challenges = {}
         for s in ("_finding_seen", "_cred_seen", "_sni_seen",
@@ -4249,6 +4256,51 @@ class PcapAnalysis:
                 remediation="Inspect DNS egress; restrict recursive resolvers; log and alert on >30-char labels.",
                 key=("dns-tunnel", src, label[:12]))
 
+    # Ports whose protocols carry auth that can span TCP segments and so benefit
+    # from reassembly: Kerberos, SMB, LDAP(S), MSSQL, HTTP.
+    REASM_PORTS = frozenset({88, 139, 445, 389, 636, 1433, 80, 8080, 8000, 8888})
+    REASM_CAP = 32768       # bytes buffered per direction — auth always sits early
+    REASM_MAX_STREAMS = 2048
+
+    def _reassemble(self, key, seq, payload):
+        """Append a TCP segment to its per-direction buffer in sequence order.
+        Returns the contiguous reassembled bytes when the buffer grew, else None.
+        Handles retransmissions and small out-of-order gaps; ignores seq wrap
+        (auth completes well within the first REASM_CAP bytes)."""
+        buf = self._reasm.get(key)
+        if buf is None:
+            if len(self._reasm) >= self.REASM_MAX_STREAMS:
+                return None
+            buf = {"next": seq, "data": bytearray(), "pending": {}, "capped": False}
+            self._reasm[key] = buf
+        if buf["capped"]:
+            return None
+        nxt = buf["next"]
+        if seq + len(payload) <= nxt:
+            return None                       # pure retransmission
+        if seq < nxt:                         # partial overlap — trim already-seen prefix
+            payload = payload[nxt - seq:]
+            seq = nxt
+        grew = False
+        if seq == nxt:
+            buf["data"] += payload
+            nxt += len(payload)
+            pend = buf["pending"]
+            while nxt in pend:                # drain any now-contiguous held segments
+                p = pend.pop(nxt)
+                buf["data"] += p
+                nxt += len(p)
+            buf["next"] = nxt
+            grew = True
+        elif len(buf["pending"]) < 64:        # gap — hold out-of-order segment (bounded)
+            buf["pending"][seq] = bytes(payload)
+        result = bytes(buf["data"]) if grew else None
+        if len(buf["data"]) >= self.REASM_CAP:   # done buffering this stream — free memory
+            buf["capped"] = True
+            buf["data"] = bytearray()
+            buf["pending"].clear()
+        return result
+
     def _conn_key(self, src, sport, dst, dport):
         """Direction-agnostic key for a TCP connection — the Type 2 (server→client)
         and Type 3 (client→server) of one NTLM handshake map to the same key."""
@@ -4414,17 +4466,31 @@ class PcapAnalysis:
     def _d_krb_roast(self, src, dst, port, payload):
         """Extract roastable hashes from a Kerberos AS-REP (app tag 0x6b) or
         TGS-REP (0x6d). Only RC4 (etype 23) is emitted — the classic roast format.
-        Needs the full message in one segment; truncated DER is refused by _der_tlv."""
-        # KDC-REP starts at offset 0 (UDP) or after the 4-byte TCP length prefix.
-        for start in (0, 4):
-            if start < len(payload) and payload[start] in (0x6B, 0x6D):
-                break
-        else:
-            return
+        Truncated DER is refused by _der_tlv, so partial captures never yield a hash."""
+        # KDC-REP starts at offset 0 (UDP) or 4 (TCP length prefix); on a reassembled
+        # stream it may sit deeper, so also scan for the app tag + DER long-form length
+        # (Kerberos messages are always long-form). Dedup makes extra attempts harmless.
+        starts = [s for s in (0, 4) if s < len(payload) and payload[s] in (0x6B, 0x6D)]
+        for tag in (0x6B, 0x6D):
+            pos = 0
+            while len(starts) < 12:
+                i = payload.find(bytes([tag]), pos)
+                if i < 0:
+                    break
+                pos = i + 1
+                if i + 1 < len(payload) and payload[i + 1] in (0x81, 0x82, 0x83):
+                    if i not in starts:
+                        starts.append(i)
+        for start in starts:
+            self._try_krb_roast(src, dst, port, payload, start)
+
+    def _try_krb_roast(self, src, dst, port, payload, start):
         app = _der_tlv(payload, start)
         if app is None:
             return
         app_tag, app_val, _ = app
+        if app_tag not in (0x6B, 0x6D):
+            return
         kdc_rep = _der_unwrap(app_val)  # KDC-REP SEQUENCE
         if kdc_rep is None:
             return
@@ -5403,6 +5469,27 @@ class PcapAnalysis:
                         self._d_irc_c2(src, dst, dport, payload_bytes)
                 except Exception:
                     pass
+
+                # Stream reassembly: when an auth message spans TCP segments, the
+                # per-packet pass above only saw a fragment. Reassemble the stream
+                # and re-run the auth detectors on the full bytes once it's
+                # multi-segment. Detector dedup makes the re-run idempotent.
+                if dport in self.REASM_PORTS or sport in self.REASM_PORTS:
+                    try:
+                        full = self._reassemble((src, sport, dst, dport),
+                                                int(pkt[TCP].seq), payload_bytes)
+                    except Exception:
+                        full = None
+                    if full is not None and len(full) > len(payload_bytes):
+                        try:
+                            self._d_ntlm(src, dst, sport, dport, full)
+                            if dport == 88 or sport == 88:
+                                self._d_krb_roast(src, dst, 88, full)
+                            if dport in (80, 8080, 8000, 8888) or sport in (80, 8080, 8000, 8888):
+                                self._d_http_ntlm(src, dst, sport, dport,
+                                                  full[:16384].decode("utf-8", errors="replace"))
+                        except Exception:
+                            pass
 
             self._store_packet(ts, src, dst, "TCP", size,
                                sport=sport, dport=dport, flags=flags,

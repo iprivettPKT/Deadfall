@@ -145,7 +145,8 @@ evidence, and a remediation suggestion.
   LDAP, MSSQL, and HTTP (base64 `Authorization`/`WWW-Authenticate: NTLM`).
   Type 2 and Type 3 are paired per connection into complete,
   hashcat-crackable NetNTLMv2 (`-m 5600`) / NetNTLMv1 (`-m 5500`) strings,
-  surfaced in the **AD / hashes** tab.
+  surfaced in the **AD / hashes** tab. Messages that span multiple TCP
+  segments are reassembled, so large handshakes aren't missed.
 - **LLMNR / NBT-NS / mDNS poisoning opportunities** — any broadcast
   name resolution from a client, flagged with Responder guidance.
 - **WPAD lookups** (DNS and NBT-NS) — classic NTLM-relay foothold.
@@ -157,7 +158,8 @@ evidence, and a remediation suggestion.
 - **Kerberos roasting extraction** — pulls roastable RC4 hashes out of the
   wire: AS-REP (`$krb5asrep$`, hashcat `-m 18200`) and service-ticket TGS-REP
   (`$krb5tgs$`, `-m 13100`) with username / realm / SPN, surfaced in the
-  AD/hashes tab and loot export.
+  AD/hashes tab and loot export. TGS-REP tickets that span multiple TCP
+  segments are reassembled before parsing.
 - **SMBv1 traffic** — EternalBlue / MS17-010 class.
 - **SMB2/3 signing posture** — parses the SMB2 NEGOTIATE `SecurityMode` to
   classify each server as signing-required or **relayable**; relayable servers
@@ -370,6 +372,10 @@ vulnerability evidence with no access control.
   survive every tick.
 - Thread safety: `PcapAnalysis` carries an `RLock` acquired around
   every packet processed and around every read in the API handlers.
+- TCP reassembly: a bounded per-direction buffer (`_reasm`, capped at 32 KB
+  per stream) lets the NTLM / Kerberos detectors see auth messages that span
+  multiple segments. It's additive — single-segment detection is unchanged and
+  detector dedup makes the reassembled re-run idempotent.
 
 ## Design constraints (for contributors)
 
