@@ -66,6 +66,16 @@ a prioritized list of pentester-relevant findings in one pass.
 - **HTTP transaction feed** — a global, searchable feed of paired
   request/response transactions across every host, filterable by substring
   or host IP.
+- **Engagement loot export** — one-click `📦 export loot` tab (and API) that
+  pulls everything in tool-ready formats: hashcat-ready hash files
+  (`netntlmv2.txt` `-m 5600`, `netntlmv1.txt` `-m 5500`, `krb5tgs.txt`
+  `-m 13100`, `krb5asrep.txt` `-m 18200`), `users.txt` for spraying,
+  `relay-targets.txt` for `ntlmrelayx -tf`, credentials/findings/host-inventory
+  CSVs, a Markdown engagement report, or all of it as a single zip.
+- **Multi-PCAP / directory ingest** — point Deadfall at several captures or a
+  whole directory and they merge into one host graph. Save the parsed analysis
+  with `--save-state` and reload it later with `--load-state` so a multi-day
+  engagement survives restarts.
 
 ## Install
 
@@ -83,6 +93,13 @@ Npcap (Windows) and raw-socket privileges (root / `CAP_NET_RAW`).
 ```bash
 python3 deadfall.py path/to/capture.pcap
 # open http://127.0.0.1:5000
+
+# merge several captures (or a whole directory) into one graph
+python3 deadfall.py run1.pcap run2.pcapng /engagements/clientA/
+
+# save the parsed analysis, then reload it later (survives restarts)
+python3 deadfall.py /engagements/clientA/ --save-state clientA.dfstate
+python3 deadfall.py --load-state clientA.dfstate
 ```
 
 ### Live mode
@@ -102,10 +119,13 @@ capture while recording pops a confirmation dialog with a
 ### Options
 
 ```
-pcap              path to pcap/pcapng file (omit when using --live)
+pcap              one or more pcap/pcapng files, or directories to scan for
+                  them (omit when using --live or --load-state)
 --live IFACE      capture live from interface instead of a file
 --bpf FILTER      BPF capture filter (live mode)
 --save-to PATH    save the live capture to this pcap file (live mode)
+--save-state PATH after parsing, save the analysis to PATH for later reload
+--load-state PATH load a previously saved analysis instead of parsing pcaps
 --list-ifaces     list available capture interfaces and exit
 --host HOST       bind address (default 127.0.0.1)
 --port PORT       bind port (default 5000)
@@ -134,10 +154,14 @@ evidence, and a remediation suggestion.
 - **ARP spoofing** — duplicate IP→MAC bindings.
 - **Kerberos weak enctypes** — RC4-HMAC / DES in AS-REP/TGS-REP
   (Kerberoasting / AS-REP roasting).
-- **Kerberos AS-REP observation** — surface candidates with
-  pre-auth disabled.
+- **Kerberos roasting extraction** — pulls roastable RC4 hashes out of the
+  wire: AS-REP (`$krb5asrep$`, hashcat `-m 18200`) and service-ticket TGS-REP
+  (`$krb5tgs$`, `-m 13100`) with username / realm / SPN, surfaced in the
+  AD/hashes tab and loot export.
 - **SMBv1 traffic** — EternalBlue / MS17-010 class.
-- **SMB2/3 traffic** — flags signing-verification follow-up.
+- **SMB2/3 signing posture** — parses the SMB2 NEGOTIATE `SecurityMode` to
+  classify each server as signing-required or **relayable**; relayable servers
+  are flagged and exported as `relay-targets.txt` for `ntlmrelayx -tf`.
 - **GPP cpassword in SMB** — MS14-025 instantly-decryptable password
   leak from SYSVOL.
 - **Cleartext LDAP simple bind** and **LDAP anonymous bind**.
@@ -317,8 +341,11 @@ vulnerability evidence with no access control.
 | `GET /api/whois/<ip>` | RDAP whois + rDNS (cached) |
 | `GET /api/plaintext` | all plaintext flows + captured payload samples |
 | `GET /api/credentials` | all extracted credential artifacts |
-| `GET /api/auth` | assembled NetNTLM hashcat hashes, captured usernames, and poisonable LLMNR/NBT-NS/mDNS queries |
+| `GET /api/auth` | assembled NetNTLM + Kerberos roast hashes, usernames, and poisonable LLMNR/NBT-NS/mDNS queries |
 | `GET /api/http` | global feed of paired HTTP request/response transactions (`?q=`, `?host=`, `?limit=`) |
+| `GET /api/export/counts` | per-artifact counts for the export tab |
+| `GET /api/export/<kind>` | download one loot artifact (`netntlmv2`, `krb5tgs`, `users`, `relay-targets`, `findings.csv`, `report.md`, …) |
+| `GET /api/export/all.zip` | download all non-empty loot artifacts as a zip |
 | `GET /api/findings` | all findings, filterable by `?severity=`, `?category=`, `?host=` |
 | `GET /api/attack-paths` | ranked attack-path playbooks derived from current findings |
 | `GET /api/live/status` | live capture + recording state |
