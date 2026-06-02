@@ -1107,6 +1107,29 @@
   }
   .tab.active { color: var(--amber); border-bottom-color: var(--amber); }
   .tab:hover:not(.active) { color: var(--text); }
+
+  /* Live-capture hit-alert toasts (bottom-right stack). */
+  #toast-stack {
+    position: fixed; right: 16px; bottom: 16px; z-index: 9999;
+    display: flex; flex-direction: column; gap: 8px; max-width: 360px;
+  }
+  .toast {
+    background: var(--bg-3); border: 1px solid var(--border-hot);
+    border-left: 3px solid var(--danger);
+    padding: 9px 12px; font-size: 11px; color: var(--text);
+    box-shadow: 0 4px 18px rgba(0,0,0,0.5);
+    animation: toast-in 0.18s ease-out;
+  }
+  .toast.sev-high { border-left-color: var(--amber); }
+  .toast .toast-title { color: var(--amber); font-weight: 600; }
+  .toast .toast-kind {
+    display: inline-block; font-size: 9px; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--bg); background: var(--danger);
+    padding: 1px 5px; border-radius: 2px; margin-right: 6px; vertical-align: middle;
+  }
+  .toast.sev-high .toast-kind { background: var(--amber); }
+  .toast .toast-detail { color: var(--text-dim); margin-top: 2px; word-break: break-all; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 </style>
 </head>
 <body>
@@ -1118,6 +1141,7 @@
 
 <div id="modal-overlay"></div>
 <div id="save-modal" class="modal"></div>
+<div id="toast-stack"></div>
 
 <div id="app">
   <header>
@@ -1207,6 +1231,15 @@
         </div>
         <div class="live-save-info" id="live-save-info"></div>
         <div class="live-err" id="live-err"></div>
+        <div style="height:1px; background:var(--border); margin:4px 0;"></div>
+        <input type="text" id="alert-webhook" placeholder="alert webhook URL (Slack/Discord/…)">
+        <div style="display:flex; gap:4px; align-items:center;">
+          <button class="btn" id="btn-alert-webhook" style="flex:1;">save webhook</button>
+          <label style="font-size:10px; color:var(--text-dim); display:flex; align-items:center; gap:4px; cursor:pointer;">
+            <input type="checkbox" id="alert-desktop" style="width:12px;height:12px;"> desktop
+          </label>
+        </div>
+        <div class="live-save-info" id="alert-info"></div>
       </div>
     </div>
 
@@ -1280,6 +1313,8 @@ let filters = {
 let frozen = false;
 const whoisCache = {};
 let _livePoll = null;
+let _lastAlertSeq = 0;
+let _alertDesktop = false;
 let _viewMode = 'graph';  // 'graph' | 'flow' | 'report' — when non-graph, skip graph rebuilds
 let _lastPacketCount = 0;
 let _lastPacketTs = 0;
@@ -1423,7 +1458,10 @@ function syncLivePolling() {
   const badgeVisible = document.getElementById('live-badge').style.display !== 'none';
   const needPoll = badgeVisible;
   if (needPoll && !_livePoll) {
-    _livePoll = setInterval(() => refresh().catch(() => {}), 3000);
+    _livePoll = setInterval(() => {
+      refresh().catch(() => {});
+      pollAlerts().catch(() => {});
+    }, 3000);
   } else if (!needPoll && _livePoll) {
     clearInterval(_livePoll);
     _livePoll = null;
@@ -1447,6 +1485,64 @@ async function liveStart() {
   }
   await refresh();
   syncLivePolling();
+}
+
+// Poll for new live-capture hits and surface them as toasts (+ optional desktop
+// notification). Driven by the live poll loop; no-ops when nothing new.
+async function pollAlerts() {
+  let data;
+  try {
+    data = await fetch('/api/live/alerts?since=' + _lastAlertSeq).then(r => r.json());
+  } catch (e) { return; }
+  const alerts = data.alerts || [];
+  // First poll of a session: sync the cursor without firing a backlog of toasts.
+  if (_lastAlertSeq === 0) {
+    _lastAlertSeq = data.max_seq || 0;
+    if (alerts.length > 8) return;
+  }
+  for (const a of alerts) {
+    if (a.seq > _lastAlertSeq) _lastAlertSeq = a.seq;
+    showToast(a);
+  }
+}
+
+function showToast(a) {
+  const stack = document.getElementById('toast-stack');
+  if (!stack) return;
+  const sev = a.severity === 'critical' ? 'sev-crit' : 'sev-high';
+  const el = document.createElement('div');
+  el.className = 'toast ' + sev;
+  el.innerHTML = `<div><span class="toast-kind">${escapeHtml(a.kind)}</span>`
+    + `<span class="toast-title">${escapeHtml(a.title)}</span></div>`
+    + (a.detail ? `<div class="toast-detail">${escapeHtml(a.detail)}${a.host ? ' · ' + escapeHtml(a.host) : ''}</div>` : '');
+  el.onclick = () => el.remove();
+  stack.appendChild(el);
+  setTimeout(() => el.remove(), 9000);
+  // Optional desktop notification.
+  if (_alertDesktop && window.Notification && Notification.permission === 'granted') {
+    try {
+      new Notification('Deadfall: ' + a.title, { body: (a.detail || '') + (a.host ? ' · ' + a.host : '') });
+    } catch (e) {}
+  }
+}
+
+async function saveAlertWebhook() {
+  const url = document.getElementById('alert-webhook').value.trim();
+  const info = document.getElementById('alert-info');
+  try {
+    const r = await fetch('/api/live/alert-config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ webhook: url }),
+    }).then(r => r.json());
+    info.textContent = r.webhook ? 'webhook saved ✓' : 'webhook cleared';
+  } catch (e) { info.textContent = 'failed: ' + e; }
+}
+
+async function loadAlertConfig() {
+  try {
+    const r = await fetch('/api/live/alert-config').then(r => r.json());
+    if (r.webhook) document.getElementById('alert-webhook').value = r.webhook;
+  } catch (e) {}
 }
 
 function showModal(html, opts) {
@@ -3034,6 +3130,23 @@ document.getElementById('btn-lan-only').addEventListener('click', () => {
 document.getElementById('btn-live-start').addEventListener('click', liveStart);
 document.getElementById('btn-live-stop').addEventListener('click', liveStop);
 document.getElementById('btn-live-save').addEventListener('click', liveSaveToggle);
+document.getElementById('btn-alert-webhook').addEventListener('click', saveAlertWebhook);
+document.getElementById('alert-webhook').addEventListener('keydown', e => {
+  if (e.key === 'Enter') saveAlertWebhook();
+});
+document.getElementById('alert-desktop').addEventListener('change', e => {
+  _alertDesktop = e.target.checked;
+  // Ask for OS notification permission the moment the user opts in.
+  if (_alertDesktop && window.Notification && Notification.permission === 'default') {
+    Notification.requestPermission().then(p => {
+      if (p !== 'granted') {
+        e.target.checked = false; _alertDesktop = false;
+        document.getElementById('alert-info').textContent = 'desktop notifications blocked by browser';
+      }
+    });
+  }
+});
+loadAlertConfig();
 
 window.addEventListener('resize', () => {
   resizeGraph();

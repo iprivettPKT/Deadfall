@@ -47,6 +47,11 @@ a prioritized list of pentester-relevant findings in one pass.
 - **Live capture mode** — sniff a local interface, populate the graph in
   real time with position-preserving updates that never reset your view,
   optionally record to pcap, and hit stop to get a save prompt.
+- **Live hit alerts** — the moment a hash, credential, or SMB relay target is
+  captured during a live session, Deadfall pops an in-UI toast (and an optional
+  desktop notification), and POSTs a JSON alert to a webhook if configured
+  (`--alert-webhook` or the live panel; Slack/Discord/generic compatible) — so
+  you can leave a passive listener running and get pinged.
 - **Security findings report** — all findings grouped by severity and
   category, filterable, with clickable host links back into the graph.
 - **Attack-path analyzer** — derives offensive playbooks from the active
@@ -124,6 +129,7 @@ pcap              one or more pcap/pcapng files, or directories to scan for
 --live IFACE      capture live from interface instead of a file
 --bpf FILTER      BPF capture filter (live mode)
 --save-to PATH    save the live capture to this pcap file (live mode)
+--alert-webhook URL  POST a JSON alert on each live hash/cred/relay-target hit
 --save-state PATH after parsing, save the analysis to PATH for later reload
 --load-state PATH load a previously saved analysis instead of parsing pcaps
 --list-ifaces     list available capture interfaces and exit
@@ -361,6 +367,8 @@ vulnerability evidence with no access control.
 | `GET /api/findings` | all findings, filterable by `?severity=`, `?category=`, `?host=` |
 | `GET /api/attack-paths` | ranked attack-path playbooks derived from current findings |
 | `GET /api/live/status` | live capture + recording state |
+| `GET /api/live/alerts` | new hash/cred/relay-target hits since `?since=<seq>` (for toasts) |
+| `GET/POST /api/live/alert-config` | get or set the alert webhook URL (`{webhook}`) |
 | `GET /api/live/interfaces` | list available capture interfaces |
 | `POST /api/live/start` | body `{iface, bpf?}` |
 | `POST /api/live/stop` | stop capture (also finalizes any recording) |

@@ -3095,6 +3095,16 @@ class PcapAnalysis:
         # spanning multiple segments (multi-segment NTLM / large Kerberos tickets).
         self._reasm = {}
 
+        # Live-capture hit alerts — a ring buffer of high-value events (hashes,
+        # creds, relay targets). The UI polls these for toasts; an optional
+        # webhook fires per alert while live capture is running.
+        self.alerts = []
+        self._alert_seq = 0
+        self.ALERT_CAP = 500
+        self.alert_webhook = None
+        self.alerts_dispatch = False   # set True by LiveCapture.start()
+        self.last_webhook_error = None
+
     def _get_host(self, ip):
         if ip not in self.hosts:
             self.hosts[ip] = {
@@ -3428,6 +3438,50 @@ class PcapAnalysis:
         self.flow_packets[flow_key].append(pid)
         return pid
 
+    def _alert(self, kind, title, detail="", host=None, severity="high"):
+        """Record a high-value live-capture hit (hash / cred / relay target) into
+        the ring buffer the UI polls, and fire the webhook if one is configured and
+        live capture is running. Cheap and idempotent — callers already dedup."""
+        with self.lock:
+            self._alert_seq += 1
+            alert = {
+                "seq": self._alert_seq, "ts": time.time(), "kind": kind,
+                "title": title, "detail": detail, "host": host, "severity": severity,
+            }
+            self.alerts.append(alert)
+            if len(self.alerts) > self.ALERT_CAP:
+                del self.alerts[:-self.ALERT_CAP]
+            webhook = self.alert_webhook if self.alerts_dispatch else None
+        if webhook:
+            threading.Thread(target=self._dispatch_webhook, args=(webhook, alert),
+                             name="alert-webhook", daemon=True).start()
+
+    def _dispatch_webhook(self, url, alert):
+        """POST one alert to a webhook. Payload carries both `text` (Slack) and
+        `content` (Discord) plus structured fields, so it works with either or a
+        generic receiver. Failures are swallowed but surfaced via last_webhook_error."""
+        import urllib.request
+        msg = f"🩸 Deadfall [{alert['kind']}] {alert['title']}"
+        if alert.get("detail"):
+            msg += f" — {alert['detail']}"
+        if alert.get("host"):
+            msg += f" ({alert['host']})"
+        msg += f"  ·  {self.source_label}"
+        body = json.dumps({"text": msg, "content": msg, "alert": alert}).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": "Deadfall/1.0"})
+            urllib.request.urlopen(req, timeout=6).read(1)
+            self.last_webhook_error = None
+        except Exception as e:
+            self.last_webhook_error = str(e)[:200]
+
+    def set_alert_webhook(self, url):
+        with self.lock:
+            self.alert_webhook = (url or "").strip() or None
+        return self.alert_webhook
+
     def _add_credential(self, src, dst, port, kind, username=None, password=None, extra=None):
         key = (src, dst, port, kind, username or "", password or "", extra or "")
         if key in self._cred_seen:
@@ -3437,6 +3491,9 @@ class PcapAnalysis:
             "src": src, "dst": dst, "port": port, "kind": kind,
             "username": username, "password": password, "extra": extra,
         })
+        cred_label = username or password or extra or ""
+        self._alert("cred", f"{kind} credential captured",
+                    f"{cred_label}".strip()[:120], host=src, severity="critical")
         if username is not None and password is not None:
             if (username.lower(), password) in DEFAULT_CREDENTIALS or \
                (username, password) in DEFAULT_CREDENTIALS:
@@ -4436,6 +4493,8 @@ class PcapAnalysis:
             "src": src, "dst": dst, "port": port,
             "challenge": challenge, "hashcat": hashcat,
         })
+        self._alert("hash", f"{label} captured (-m {mode})",
+                    f"{domain}\\{username}", host=src, severity="critical")
 
     def _d_kerberos(self, src, dst, port, payload):
         # ASN.1 tag [0] INTEGER for enctype: a0 03 02 01 XX. 0x01/0x03=DES, 0x17=RC4 — all roastable.
@@ -4588,6 +4647,8 @@ class PcapAnalysis:
             "user": user, "realm": realm, "spn": spn,
             "src": src, "dst": dst, "port": port, "hashcat": hashcat,
         })
+        self._alert("hash", f"{label} {self._KRB_AES.get(etype, 'rc4')} captured (-m {mode})",
+                    f"{spn or user}@{realm}", host=src, severity="critical")
         kind = {"krb5tgs": "Kerberoastable", "krb5asrep": "AS-REP roastable",
                 "krb5pa": "Pre-auth roastable"}[label]
         # AES kerberoast salt is realm+service-account; we only have the requesting
@@ -4650,6 +4711,7 @@ class PcapAnalysis:
         # Don't downgrade a "required" verdict if a later odd packet says otherwise.
         if prev is not None and prev.get("signing_required"):
             return
+        first_seen = prev is None
         self.smb_servers[server] = {"signing_required": required, "port": port}
         if not required:
             self._add_finding("high", "smb",
@@ -4661,6 +4723,9 @@ class PcapAnalysis:
                 remediation="Set 'Microsoft network server: Digitally sign communications "
                             "(always)' = Enabled (RequireSecuritySignature=1) via GPO.",
                 key=("smb-norelaysign", server))
+            if first_seen:
+                self._alert("relay-target", "SMB relay target found",
+                            f"{server}:{port} (signing not required)", host=server)
 
     def _d_tls(self, src, dst, port, payload):
         if len(payload) < 11:
@@ -6281,6 +6346,7 @@ class LiveCapture:
         if self.is_running() or self.analysis is None:
             return
         self.error = None
+        self.analysis.alerts_dispatch = True   # enable webhook dispatch while live
         self._stop.clear()
         self.started_at = time.time()
         self.thread = threading.Thread(target=self._run, name="pcap-sniff", daemon=True)
@@ -6687,6 +6753,35 @@ def api_live_status():
     return jsonify(live_capture.status())
 
 
+@app.route("/api/live/alerts")
+def api_live_alerts():
+    """New high-value hits (hash/cred/relay-target) since ?since=<seq>, for toasts."""
+    if analysis is None:
+        return jsonify({"alerts": [], "max_seq": 0})
+    try:
+        since = int(request.args.get("since", "0"))
+    except Exception:
+        since = 0
+    with analysis.lock:
+        alerts = [a for a in getattr(analysis, "alerts", []) if a["seq"] > since]
+        max_seq = getattr(analysis, "_alert_seq", 0)
+        webhook = bool(getattr(analysis, "alert_webhook", None))
+        werr = getattr(analysis, "last_webhook_error", None)
+    return jsonify({"alerts": alerts, "max_seq": max_seq,
+                    "webhook": webhook, "webhook_error": werr})
+
+
+@app.route("/api/live/alert-config", methods=["GET", "POST"])
+def api_live_alert_config():
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        analysis.set_alert_webhook(data.get("webhook"))
+    return jsonify({"webhook": getattr(analysis, "alert_webhook", None) or "",
+                    "webhook_error": getattr(analysis, "last_webhook_error", None)})
+
+
 @app.route("/api/live/interfaces")
 def api_live_interfaces():
     try:
@@ -6781,6 +6876,9 @@ def main():
     ap.add_argument("--bpf", metavar="FILTER", help="BPF capture filter (live mode)")
     ap.add_argument("--save-to", metavar="PATH",
                     help="save the live capture to this pcap file (live mode only)")
+    ap.add_argument("--alert-webhook", metavar="URL",
+                    help="POST a JSON alert to this URL on each live hash/cred/relay-target "
+                         "hit (Slack/Discord/generic compatible)")
     ap.add_argument("--save-state", metavar="PATH",
                     help="after parsing, save the analysis to PATH so it can be reloaded later")
     ap.add_argument("--load-state", metavar="PATH",
@@ -6850,6 +6948,9 @@ def main():
               f"low={sev['low']} info={sev['info']})")
     else:
         analysis = PcapAnalysis(source_label=f"live:{args.live}")
+        if args.alert_webhook:
+            analysis.set_alert_webhook(args.alert_webhook)
+            print(f"[*] alert webhook configured")
         live_capture.configure(analysis, args.live, args.bpf)
         if args.save_to:
             try:
