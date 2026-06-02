@@ -1224,6 +1224,27 @@
       </div>
     </div>
 
+    <div class="filter-group">
+      <h2 class="section-title">credential capture <span style="color:var(--text-dim);font-weight:400;">(responder)</span></h2>
+      <div class="live-panel">
+        <select id="resp-iface"></select>
+        <input type="text" id="resp-spoof-ip" placeholder="spoof IP (blank = iface IP)">
+        <div style="display:flex; gap:8px; flex-wrap:wrap; font-size:10px; color:var(--text-dim); margin:2px 0;">
+          <label style="display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" class="resp-listener" value="LLMNR" checked style="width:12px;height:12px;"> LLMNR</label>
+          <label style="display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" class="resp-listener" value="NBT-NS" checked style="width:12px;height:12px;"> NBT-NS</label>
+          <label style="display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" class="resp-listener" value="mDNS" checked style="width:12px;height:12px;"> mDNS</label>
+          <label style="display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" class="resp-listener" value="SMB" checked style="width:12px;height:12px;"> SMB</label>
+          <label style="display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" class="resp-listener" value="HTTP" checked style="width:12px;height:12px;"> HTTP</label>
+        </div>
+        <div style="display:flex; gap:4px;">
+          <button class="btn" id="btn-resp-start" style="flex:1;">☠ poison</button>
+          <button class="btn" id="btn-resp-stop" style="flex:1;" disabled>■ stop</button>
+        </div>
+        <div class="live-save-info" id="resp-info"></div>
+        <div class="live-err" id="resp-err"></div>
+      </div>
+    </div>
+
     <div class="filter-group" id="live-group">
       <h2 class="section-title">live capture</h2>
       <div class="live-panel">
@@ -1346,6 +1367,7 @@ async function init() {
   await refreshInterfaces();
   document.getElementById('loading').style.display = 'none';
   syncLivePolling();
+  respPoll();   // reflect responder state if it's already running
 }
 
 async function refresh() {
@@ -1389,7 +1411,7 @@ async function refreshInterfaces() {
     const opts = ifaces.length
       ? ifaces.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')
       : '<option value="">(no interfaces)</option>';
-    for (const id of ['live-iface', 'sweep-iface']) {
+    for (const id of ['live-iface', 'sweep-iface', 'resp-iface']) {
       const sel = document.getElementById(id);
       if (!sel) continue;
       const current = sel.value;
@@ -1426,6 +1448,80 @@ async function arpSweep() {
     };
     setTimeout(poll, 700);
   } catch (e) { info.textContent = String(e); btn.disabled = false; }
+}
+
+let respPollTimer = null;
+
+function respRenderStatus(s) {
+  const info = document.getElementById('resp-info');
+  const err = document.getElementById('resp-err');
+  const startBtn = document.getElementById('btn-resp-start');
+  const stopBtn = document.getElementById('btn-resp-stop');
+  startBtn.disabled = !!s.running;
+  stopBtn.disabled = !s.running;
+  // Per-listener state: green if bound, red label if it failed to bind.
+  const listeners = s.listeners || {};
+  const chips = Object.keys(listeners).map(k => {
+    const v = listeners[k];
+    const ok = (v === true);
+    const c = ('counts' in s && s.counts[k] != null) ? s.counts[k] : 0;
+    const color = ok ? 'var(--accent)' : '#e06c6c';
+    const title = ok ? '' : ` title="${escapeHtml(String(v))}"`;
+    return `<span${title} style="color:${color}">${escapeHtml(k)}${ok ? ` ${c}` : ' ✗'}</span>`;
+  }).join(' · ');
+  if (s.running) {
+    info.innerHTML = `poisoning as <b style="color:var(--text)">${escapeHtml(s.spoof_ip || '')}</b>`
+      + ` · <b style="color:var(--accent)">${s.hashes || 0} hashes</b><br>${chips}`;
+  } else if (s.stopped_at) {
+    info.innerHTML = `stopped · captured <b style="color:var(--accent)">${s.hashes || 0} hashes</b> (see AD/hashes tab)`;
+  } else {
+    info.textContent = '';
+  }
+  // Surface bind failures (e.g. port 445/137 already in use, or not root).
+  const fails = Object.entries(listeners).filter(([, v]) => v !== true)
+    .map(([k, v]) => `${k}: ${v}`);
+  err.textContent = s.error ? s.error : (fails.length ? fails.join(' · ') : '');
+}
+
+async function respPoll() {
+  try {
+    const s = await fetch('/api/responder/status').then(r => r.json());
+    respRenderStatus(s);
+    if (s.running) {
+      respPollTimer = setTimeout(respPoll, 1500);
+      await refresh();   // newly-seen victims show up in the graph
+    }
+  } catch (e) { /* keep last state */ }
+}
+
+async function respStart() {
+  const iface = document.getElementById('resp-iface').value;
+  const spoof_ip = document.getElementById('resp-spoof-ip').value.trim() || null;
+  const info = document.getElementById('resp-info');
+  const err = document.getElementById('resp-err');
+  const listeners = Array.from(document.querySelectorAll('.resp-listener:checked')).map(c => c.value);
+  err.textContent = '';
+  if (!iface) { info.textContent = 'pick an interface'; return; }
+  if (!listeners.length) { info.textContent = 'enable at least one listener'; return; }
+  info.textContent = 'starting…';
+  try {
+    const s = await fetch('/api/responder/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ iface, spoof_ip, listeners }),
+    }).then(r => r.json());
+    if (s.error && !s.running) { info.textContent = ''; err.textContent = s.error; return; }
+    respRenderStatus(s);
+    if (respPollTimer) clearTimeout(respPollTimer);
+    respPollTimer = setTimeout(respPoll, 1500);
+  } catch (e) { err.textContent = String(e); }
+}
+
+async function respStop() {
+  if (respPollTimer) { clearTimeout(respPollTimer); respPollTimer = null; }
+  try {
+    const s = await fetch('/api/responder/stop', { method: 'POST' }).then(r => r.json());
+    respRenderStatus(s);
+  } catch (e) { document.getElementById('resp-err').textContent = String(e); }
 }
 
 function updateLiveBadge(live, summary) {
@@ -3273,6 +3369,8 @@ document.getElementById('btn-live-start').addEventListener('click', liveStart);
 document.getElementById('btn-live-stop').addEventListener('click', liveStop);
 document.getElementById('btn-live-save').addEventListener('click', liveSaveToggle);
 document.getElementById('btn-arp-sweep').addEventListener('click', arpSweep);
+document.getElementById('btn-resp-start').addEventListener('click', respStart);
+document.getElementById('btn-resp-stop').addEventListener('click', respStop);
 document.getElementById('btn-alert-webhook').addEventListener('click', saveAlertWebhook);
 document.getElementById('alert-webhook').addEventListener('keydown', e => {
   if (e.key === 'Enter') saveAlertWebhook();
