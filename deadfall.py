@@ -3694,23 +3694,18 @@ class PcapAnalysis:
         if ARP not in pkt:
             return
         a = pkt[ARP]
+        # Only the ARP *sender* (psrc + hwsrc) is a confirmed device: it's either
+        # transmitting a request or replying to one. This covers silent-but-present
+        # hosts that only answer ARP. We deliberately do NOT create a node for the
+        # request *target* (pdst): a "who-has X" is just someone wanting to reach X,
+        # not proof X exists — unanswered sweeps/gateway probes would graph phantom
+        # devices for IPs that aren't really there. A real target reveals itself by
+        # replying (its reply's psrc lands here) or via its own traffic.
         if a.psrc and a.hwsrc and a.hwsrc.lower() != "00:00:00:00:00:00":
             self.arp_table[a.psrc].add(a.hwsrc.lower())
             h = self._mark(a.psrc, "arp")
             if h is not None:
                 h["mac"] = a.hwsrc.lower()
-        # The ARP *target* (pdst) is a real, addressed device on the segment even
-        # if it never sends a packet we'd otherwise see. ARP is broadcast, so this
-        # surfaces silent hosts that traffic-only discovery misses (works off-SPAN).
-        try:
-            op = int(a.op)
-        except Exception:
-            op = 1
-        if op == 1 and a.pdst:   # who-has request → pdst is the sought device
-            tgt = self._mark(a.pdst, "arp-target")
-            if tgt is not None and a.hwdst and a.hwdst.lower() not in (
-                    "00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff") and not tgt.get("mac"):
-                tgt["mac"] = a.hwdst.lower()
 
     # --- L2 discovery: LLDP / CDP ----------------------------------------
     # Switches, APs and IP phones advertise themselves via LLDP (ethertype

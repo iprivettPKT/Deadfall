@@ -30,12 +30,14 @@ a prioritized list of pentester-relevant findings in one pass.
   harvested from DHCP, mDNS, NBT-NS, SSDP, and reverse DNS, so the graph
   reads as real devices instead of bare IPs.
 - **Passive device discovery** — beyond hosts seen in IP conversations,
-  Deadfall surfaces devices from **ARP targets** (the "who-has" address even if
-  it never replies), **DHCP leases** (the server's assigned `yiaddr` + MAC),
-  and **LLDP / CDP** announcements (switches, APs, IP phones — system name,
-  port, model, capabilities). These ride broadcast/multicast, so they work even
-  off a SPAN port. Every host is tagged with **how** it was discovered
-  (traffic / arp / arp-target / dhcp / dhcp-lease / lldp / cdp / mdns / …).
+  Deadfall surfaces devices from **ARP** (any host that sends or *replies* to
+  ARP — catching silent hosts that only answer ARP; unanswered "who-has" sweeps
+  are ignored so phantom IPs aren't graphed), **DHCP leases** (the server's
+  assigned `yiaddr` + MAC), and **LLDP / CDP** announcements (switches, APs, IP
+  phones — system name, port, model, capabilities). These ride
+  broadcast/multicast, so they work even off a SPAN port. Every host is tagged
+  with **how** it was discovered (traffic / arp / dhcp / dhcp-lease / lldp /
+  cdp / mdns / …).
 - **Device inventory** — a `🖧 device inventory` tab (and `/api/inventory`)
   lists every **local** device (RFC1918 / link-local / ULA) with its discovery
   sources, splitting **active** hosts (seen in traffic) from **silent** ones
