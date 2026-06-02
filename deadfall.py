@@ -6147,6 +6147,75 @@ class PcapAnalysis:
                 counts[stem] = sum(1 for h in krb if h.get("mode") == mode)
             return counts
 
+    def capture_position(self):
+        """Infer the capture vantage point from the traffic mix, so the user knows
+        when coverage is structurally limited. On an endpoint/un-mirrored port you
+        see only broadcast/multicast + your own unicast; on a SPAN/tap you see
+        unicast between other hosts too. Heuristic — returns the evidence with it."""
+        with self.lock:
+            uni_pkts = bm_pkts = 0
+            involve = Counter()
+            third_party_flows = 0
+            for (src, dst), f in self.flows.items():
+                pk = f.get("packets", 0)
+                if is_multicast_or_broadcast(src) or is_multicast_or_broadcast(dst):
+                    bm_pkts += pk
+                else:
+                    uni_pkts += pk
+                    involve[src] += pk
+                    involve[dst] += pk
+            total = uni_pkts + bm_pkts
+            top_host, top_pkts = (involve.most_common(1)[0] if involve else (None, 0))
+            if top_host is not None:
+                for (src, dst), f in self.flows.items():
+                    if (not is_multicast_or_broadcast(src) and not is_multicast_or_broadcast(dst)
+                            and src != top_host and dst != top_host):
+                        third_party_flows += 1
+            top_share = (top_pkts / uni_pkts) if uni_pkts else 0.0
+            bcast_pct = (bm_pkts / total * 100) if total else 0.0
+            distinct = len(involve)
+            silent = sum(1 for ip, h in self.hosts.items()
+                         if not h.get("is_multicast")
+                         and ip not in ("0.0.0.0", "255.255.255.255", "::")
+                         and not (h.get("packets_in") or h.get("packets_out")))
+
+        # Classify. Frame everything as "likely" — this is an inference.
+        if total == 0:
+            verdict, label = "unknown", "No traffic to assess"
+            detail = "No packets parsed yet."
+        elif uni_pkts == 0 or bcast_pct >= 95:
+            verdict, label = "broadcast-only", "Broadcast/multicast only — likely an un-mirrored switch port"
+            detail = ("Almost no unicast was captured. You're seeing broadcast/multicast chatter but not "
+                      "the actual conversations between hosts — typical of a normal switch port with no SPAN. "
+                      "Most devices' unicast traffic (and the creds/hashes in it) is invisible from here.")
+        elif top_host is not None and top_share >= 0.97:
+            verdict, label = "endpoint", f"Endpoint capture — almost all unicast involves {top_host}"
+            detail = (f"{top_share*100:.0f}% of unicast traffic has {top_host} as one endpoint, which is what a "
+                      f"capture taken on that host (or its un-mirrored port) looks like. You see {top_host}'s own "
+                      "conversations but not unicast between other devices — to cover the segment you need a SPAN/tap.")
+        elif top_share <= 0.85 and distinct >= 5 and third_party_flows >= 3:
+            verdict, label = "span", "SPAN / tap — broad unicast visibility"
+            detail = (f"Unicast is spread across many host pairs ({third_party_flows} flows don't involve the "
+                      f"busiest host), which is consistent with a mirror port or inline tap. Coverage of on-segment "
+                      "unicast looks good; silent/powered-off devices still can't be seen passively.")
+        else:
+            verdict, label = "partial", "Partial visibility — possibly a gateway or partial mirror"
+            detail = (f"One host carries {top_share*100:.0f}% of unicast but some third-party traffic "
+                      f"({third_party_flows} flows) is visible too — e.g. a capture on a router/gateway. Some "
+                      "inter-host unicast is likely still missing.")
+        if silent:
+            detail += (f" {silent} device(s) here were seen only via ARP/DHCP/LLDP/CDP, never in a unicast "
+                       "conversation — corroborating that their traffic isn't reaching this capture point.")
+        low_conf = total < 2000
+        return {
+            "verdict": verdict, "label": label, "detail": detail,
+            "broadcast_pct": round(bcast_pct, 1),
+            "unicast_packets": uni_pkts, "broadcast_packets": bm_pkts,
+            "top_host": top_host, "top_host_share": round(top_share, 3),
+            "distinct_unicast_hosts": distinct, "third_party_flows": third_party_flows,
+            "silent_devices": silent, "low_confidence": low_conf,
+        }
+
     def inventory(self):
         """Unified device inventory: every IP host plus L2-only LLDP/CDP neighbors,
         each annotated with how it was discovered. 'active' = sent/received IP
@@ -6187,11 +6256,13 @@ class PcapAnalysis:
             for d in devices:
                 for s in d["discovery_sources"]:
                     by_source[s] = by_source.get(s, 0) + 1
-            return {
+            result = {
                 "devices": devices, "total": len(devices), "by_source": by_source,
                 "active": sum(1 for d in devices if d["active"]),
                 "passive": sum(1 for d in devices if not d["active"]),
             }
+        result["position"] = self.capture_position()
+        return result
 
     def _finalize(self):
         # Roll up device identity for every host.
@@ -6870,6 +6941,13 @@ def api_inventory():
     if not analysis:
         return jsonify({"error": "no pcap loaded"}), 404
     return jsonify(analysis.inventory())
+
+
+@app.route("/api/capture-position")
+def api_capture_position():
+    if not analysis:
+        return jsonify({"error": "no pcap loaded"}), 404
+    return jsonify(analysis.capture_position())
 
 
 @app.route("/api/export/counts")

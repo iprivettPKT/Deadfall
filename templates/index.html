@@ -2947,10 +2947,26 @@ async function showInventory() {
         </div>
       </div>`;
   };
+  // Capture-vantage banner — explains structural coverage limits.
+  const p = data.position || {};
+  const vColor = { span: 'var(--accent)', partial: 'var(--amber)',
+                   endpoint: 'var(--amber)', 'broadcast-only': 'var(--danger)' }[p.verdict] || 'var(--text-faint)';
+  const vIcon = { span: '✓', partial: '◐', endpoint: '⚠', 'broadcast-only': '⚠' }[p.verdict] || 'ℹ';
+  const posBanner = p.label ? `
+    <div style="border:1px solid var(--border); border-left:3px solid ${vColor}; padding:8px 10px; margin-bottom:10px;">
+      <div style="color:${vColor}; font-weight:600;">${vIcon} ${escapeHtml(p.label)}${p.low_confidence ? ' <span style="color:var(--text-faint); font-weight:400;">(low confidence — little traffic)</span>' : ''}</div>
+      <div style="color:var(--text-dim); font-size:11px; margin-top:3px;">${escapeHtml(p.detail || '')}</div>
+      <div style="color:var(--text-faint); font-size:10px; margin-top:4px;">
+        ${p.broadcast_pct}% broadcast/multicast · ${fmtNum(p.unicast_packets || 0)} unicast pkts ·
+        ${p.distinct_unicast_hosts || 0} unicast hosts · ${p.third_party_flows || 0} third-party flows
+      </div>
+    </div>` : '';
+
   // Active devices first, then silent (passively-discovered) ones.
   const sorted = devs.slice().sort((a, b) => (b.active - a.active));
   panel.innerHTML = `
     <div class="ip-header"><div class="ip" style="color:var(--accent);">🖧 device inventory</div></div>
+    ${posBanner}
     <div style="color:var(--text-dim); font-size:11px; margin-bottom:4px;">
       ${data.total} devices · <b style="color:var(--text);">${data.active}</b> active ·
       <b style="color:var(--amber);">${data.passive}</b> silent (ARP/DHCP/LLDP/CDP-only)

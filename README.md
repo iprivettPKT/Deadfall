@@ -40,6 +40,12 @@ a prioritized list of pentester-relevant findings in one pass.
   lists every device with its discovery sources, splitting **active** hosts
   (seen in traffic) from **silent** ones known only from ARP/DHCP/LLDP/CDP —
   so coverage is auditable and you can see what traffic-only analysis missed.
+- **Capture-position diagnostic** — from the broadcast-vs-unicast mix and how
+  unicast is distributed, Deadfall infers your vantage point (endpoint /
+  SPAN-tap / un-mirrored switch port / gateway) and tells you when it's
+  structurally blind to unicast between other hosts — so a thin capture reads
+  as "wrong vantage," not "missing devices." Shown atop the inventory tab and
+  at `/api/capture-position`.
 - **Threat-intel reputation** — public IPs are checked against offline
   reputation feeds; flagged nodes get a red glow and a tag in the tooltip
   and detail panel.
@@ -372,6 +378,7 @@ vulnerability evidence with no access control.
 | `GET /api/credentials` | all extracted credential artifacts |
 | `GET /api/auth` | assembled NetNTLM + Kerberos roast hashes, usernames, and poisonable LLMNR/NBT-NS/mDNS queries |
 | `GET /api/inventory` | unified device inventory with per-device discovery sources (active vs silent) |
+| `GET /api/capture-position` | inferred capture vantage (endpoint / SPAN / un-mirrored / gateway) + evidence |
 | `GET /api/http` | global feed of paired HTTP request/response transactions (`?q=`, `?host=`, `?limit=`) |
 | `GET /api/export/counts` | per-artifact counts for the export tab |
 | `GET /api/export/<kind>` | download one loot artifact (`netntlmv2`, `krb5tgs`, `users`, `relay-targets`, `findings.csv`, `report.md`, …) |
