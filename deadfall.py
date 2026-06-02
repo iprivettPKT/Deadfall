@@ -55,10 +55,17 @@ from scapy.packet import Raw
 from scapy.utils import PcapReader, PcapWriter
 from scapy.sendrecv import sniff
 try:
-    from scapy.arch import get_if_list
+    from scapy.sendrecv import srp
+except Exception:
+    srp = None
+try:
+    from scapy.arch import get_if_list, get_if_addr
 except Exception:
     def get_if_list():
         return []
+
+    def get_if_addr(_iface):
+        return "0.0.0.0"
 try:
     from scapy.layers.inet6 import IPv6, ICMPv6ND_RA
 except Exception:
@@ -6823,9 +6830,118 @@ class WhoisCache:
 
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
+class ArpSweep:
+    """Active ARP discovery — broadcast ARP requests across a subnet and fold the
+    replies into the analysis as confirmed devices (source tag 'arp-sweep'). The
+    active complement to passive capture: it proves which addresses are actually
+    present. Needs raw-socket privileges, same as live capture."""
+
+    def __init__(self):
+        self.analysis = None
+        self.thread = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.iface = self.subnet = None
+        self.started_at = self.finished_at = self.error = None
+        self.results = []
+        self.new_count = 0
+
+    def configure(self, analysis):
+        self.analysis = analysis
+
+    def status(self):
+        with self.lock:
+            return {
+                "running": self.running, "iface": self.iface, "subnet": self.subnet,
+                "started_at": self.started_at, "finished_at": self.finished_at,
+                "error": self.error, "found": len(self.results),
+                "new": self.new_count, "results": list(self.results),
+            }
+
+    def start(self, iface, subnet=None):
+        if self.running:
+            return False, "a sweep is already running"
+        if srp is None:
+            return False, "scapy send/recv is unavailable in this build"
+        if self.analysis is None:
+            return False, "no analysis context"
+        if not subnet:
+            try:
+                ip = get_if_addr(iface)
+                if not ip or ip == "0.0.0.0":
+                    return False, f"{iface} has no IPv4 address — specify a subnet"
+                subnet = str(ipaddress.ip_network(ip + "/24", strict=False))
+            except Exception as e:
+                return False, f"could not derive subnet for {iface}: {e}"
+        try:
+            net = ipaddress.ip_network(subnet, strict=False)
+        except Exception as e:
+            return False, f"invalid subnet: {e}"
+        if net.num_addresses > 4096:
+            return False, "subnet too large (max /20) — narrow the range"
+        with self.lock:
+            self.running = True
+            self.iface, self.subnet = iface, str(net)
+            self.error, self.results, self.new_count = None, [], 0
+            self.started_at, self.finished_at = time.time(), None
+        self.thread = threading.Thread(target=self._run, args=(iface, str(net)),
+                                       name="arp-sweep", daemon=True)
+        self.thread.start()
+        return True, None
+
+    def _ingest_reply(self, ip, mac):
+        """Fold one ARP reply (ip, mac) into the analysis. Returns whether new."""
+        if not ip or ip == "0.0.0.0":
+            return None
+        a = self.analysis
+        was_new = ip not in a.hosts
+        mac = (mac or "").lower()
+        with a.lock:
+            h = a._mark(ip, "arp-sweep")
+            if h is not None and mac and mac != "00:00:00:00:00:00":
+                h["mac"] = mac
+                a.arp_table[ip].add(mac)
+                if not h.get("vendor"):
+                    h["vendor"] = lookup_vendor(mac)
+                if not h.get("device_type"):
+                    h["device_type"] = infer_device_type(h)
+        return {"ip": ip, "mac": mac, "vendor": lookup_vendor(mac) if mac else None, "new": was_new}
+
+    def _run(self, iface, subnet):
+        try:
+            ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=subnet),
+                         timeout=3, iface=iface, verbose=0, retry=1)
+            results = []
+            for _sent, rcv in ans:
+                r = self._ingest_reply(getattr(rcv, "psrc", None), getattr(rcv, "hwsrc", None))
+                if r:
+                    results.append(r)
+
+            def ipkey(r):
+                try:
+                    return tuple(int(o) for o in r["ip"].split("."))
+                except Exception:
+                    return (999,)
+            results.sort(key=ipkey)
+            with self.lock:
+                self.results = results
+                self.new_count = sum(1 for r in results if r["new"])
+        except PermissionError as e:
+            with self.lock:
+                self.error = f"permission denied — run with root / CAP_NET_RAW: {e}"
+        except Exception as e:
+            with self.lock:
+                self.error = str(e)[:200]
+        finally:
+            with self.lock:
+                self.running = False
+                self.finished_at = time.time()
+
+
 analysis = None
 whois_cache = WhoisCache()
 live_capture = LiveCapture()
+arp_sweep = ArpSweep()
 
 
 @app.route("/")
@@ -7139,6 +7255,27 @@ def api_live_interfaces():
         return jsonify({"interfaces": sorted(get_if_list())})
     except Exception as e:
         return jsonify({"interfaces": [], "error": str(e)})
+
+
+@app.route("/api/arp-sweep/start", methods=["POST"])
+def api_arp_sweep_start():
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    data = request.get_json(silent=True) or {}
+    iface = (data.get("iface") or "").strip()
+    subnet = (data.get("subnet") or "").strip() or None
+    if not iface:
+        return jsonify({"error": "iface required"}), 400
+    arp_sweep.configure(analysis)
+    ok, err = arp_sweep.start(iface, subnet)
+    if not ok:
+        return jsonify({"error": err, **arp_sweep.status()}), 400
+    return jsonify(arp_sweep.status())
+
+
+@app.route("/api/arp-sweep/status")
+def api_arp_sweep_status():
+    return jsonify(arp_sweep.status())
 
 
 @app.route("/api/live/start", methods=["POST"])

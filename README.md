@@ -68,6 +68,13 @@ a prioritized list of pentester-relevant findings in one pass.
 - **Live capture mode** — sniff a local interface, populate the graph in
   real time with position-preserving updates that never reset your view,
   optionally record to pcap, and hit stop to get a save prompt.
+- **Active ARP sweep** — the one active-discovery feature: broadcast ARP
+  requests across an interface's /24 (or a subnet you specify) and fold the
+  replies straight into the graph/inventory as confirmed devices (source tag
+  `arp-sweep`, with OUI vendor). It's the active complement to passive capture —
+  it proves which addresses are actually present, and unlike passive ARP, it
+  won't graph phantoms because only *replies* count. Needs raw-socket
+  privileges, like live capture.
 - **Live hit alerts** — the moment a hash, credential, or SMB relay target is
   captured during a live session, Deadfall pops an in-UI toast (and an optional
   desktop notification), and POSTs a JSON alert to a webhook if configured
@@ -393,6 +400,8 @@ vulnerability evidence with no access control.
 | `GET /api/live/alerts` | new hash/cred/relay-target hits since `?since=<seq>` (for toasts) |
 | `GET/POST /api/live/alert-config` | get or set the alert webhook URL (`{webhook}`) |
 | `GET /api/live/interfaces` | list available capture interfaces |
+| `POST /api/arp-sweep/start` | body `{iface, subnet?}` — active ARP sweep of a subnet (raw-socket privileges) |
+| `GET /api/arp-sweep/status` | sweep progress + replies (ip / mac / vendor / new) |
 | `POST /api/live/start` | body `{iface, bpf?}` |
 | `POST /api/live/stop` | stop capture (also finalizes any recording) |
 | `POST /api/live/save` | body `{path?}` — start recording to pcap (default: `deadfall-<timestamp>.pcap`) |
@@ -447,4 +456,6 @@ vulnerability evidence with no access control.
 Deadfall is intended for analyzing traffic you are authorized to
 examine — pentesting engagements, CTFs, lab captures, your own
 network. Credential extractors look at plaintext bytes only; nothing
-is ever decrypted.
+is ever decrypted. Analysis is otherwise passive; the **active ARP
+sweep** is the one feature that transmits — only run it on networks
+you are authorized to probe.

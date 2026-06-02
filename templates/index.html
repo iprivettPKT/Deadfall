@@ -1214,6 +1214,16 @@
       </div>
     </div>
 
+    <div class="filter-group">
+      <h2 class="section-title">active discovery</h2>
+      <div class="live-panel">
+        <select id="sweep-iface"></select>
+        <input type="text" id="sweep-subnet" placeholder="subnet (blank = iface /24)">
+        <button class="btn" id="btn-arp-sweep" style="width:100%;">⚡ ARP sweep</button>
+        <div class="live-save-info" id="sweep-info"></div>
+      </div>
+    </div>
+
     <div class="filter-group" id="live-group">
       <h2 class="section-title">live capture</h2>
       <div class="live-panel">
@@ -1375,14 +1385,47 @@ let _whoisPoll = null;
 async function refreshInterfaces() {
   try {
     const r = await fetch('/api/live/interfaces').then(r => r.json());
-    const sel = document.getElementById('live-iface');
     const ifaces = r.interfaces || [];
-    const current = (document.querySelector('#live-iface') || {}).value;
-    sel.innerHTML = ifaces.length
+    const opts = ifaces.length
       ? ifaces.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')
       : '<option value="">(no interfaces)</option>';
-    if (current && ifaces.includes(current)) sel.value = current;
+    for (const id of ['live-iface', 'sweep-iface']) {
+      const sel = document.getElementById(id);
+      if (!sel) continue;
+      const current = sel.value;
+      sel.innerHTML = opts;
+      if (current && ifaces.includes(current)) sel.value = current;
+    }
   } catch (e) { /* non-fatal */ }
+}
+
+async function arpSweep() {
+  const iface = document.getElementById('sweep-iface').value;
+  const subnet = document.getElementById('sweep-subnet').value.trim() || null;
+  const info = document.getElementById('sweep-info');
+  const btn = document.getElementById('btn-arp-sweep');
+  if (!iface) { info.textContent = 'pick an interface'; return; }
+  btn.disabled = true;
+  info.textContent = 'starting sweep…';
+  try {
+    const r = await fetch('/api/arp-sweep/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ iface, subnet }),
+    }).then(r => r.json());
+    if (r.error) { info.textContent = r.error; btn.disabled = false; return; }
+    const poll = async () => {
+      let s;
+      try { s = await fetch('/api/arp-sweep/status').then(r => r.json()); }
+      catch (e) { info.textContent = String(e); btn.disabled = false; return; }
+      if (s.running) { info.textContent = `sweeping ${escapeHtml(s.subnet || '')} …`; setTimeout(poll, 700); return; }
+      btn.disabled = false;
+      if (s.error) { info.className = 'live-save-info'; info.textContent = s.error; return; }
+      info.innerHTML = `found <b style="color:var(--text)">${s.found}</b> on ${escapeHtml(s.subnet || '')} · `
+        + `<b style="color:var(--accent)">${s.new} new</b>`;
+      await refresh();   // pull newly-discovered hosts into the graph
+    };
+    setTimeout(poll, 700);
+  } catch (e) { info.textContent = String(e); btn.disabled = false; }
 }
 
 function updateLiveBadge(live, summary) {
@@ -2904,7 +2947,7 @@ async function showAuthLoot() {
 
 // Per-discovery-source chip color, so coverage is readable at a glance.
 const SRC_COLOR = {
-  traffic: 'var(--accent-dim)', arp: '#6a8caf', 'arp-target': '#b0863e',
+  traffic: 'var(--accent-dim)', arp: '#6a8caf', 'arp-sweep': '#c0a05e',
   dhcp: '#5a8f6a', 'dhcp-lease': '#3e8f6a', lldp: '#a05ec0', cdp: '#c05e8f',
   mdns: '#5e9fc0', ssdp: '#5e9fc0', nbns: '#8f8f3e', dns: '#7a7a7a',
 };
@@ -3229,6 +3272,7 @@ document.getElementById('btn-lan-only').addEventListener('click', () => {
 document.getElementById('btn-live-start').addEventListener('click', liveStart);
 document.getElementById('btn-live-stop').addEventListener('click', liveStop);
 document.getElementById('btn-live-save').addEventListener('click', liveSaveToggle);
+document.getElementById('btn-arp-sweep').addEventListener('click', arpSweep);
 document.getElementById('btn-alert-webhook').addEventListener('click', saveAlertWebhook);
 document.getElementById('alert-webhook').addEventListener('keydown', e => {
   if (e.key === 'Enter') saveAlertWebhook();
