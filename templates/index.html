@@ -1318,6 +1318,7 @@ const whoisCache = {};
 let _livePoll = null;
 let _lastAlertSeq = 0;
 let _alertDesktop = false;
+let _invShowPublic = false;
 let _viewMode = 'graph';  // 'graph' | 'flow' | 'report' — when non-graph, skip graph rebuilds
 let _lastPacketCount = 0;
 let _lastPacketTs = 0;
@@ -2917,7 +2918,7 @@ async function showInventory() {
   panel.innerHTML = '<div style="color:var(--text-faint); font-size:11px;">building inventory…</div>';
   let data;
   try {
-    data = await fetch('/api/inventory').then(r => r.json());
+    data = await fetch('/api/inventory?include_public=' + (_invShowPublic ? '1' : '0')).then(r => r.json());
   } catch (e) {
     panel.innerHTML = `<div style="color:var(--danger);">inventory load failed: ${escapeHtml(String(e))}</div>`;
     return;
@@ -2968,9 +2969,13 @@ async function showInventory() {
     <div class="ip-header"><div class="ip" style="color:var(--accent);">🖧 device inventory</div></div>
     ${posBanner}
     <div style="color:var(--text-dim); font-size:11px; margin-bottom:4px;">
-      ${data.total} devices · <b style="color:var(--text);">${data.active}</b> active ·
+      ${data.total} ${_invShowPublic ? '' : 'local '}devices · <b style="color:var(--text);">${data.active}</b> active ·
       <b style="color:var(--amber);">${data.passive}</b> silent (ARP/DHCP/LLDP/CDP-only)
     </div>
+    <label style="display:flex; align-items:center; gap:6px; font-size:10px; color:var(--text-dim); cursor:pointer; margin-bottom:8px;">
+      <input type="checkbox" id="inv-public" ${_invShowPublic ? 'checked' : ''} style="width:12px;height:12px;">
+      include public IPs${data.public_skipped && !_invShowPublic ? ` <span style="color:var(--text-faint);">(${data.public_skipped} hidden — remote internet endpoints)</span>` : ''}
+    </label>
     <div style="margin-bottom:8px;">${srcLegend}</div>
     <a class="btn" href="/api/export/hosts.csv" download style="display:inline-block; margin-bottom:10px;">⬇ hosts.csv</a>
     ${sorted.map(row).join('') || '<div style="color:var(--text-faint);">no devices yet.</div>'}
@@ -2979,6 +2984,8 @@ async function showInventory() {
     const node = graph.nodes.find(n => n.id === a.dataset.ip);
     if (node) selectNode(node);
   }));
+  const pub = document.getElementById('inv-public');
+  if (pub) pub.addEventListener('change', e => { _invShowPublic = e.target.checked; showInventory(); });
 }
 
 async function showExport() {

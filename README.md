@@ -37,9 +37,11 @@ a prioritized list of pentester-relevant findings in one pass.
   off a SPAN port. Every host is tagged with **how** it was discovered
   (traffic / arp / arp-target / dhcp / dhcp-lease / lldp / cdp / mdns / …).
 - **Device inventory** — a `🖧 device inventory` tab (and `/api/inventory`)
-  lists every device with its discovery sources, splitting **active** hosts
-  (seen in traffic) from **silent** ones known only from ARP/DHCP/LLDP/CDP —
-  so coverage is auditable and you can see what traffic-only analysis missed.
+  lists every **local** device (RFC1918 / link-local / ULA) with its discovery
+  sources, splitting **active** hosts (seen in traffic) from **silent** ones
+  known only from ARP/DHCP/LLDP/CDP — so coverage is auditable and you can see
+  what traffic-only analysis missed. Public IPs are remote internet endpoints,
+  not on-network devices, so they're hidden by default (toggle to include them).
 - **Capture-position diagnostic** — from the broadcast-vs-unicast mix and how
   unicast is distributed, Deadfall infers your vantage point (endpoint /
   SPAN-tap / un-mirrored switch port / gateway) and tells you when it's
@@ -377,7 +379,7 @@ vulnerability evidence with no access control.
 | `GET /api/plaintext` | all plaintext flows + captured payload samples |
 | `GET /api/credentials` | all extracted credential artifacts |
 | `GET /api/auth` | assembled NetNTLM + Kerberos roast hashes, usernames, and poisonable LLMNR/NBT-NS/mDNS queries |
-| `GET /api/inventory` | unified device inventory with per-device discovery sources (active vs silent) |
+| `GET /api/inventory` | local device inventory with per-device discovery sources (active vs silent); `?include_public=1` to add remote IPs |
 | `GET /api/capture-position` | inferred capture vantage (endpoint / SPAN / un-mirrored / gateway) + evidence |
 | `GET /api/http` | global feed of paired HTTP request/response transactions (`?q=`, `?host=`, `?limit=`) |
 | `GET /api/export/counts` | per-artifact counts for the export tab |

@@ -6216,15 +6216,22 @@ class PcapAnalysis:
             "silent_devices": silent, "low_confidence": low_conf,
         }
 
-    def inventory(self):
+    def inventory(self, include_public=False):
         """Unified device inventory: every IP host plus L2-only LLDP/CDP neighbors,
         each annotated with how it was discovered. 'active' = sent/received IP
         traffic; 'passive' = known only from ARP/DHCP/LLDP/CDP (would be missed
-        by traffic-only discovery)."""
+        by traffic-only discovery).
+
+        Defaults to local (RFC1918 / link-local / ULA) devices only — public IPs are
+        remote internet endpoints your hosts talked to, not devices on the network.
+        Pass include_public=True to list them too."""
         with self.lock:
-            host_macs, devices = set(), []
+            host_macs, devices, public_skipped = set(), [], 0
             for ip, h in sorted(self.hosts.items()):
                 if h.get("is_multicast") or ip in ("0.0.0.0", "255.255.255.255", "::"):
+                    continue
+                if not h.get("is_private") and not include_public:
+                    public_skipped += 1
                     continue
                 mac = h.get("mac")
                 if mac:
@@ -6260,6 +6267,7 @@ class PcapAnalysis:
                 "devices": devices, "total": len(devices), "by_source": by_source,
                 "active": sum(1 for d in devices if d["active"]),
                 "passive": sum(1 for d in devices if not d["active"]),
+                "include_public": include_public, "public_skipped": public_skipped,
             }
         result["position"] = self.capture_position()
         return result
@@ -6940,7 +6948,8 @@ def api_auth():
 def api_inventory():
     if not analysis:
         return jsonify({"error": "no pcap loaded"}), 404
-    return jsonify(analysis.inventory())
+    include_public = request.args.get("include_public", "").lower() in ("1", "true", "yes")
+    return jsonify(analysis.inventory(include_public=include_public))
 
 
 @app.route("/api/capture-position")
