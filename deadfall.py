@@ -50,7 +50,7 @@ except Exception:
     pass
 
 from scapy.layers.inet import IP, TCP, UDP, ICMP
-from scapy.layers.l2 import ARP
+from scapy.layers.l2 import ARP, Ether
 from scapy.packet import Raw
 from scapy.utils import PcapReader, PcapWriter
 from scapy.sendrecv import sniff
@@ -3105,6 +3105,10 @@ class PcapAnalysis:
         self.alerts_dispatch = False   # set True by LiveCapture.start()
         self.last_webhook_error = None
 
+        # L2 discovery neighbors (LLDP / CDP) keyed by announcing MAC. Captures
+        # infrastructure (switches/APs/phones) that may have no IP we'd otherwise see.
+        self.l2_neighbors = {}
+
     def _get_host(self, ip):
         if ip not in self.hosts:
             self.hosts[ip] = {
@@ -3117,6 +3121,9 @@ class PcapAnalysis:
                 "ports_listening": set(),
                 "ports_connecting": set(),
                 "protocols": set(),
+                # how this device was discovered: traffic / arp / arp-target /
+                # dhcp / dhcp-lease / lldp / cdp / mdns / ssdp / nbns / rdns
+                "discovery_sources": set(),
                 "plaintext_services": set(),
                 "encrypted_services": set(),
                 "dns_names": set(),
@@ -3150,6 +3157,18 @@ class PcapAnalysis:
             # _finalize() does a second pass to cover the early-host case).
             self._check_reputation(ip)
         return self.hosts[ip]
+
+    def _mark(self, ip, source):
+        """Ensure a host record exists for ip and tag how it was discovered.
+        Returns the host dict (or None for non-routable pseudo-addresses)."""
+        if not ip or ip in ("0.0.0.0", "255.255.255.255", "::"):
+            return None
+        try:
+            h = self._get_host(ip)
+        except Exception:
+            return None
+        h["discovery_sources"].add(source)
+        return h
 
     def _check_reputation(self, ip):
         """Look an IP up in the loaded reputation feeds and populate host fields."""
@@ -3675,12 +3694,173 @@ class PcapAnalysis:
         if ARP not in pkt:
             return
         a = pkt[ARP]
-        if a.psrc and a.hwsrc:
+        if a.psrc and a.hwsrc and a.hwsrc.lower() != "00:00:00:00:00:00":
             self.arp_table[a.psrc].add(a.hwsrc.lower())
-            try:
-                self._get_host(a.psrc)["mac"] = a.hwsrc.lower()
-            except Exception:
-                pass
+            h = self._mark(a.psrc, "arp")
+            if h is not None:
+                h["mac"] = a.hwsrc.lower()
+        # The ARP *target* (pdst) is a real, addressed device on the segment even
+        # if it never sends a packet we'd otherwise see. ARP is broadcast, so this
+        # surfaces silent hosts that traffic-only discovery misses (works off-SPAN).
+        try:
+            op = int(a.op)
+        except Exception:
+            op = 1
+        if op == 1 and a.pdst:   # who-has request → pdst is the sought device
+            tgt = self._mark(a.pdst, "arp-target")
+            if tgt is not None and a.hwdst and a.hwdst.lower() not in (
+                    "00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff") and not tgt.get("mac"):
+                tgt["mac"] = a.hwdst.lower()
+
+    # --- L2 discovery: LLDP / CDP ----------------------------------------
+    # Switches, APs and IP phones advertise themselves via LLDP (ethertype
+    # 0x88cc) and Cisco CDP (multicast 01:00:0c:cc:cc:cc). These are the
+    # infrastructure devices that generate little/no IP traffic of their own.
+    _LLDP_CAPS = [(0x02, "Repeater"), (0x04, "Bridge/Switch"), (0x08, "WLAN-AP"),
+                  (0x10, "Router"), (0x20, "Phone"), (0x40, "DOCSIS"), (0x80, "Station")]
+    _CDP_CAPS = [(0x01, "Router"), (0x02, "Bridge"), (0x08, "Switch"),
+                 (0x10, "Host"), (0x80, "Phone")]
+
+    def _d_l2_discovery(self, pkt):
+        """Parse an LLDP/CDP frame if present. Returns True if it was one."""
+        if Ether not in pkt:
+            return False
+        eth = pkt[Ether]
+        try:
+            etype = int(eth.type)
+        except Exception:
+            etype = None
+        src_mac = (eth.src or "").lower()
+        dst_mac = (eth.dst or "").lower()
+        try:
+            if etype == 0x88CC:
+                self._parse_lldp(src_mac, bytes(eth.payload))
+                return True
+            if dst_mac == "01:00:0c:cc:cc:cc":
+                self._parse_cdp(src_mac, bytes(pkt))
+                return True
+        except Exception:
+            return True   # it was an L2 discovery frame even if parsing tripped
+        return False
+
+    @staticmethod
+    def _decode_caps(value, table):
+        return [name for bit, name in table if value & bit]
+
+    def _parse_lldp(self, src_mac, data):
+        rec = {"source": "lldp", "mac": src_mac, "name": None, "descr": None,
+               "port": None, "caps": [], "mgmt_ip": None}
+        i = 0
+        while i + 2 <= len(data):
+            hdr = (data[i] << 8) | data[i + 1]
+            ttype = hdr >> 9
+            tlen = hdr & 0x1FF
+            i += 2
+            val = data[i:i + tlen]
+            i += tlen
+            if ttype == 0:                       # End of LLDPDU
+                break
+            if len(val) < 1 and ttype not in (3,):
+                continue
+            if ttype == 1 and len(val) >= 2:     # Chassis ID
+                sub, body = val[0], val[1:]
+                if sub == 4 and len(body) == 6:
+                    rec["mac"] = ":".join(f"{b:02x}" for b in body)
+                elif sub in (5, 6, 7):
+                    rec["name"] = rec["name"] or body.decode("utf-8", "replace").strip("\x00")
+            elif ttype == 2 and len(val) >= 2:   # Port ID
+                rec["port"] = val[1:].decode("utf-8", "replace").strip("\x00")[:64]
+            elif ttype == 5:                     # System Name
+                rec["name"] = val.decode("utf-8", "replace").strip("\x00")[:96]
+            elif ttype == 6:                     # System Description
+                rec["descr"] = val.decode("utf-8", "replace").strip("\x00")[:160]
+            elif ttype == 7 and len(val) >= 4:   # System Capabilities (enabled = bytes 2-3)
+                rec["caps"] = self._decode_caps((val[2] << 8) | val[3], self._LLDP_CAPS)
+            elif ttype == 8 and len(val) >= 1:   # Management Address
+                alen = val[0]
+                if alen == 5 and len(val) >= 6 and val[1] == 1:   # IPv4 (subtype 1, 4 bytes)
+                    rec["mgmt_ip"] = ".".join(str(b) for b in val[2:6])
+        self._record_l2_neighbor(rec)
+
+    def _parse_cdp(self, src_mac, raw):
+        sig = raw.find(b"\xaa\xaa\x03\x00\x00\x0c\x20\x00")   # LLC + SNAP (OUI 00000c, PID 2000)
+        if sig < 0:
+            return
+        cdp = raw[sig + 8:]
+        if len(cdp) < 4:
+            return
+        rec = {"source": "cdp", "mac": src_mac, "name": None, "platform": None,
+               "port": None, "version": None, "caps": [], "addresses": []}
+        i = 4   # skip version(1) + ttl(1) + checksum(2)
+        while i + 4 <= len(cdp):
+            ttype = (cdp[i] << 8) | cdp[i + 1]
+            tlen = (cdp[i + 2] << 8) | cdp[i + 3]
+            if tlen < 4 or i + tlen > len(cdp):
+                break
+            val = cdp[i + 4:i + tlen]
+            i += tlen
+            if ttype == 0x0001:
+                rec["name"] = val.decode("utf-8", "replace").strip("\x00")[:96]
+            elif ttype == 0x0003:
+                rec["port"] = val.decode("utf-8", "replace").strip("\x00")[:64]
+            elif ttype == 0x0006:
+                rec["platform"] = val.decode("utf-8", "replace").strip("\x00")[:96]
+            elif ttype == 0x0005:
+                rec["version"] = val.decode("utf-8", "replace").strip("\x00").split("\n")[0][:120]
+            elif ttype == 0x0004 and len(val) >= 4:
+                rec["caps"] = self._decode_caps(int.from_bytes(val[:4], "big"), self._CDP_CAPS)
+            elif ttype == 0x0002 and len(val) >= 4:   # Addresses
+                n = int.from_bytes(val[:4], "big")
+                p = 4
+                for _ in range(min(n, 8)):
+                    if p + 2 > len(val):
+                        break
+                    ptype_len = val[p + 1]
+                    p += 2 + ptype_len
+                    if p + 2 > len(val):
+                        break
+                    alen = int.from_bytes(val[p:p + 2], "big")
+                    p += 2
+                    addr = val[p:p + alen]
+                    p += alen
+                    if alen == 4:
+                        rec["addresses"].append(".".join(str(b) for b in addr))
+        self._record_l2_neighbor(rec)
+
+    def _record_l2_neighbor(self, rec):
+        """Store an LLDP/CDP neighbor and, when it carries an IP, enrich the host."""
+        mac = rec.get("mac")
+        if mac:
+            prev = self.l2_neighbors.get(mac, {})
+            prev.update({k: v for k, v in rec.items() if v})
+            self.l2_neighbors[mac] = prev
+        # Pick a device-type hint from capabilities/platform.
+        caps = rec.get("caps") or []
+        dtype = None
+        if any("Phone" in c for c in caps):
+            dtype = "IP Phone"
+        elif any("AP" in c or "WLAN" in c for c in caps):
+            dtype = "Wireless AP"
+        elif any("Switch" in c or "Bridge" in c for c in caps):
+            dtype = "Switch"
+        elif any("Router" in c for c in caps):
+            dtype = "Router"
+        ips = list(rec.get("addresses") or [])
+        if rec.get("mgmt_ip"):
+            ips.append(rec["mgmt_ip"])
+        for ip in ips:
+            h = self._mark(ip, rec["source"])
+            if h is None:
+                continue
+            if mac and not h.get("mac"):
+                h["mac"] = mac
+            if rec.get("name"):
+                h["lldp_cdp_name"] = rec["name"]
+            if dtype and not h.get("device_type"):
+                h["device_type"] = dtype
+            h["lldp_cdp"] = {k: rec.get(k) for k in
+                             ("source", "name", "platform", "descr", "port", "version", "caps")
+                             if rec.get(k)}
 
     def _d_device_recon(self, ip, h):
         """Map identity + listening ports → device-specific exposure findings.
@@ -4101,6 +4281,7 @@ class PcapAnalysis:
                     try:
                         ip = rdata
                         h = self._get_host(ip)
+                        h["discovery_sources"].add("mdns" if is_mdns else "dns")
                         if is_mdns and rname.endswith(".local") and not h.get("mdns_local_name"):
                             # ".local" mDNS hostnames are device-claimed names.
                             h["mdns_local_name"] = rname[:-len(".local")] if rname.endswith(".local") else rname
@@ -4126,6 +4307,7 @@ class PcapAnalysis:
                         # also marks the SRC host as having that friendly name.
                         if is_mdns and name and "._" not in rname and rname.endswith(".local"):
                             sh = self._get_host(src)
+                            sh["discovery_sources"].add("mdns")
                             if not sh.get("mdns_local_name"):
                                 sh["mdns_local_name"] = name
                     except Exception:
@@ -4160,20 +4342,39 @@ class PcapAnalysis:
             elif k == "message-type" and v in (1, 3, 8):
                 is_client = True  # DISCOVER/REQUEST/INFORM come from the client
         # Attribute to source IP if routable; else to the client MAC's host record (best-effort).
+        # The hostname/vendor-class options belong to the *client*, so only fold them into
+        # src for client-originated messages (DISCOVER/REQUEST/INFORM) — never the server.
         target_ip = src if (src and src != "0.0.0.0") else None
         if target_ip:
-            h = self._get_host(target_ip)
-            if hostname and not h.get("dhcp_hostname"):
-                h["dhcp_hostname"] = hostname
-            if vendor_class and not h.get("dhcp_vendor_class"):
-                h["dhcp_vendor_class"] = vendor_class
-            if client_mac and not h.get("mac"):
-                h["mac"] = client_mac
+            h = self._mark(target_ip, "dhcp")
+            if h is not None and is_client:
+                if hostname and not h.get("dhcp_hostname"):
+                    h["dhcp_hostname"] = hostname
+                if vendor_class and not h.get("dhcp_vendor_class"):
+                    h["dhcp_vendor_class"] = vendor_class
+                if client_mac and not h.get("mac"):
+                    h["mac"] = client_mac
         elif client_mac:
             # 0.0.0.0 case — stash for later (a host record may appear once it gets a lease).
             self._dhcp_by_mac[client_mac] = {
                 "hostname": hostname, "vendor_class": vendor_class,
             }
+        # The server's OFFER/ACK carries yiaddr = the address being assigned to the
+        # client. Register it so a freshly-leased but otherwise-silent device shows up
+        # by its IP (with MAC + hostname), even before it sends any other traffic.
+        try:
+            yi = pkt[BOOTP].yiaddr
+        except Exception:
+            yi = None
+        if yi and yi != "0.0.0.0":
+            lease = self._mark(yi, "dhcp-lease")
+            if lease is not None:
+                if client_mac and not lease.get("mac"):
+                    lease["mac"] = client_mac
+                if hostname and not lease.get("dhcp_hostname"):
+                    lease["dhcp_hostname"] = hostname
+                if vendor_class and not lease.get("dhcp_vendor_class"):
+                    lease["dhcp_vendor_class"] = vendor_class
 
     def _record_poisonable(self, src, proto, name):
         """Track a name-resolution query an attacker could answer (Responder targets)."""
@@ -4251,6 +4452,7 @@ class PcapAnalysis:
                 name = qname.strip().rstrip("$").rstrip("\x00")
                 if name and name != "*" and name != "\x01\x02__MSBROWSE__\x02":
                     h = self._get_host(src)
+                    h["discovery_sources"].add("nbns")
                     if not h.get("nbns_name"):
                         h["nbns_name"] = name
         elif dport == 5353:
@@ -5334,11 +5536,13 @@ class PcapAnalysis:
                 continue
             if k == "server":
                 h = self._get_host(src)
+                h["discovery_sources"].add("ssdp")
                 if not h.get("ssdp_server"):
                     h["ssdp_server"] = v[:200]
             elif k == "user-agent" and src and src != dst:
                 # NOTIFY uses USER-AGENT for the same purpose on some stacks.
                 h = self._get_host(src)
+                h["discovery_sources"].add("ssdp")
                 if not h.get("ssdp_server"):
                     h["ssdp_server"] = v[:200]
 
@@ -5466,6 +5670,10 @@ class PcapAnalysis:
             self._d_arp(pkt)
             return
 
+        # LLDP / CDP ride raw L2 (no IP layer) — handle before the IP checks.
+        if self._d_l2_discovery(pkt):
+            return
+
         if IP in pkt:
             src = pkt[IP].src
             dst = pkt[IP].dst
@@ -5481,6 +5689,8 @@ class PcapAnalysis:
         size = len(pkt)
         src_host = self._get_host(src)
         dst_host = self._get_host(dst)
+        src_host["discovery_sources"].add("traffic")
+        dst_host["discovery_sources"].add("traffic")
         src_host["packets_out"] += 1
         src_host["bytes_out"] += size
         dst_host["packets_in"] += 1
@@ -5799,6 +6009,7 @@ class PcapAnalysis:
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["ip", "mac", "vendor", "device_type", "hostname", "is_private",
+                    "discovery_sources",
                     "ports_listening", "protocols", "plaintext_services", "whois_org",
                     "whois_country", "reputation_tags", "malicious", "risk_score",
                     "packets_in", "packets_out", "bytes_in", "bytes_out"])
@@ -5807,8 +6018,9 @@ class PcapAnalysis:
                 continue
             w.writerow([
                 ip, h.get("mac") or "", h.get("vendor") or "", h.get("device_type") or "",
-                h.get("hostname") or pick_hostname(h) or "",
+                h.get("hostname") or pick_hostname(h) or h.get("lldp_cdp_name") or "",
                 "yes" if h.get("is_private") else "no",
+                ";".join(sorted(h.get("discovery_sources") or [])),
                 " ".join(str(p) for p in sorted(h.get("ports_listening", []))[:60]),
                 " ".join(sorted(h.get("protocols", []))),
                 " ".join(sorted(h.get("plaintext_services", []))),
@@ -5934,6 +6146,52 @@ class PcapAnalysis:
             for mode, stem, _label in self.KRB_MODES:
                 counts[stem] = sum(1 for h in krb if h.get("mode") == mode)
             return counts
+
+    def inventory(self):
+        """Unified device inventory: every IP host plus L2-only LLDP/CDP neighbors,
+        each annotated with how it was discovered. 'active' = sent/received IP
+        traffic; 'passive' = known only from ARP/DHCP/LLDP/CDP (would be missed
+        by traffic-only discovery)."""
+        with self.lock:
+            host_macs, devices = set(), []
+            for ip, h in sorted(self.hosts.items()):
+                if h.get("is_multicast") or ip in ("0.0.0.0", "255.255.255.255", "::"):
+                    continue
+                mac = h.get("mac")
+                if mac:
+                    host_macs.add(mac)
+                active = bool(h.get("packets_in") or h.get("packets_out"))
+                devices.append({
+                    "ip": ip, "mac": mac, "vendor": h.get("vendor"),
+                    "device_type": h.get("device_type"),
+                    "hostname": h.get("hostname") or pick_hostname(h) or h.get("lldp_cdp_name"),
+                    "discovery_sources": sorted(h.get("discovery_sources") or []),
+                    "ports": sorted(h.get("ports_listening") or [])[:30],
+                    "is_private": bool(h.get("is_private")),
+                    "lldp_cdp": h.get("lldp_cdp"), "active": active,
+                })
+            for mac, n in sorted(self.l2_neighbors.items()):
+                if mac in host_macs:
+                    continue   # already represented by an IP host with this MAC
+                devices.append({
+                    "ip": None, "mac": mac, "vendor": None,
+                    "device_type": None, "hostname": n.get("name"),
+                    "discovery_sources": [n.get("source")] if n.get("source") else [],
+                    "ports": [], "is_private": True,
+                    "lldp_cdp": {k: n.get(k) for k in
+                                 ("source", "platform", "port", "caps", "descr", "version")
+                                 if n.get(k)},
+                    "active": False,
+                })
+            by_source = {}
+            for d in devices:
+                for s in d["discovery_sources"]:
+                    by_source[s] = by_source.get(s, 0) + 1
+            return {
+                "devices": devices, "total": len(devices), "by_source": by_source,
+                "active": sum(1 for d in devices if d["active"]),
+                "passive": sum(1 for d in devices if not d["active"]),
+            }
 
     def _finalize(self):
         # Roll up device identity for every host.
@@ -6182,6 +6440,7 @@ class PcapAnalysis:
                 "rdns_name": h.get("rdns_name"),
                 "malicious": h.get("malicious", False),
                 "reputation_tags": h.get("reputation_tags") or [],
+                "discovery_sources": sorted(h.get("discovery_sources") or []),
             } for ip, h in self.hosts.items()]
             links = [{
                 "source": src,
@@ -6264,11 +6523,14 @@ class PcapAnalysis:
             "mdns_local_name": h.get("mdns_local_name"),
             "ssdp_server": h.get("ssdp_server"),
             "rdns_name": h.get("rdns_name"),
+            "lldp_cdp_name": h.get("lldp_cdp_name"),
+            "lldp_cdp": h.get("lldp_cdp"),
             "whois_org": h.get("whois_org"),
             "whois_country": h.get("whois_country"),
             "whois_asn": h.get("whois_asn"),
             "malicious": h.get("malicious", False),
             "reputation_tags": h.get("reputation_tags") or [],
+            "discovery_sources": sorted(h.get("discovery_sources") or []),
         }
 
 
@@ -6601,6 +6863,13 @@ def api_auth():
             "krb": len(krb), "users": len(users), "poisonable": len(poison),
         },
     })
+
+
+@app.route("/api/inventory")
+def api_inventory():
+    if not analysis:
+        return jsonify({"error": "no pcap loaded"}), 404
+    return jsonify(analysis.inventory())
 
 
 @app.route("/api/export/counts")

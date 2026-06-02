@@ -1266,6 +1266,9 @@
       <button class="btn" id="btn-export" style="width:100%; text-align:left; margin-bottom:4px;">
         📦 export loot
       </button>
+      <button class="btn" id="btn-inventory" style="width:100%; text-align:left; margin-bottom:4px;">
+        🖧 device inventory
+      </button>
       <button class="btn" id="btn-lan-only" style="width:100%; text-align:left; margin-bottom:4px;">
         🏠 graph LAN only
       </button>
@@ -2206,8 +2209,16 @@ function renderDetail(d, w) {
   if (d.nbns_name)         deviceChips.push(`<span class="tag" title="NetBIOS NS">NBNS: ${d.nbns_name}</span>`);
   if (d.ssdp_server)       deviceChips.push(`<span class="tag" title="SSDP Server header">SSDP: ${d.ssdp_server}</span>`);
   if (d.rdns_name)         deviceChips.push(`<span class="tag" title="reverse DNS">rDNS: ${d.rdns_name}</span>`);
+  if (d.lldp_cdp_name)     deviceChips.push(`<span class="tag" title="LLDP/CDP system name">${escapeHtml((d.lldp_cdp && d.lldp_cdp.source || 'lldp').toUpperCase())}: ${escapeHtml(d.lldp_cdp_name)}</span>`);
+  if (d.lldp_cdp && d.lldp_cdp.platform) deviceChips.push(`<span class="tag" title="LLDP/CDP platform">${escapeHtml(d.lldp_cdp.platform)}</span>`);
+  if (d.lldp_cdp && d.lldp_cdp.port)     deviceChips.push(`<span class="tag" title="LLDP/CDP port">port: ${escapeHtml(d.lldp_cdp.port)}</span>`);
   if (d.whois_org)         deviceChips.push(`<span class="tag" title="RDAP ASN org">ASN: ${d.whois_org}${d.whois_asn ? ' ('+d.whois_asn+')' : ''}</span>`);
   if (d.whois_country)     deviceChips.push(`<span class="tag" title="RDAP country">${d.whois_country}</span>`);
+  // How this device was discovered — directly answers "did we actually see it?"
+  if (d.discovery_sources && d.discovery_sources.length) {
+    for (const s of d.discovery_sources)
+      deviceChips.push(`<span class="tag" title="discovery source" style="background:${SRC_COLOR[s] || 'var(--bg-3)'};color:var(--bg);border:0;">${escapeHtml(s)}</span>`);
+  }
   if (d.reputation_tags && d.reputation_tags.length) {
     const cls = d.malicious ? 'rep-mal' : 'rep-info';
     for (const t of d.reputation_tags) {
@@ -2890,6 +2901,70 @@ async function showAuthLoot() {
   `;
 }
 
+// Per-discovery-source chip color, so coverage is readable at a glance.
+const SRC_COLOR = {
+  traffic: 'var(--accent-dim)', arp: '#6a8caf', 'arp-target': '#b0863e',
+  dhcp: '#5a8f6a', 'dhcp-lease': '#3e8f6a', lldp: '#a05ec0', cdp: '#c05e8f',
+  mdns: '#5e9fc0', ssdp: '#5e9fc0', nbns: '#8f8f3e', dns: '#7a7a7a',
+};
+function srcChip(s) {
+  return `<span class="tag" style="background:${SRC_COLOR[s] || 'var(--bg-3)'};color:var(--bg);border:0;">${escapeHtml(s)}</span>`;
+}
+
+async function showInventory() {
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  panel.innerHTML = '<div style="color:var(--text-faint); font-size:11px;">building inventory…</div>';
+  let data;
+  try {
+    data = await fetch('/api/inventory').then(r => r.json());
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--danger);">inventory load failed: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  const devs = data.devices || [];
+  const srcOrder = Object.entries(data.by_source || {}).sort((a, b) => b[1] - a[1]);
+  const srcLegend = srcOrder.map(([s, n]) => `${srcChip(s)}<span style="color:var(--text-faint); font-size:10px; margin:0 8px 0 2px;">${n}</span>`).join('');
+  const row = d => {
+    const id = d.ip || `(${d.mac || '?'})`;
+    const name = d.hostname || (d.lldp_cdp && d.lldp_cdp.platform) || '';
+    const dt = d.device_type ? `<span style="color:var(--text-dim);"> · ${escapeHtml(d.device_type)}</span>` : '';
+    const ven = d.vendor && !String(d.vendor).startsWith('(') ? `<span style="color:var(--text-faint);"> · ${escapeHtml(d.vendor)}</span>` : '';
+    const portStr = d.ports && d.ports.length ? `<span style="color:var(--text-faint); font-size:10px;"> :${d.ports.slice(0, 12).join(',')}</span>` : '';
+    return `
+      <div style="padding:7px 0; border-bottom:1px solid var(--border); ${d.active ? '' : 'opacity:0.82;'}">
+        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+          ${d.ip ? `<a class="ac-host-link" data-ip="${d.ip}" style="color:var(--amber); cursor:pointer; font-weight:600;">${d.ip}</a>`
+                 : `<span style="color:var(--text-dim); font-weight:600;">${escapeHtml(id)}</span>`}
+          ${name ? `<span style="color:var(--text);">${escapeHtml(name)}</span>` : ''}
+          ${dt}${ven}
+          ${!d.active ? '<span style="color:var(--amber); font-size:9px; border:1px solid var(--amber); padding:0 4px; border-radius:2px;">silent</span>' : ''}
+        </div>
+        <div style="margin-top:3px; display:flex; align-items:center; gap:4px; flex-wrap:wrap;">
+          ${(d.discovery_sources || []).map(srcChip).join('')}
+          ${d.mac ? `<span style="color:var(--text-faint); font-size:10px;">${escapeHtml(d.mac)}</span>` : ''}
+          ${portStr}
+        </div>
+      </div>`;
+  };
+  // Active devices first, then silent (passively-discovered) ones.
+  const sorted = devs.slice().sort((a, b) => (b.active - a.active));
+  panel.innerHTML = `
+    <div class="ip-header"><div class="ip" style="color:var(--accent);">🖧 device inventory</div></div>
+    <div style="color:var(--text-dim); font-size:11px; margin-bottom:4px;">
+      ${data.total} devices · <b style="color:var(--text);">${data.active}</b> active ·
+      <b style="color:var(--amber);">${data.passive}</b> silent (ARP/DHCP/LLDP/CDP-only)
+    </div>
+    <div style="margin-bottom:8px;">${srcLegend}</div>
+    <a class="btn" href="/api/export/hosts.csv" download style="display:inline-block; margin-bottom:10px;">⬇ hosts.csv</a>
+    ${sorted.map(row).join('') || '<div style="color:var(--text-faint);">no devices yet.</div>'}
+  `;
+  panel.querySelectorAll('.ac-host-link').forEach(a => a.addEventListener('click', () => {
+    const node = graph.nodes.find(n => n.id === a.dataset.ip);
+    if (node) selectNode(node);
+  }));
+}
+
 async function showExport() {
   const panel = document.getElementById('detail');
   panel.className = 'detail';
@@ -3087,6 +3162,7 @@ document.getElementById('btn-attack-paths').addEventListener('click', () => { _v
 document.getElementById('btn-http-feed').addEventListener('click', () => { _viewMode = 'report'; showHttpFeed(); });
 document.getElementById('btn-auth-loot').addEventListener('click', () => { _viewMode = 'report'; showAuthLoot(); });
 document.getElementById('btn-export').addEventListener('click', () => { _viewMode = 'report'; showExport(); });
+document.getElementById('btn-inventory').addEventListener('click', () => { _viewMode = 'report'; showInventory(); });
 // LAN-only is a toggle: first press hides public/multicast; second press restores
 // whatever the user had selected previously. Button gets an .active class while
 // LAN-only is engaged so the state is visible at a glance.

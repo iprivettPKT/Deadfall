@@ -29,6 +29,17 @@ a prioritized list of pentester-relevant findings in one pass.
   Wireshark `manuf` when present), inferred device type, and hostnames
   harvested from DHCP, mDNS, NBT-NS, SSDP, and reverse DNS, so the graph
   reads as real devices instead of bare IPs.
+- **Passive device discovery** — beyond hosts seen in IP conversations,
+  Deadfall surfaces devices from **ARP targets** (the "who-has" address even if
+  it never replies), **DHCP leases** (the server's assigned `yiaddr` + MAC),
+  and **LLDP / CDP** announcements (switches, APs, IP phones — system name,
+  port, model, capabilities). These ride broadcast/multicast, so they work even
+  off a SPAN port. Every host is tagged with **how** it was discovered
+  (traffic / arp / arp-target / dhcp / dhcp-lease / lldp / cdp / mdns / …).
+- **Device inventory** — a `🖧 device inventory` tab (and `/api/inventory`)
+  lists every device with its discovery sources, splitting **active** hosts
+  (seen in traffic) from **silent** ones known only from ARP/DHCP/LLDP/CDP —
+  so coverage is auditable and you can see what traffic-only analysis missed.
 - **Threat-intel reputation** — public IPs are checked against offline
   reputation feeds; flagged nodes get a red glow and a tag in the tooltip
   and detail panel.
@@ -360,6 +371,7 @@ vulnerability evidence with no access control.
 | `GET /api/plaintext` | all plaintext flows + captured payload samples |
 | `GET /api/credentials` | all extracted credential artifacts |
 | `GET /api/auth` | assembled NetNTLM + Kerberos roast hashes, usernames, and poisonable LLMNR/NBT-NS/mDNS queries |
+| `GET /api/inventory` | unified device inventory with per-device discovery sources (active vs silent) |
 | `GET /api/http` | global feed of paired HTTP request/response transactions (`?q=`, `?host=`, `?limit=`) |
 | `GET /api/export/counts` | per-artifact counts for the export tab |
 | `GET /api/export/<kind>` | download one loot artifact (`netntlmv2`, `krb5tgs`, `users`, `relay-targets`, `findings.csv`, `report.md`, …) |
