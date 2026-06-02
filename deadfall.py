@@ -4464,16 +4464,19 @@ class PcapAnalysis:
         self._d_krb_roast(src, dst, port, payload)
 
     def _d_krb_roast(self, src, dst, port, payload):
-        """Extract roastable hashes from a Kerberos AS-REP (app tag 0x6b) or
-        TGS-REP (0x6d). Only RC4 (etype 23) is emitted — the classic roast format.
-        Truncated DER is refused by _der_tlv, so partial captures never yield a hash."""
-        # KDC-REP starts at offset 0 (UDP) or 4 (TCP length prefix); on a reassembled
-        # stream it may sit deeper, so also scan for the app tag + DER long-form length
-        # (Kerberos messages are always long-form). Dedup makes extra attempts harmless.
-        starts = [s for s in (0, 4) if s < len(payload) and payload[s] in (0x6B, 0x6D)]
-        for tag in (0x6B, 0x6D):
+        """Extract crackable hashes from Kerberos messages: AS-REP (app 0x6b,
+        AS-REP roast, RC4 only — hashcat has no AES AS-REP mode), TGS-REP (0x6d,
+        Kerberoast, RC4/AES128/AES256), and AS-REQ (0x6a, PA-ENC-TIMESTAMP
+        pre-auth roast, AES128/AES256). Truncated DER is refused by _der_tlv, so
+        partial captures never yield a hash."""
+        # Message starts at offset 0 (UDP) or 4 (TCP length prefix); on a reassembled
+        # stream it may sit deeper, so also scan for the app tag + DER long-form length.
+        # Dedup makes extra attempts harmless.
+        app_tags = (0x6A, 0x6B, 0x6D)
+        starts = [s for s in (0, 4) if s < len(payload) and payload[s] in app_tags]
+        for tag in app_tags:
             pos = 0
-            while len(starts) < 12:
+            while len(starts) < 16:
                 i = payload.find(bytes([tag]), pos)
                 if i < 0:
                     break
@@ -4489,12 +4492,15 @@ class PcapAnalysis:
         if app is None:
             return
         app_tag, app_val, _ = app
-        if app_tag not in (0x6B, 0x6D):
+        if app_tag not in (0x6A, 0x6B, 0x6D):
             return
-        kdc_rep = _der_unwrap(app_val)  # KDC-REP SEQUENCE
-        if kdc_rep is None:
+        body = _der_unwrap(app_val)  # KDC-REP / KDC-REQ SEQUENCE
+        if body is None:
             return
-        kids = _der_children(kdc_rep)
+        kids = _der_children(body)
+        if app_tag == 0x6A:  # AS-REQ — PA-ENC-TIMESTAMP pre-auth roast (AES only)
+            self._try_krb_preauth(src, dst, port, kids)
+            return
         crealm = _der_string(_der_find(kids, 0xA3) or b"")        # [3] crealm
         user = _der_principal(_der_find(kids, 0xA4) or b"")       # [4] cname
         if app_tag == 0x6B:  # AS-REP — roast the KDC-REP enc-part ([6], user's key)
@@ -4502,8 +4508,8 @@ class PcapAnalysis:
             enc = _der_encrypted_part(ep) if ep else None
             if not enc or not user or not crealm:
                 return
-            self._emit_krb_hash("krb5asrep", 18200, enc, user, crealm, None, src, dst, port)
-        elif app_tag == 0x6D:  # TGS-REP — roast the *ticket's* enc-part (service key)
+            self._emit_krb_hash("krb5asrep", enc, user, crealm, None, src, dst, port)
+        else:  # 0x6D TGS-REP — roast the *ticket's* enc-part (service account key)
             ticket_ctx = _der_find(kids, 0xA5)  # [5] ticket
             ticket_app = _der_unwrap(ticket_ctx) if ticket_ctx else None  # [APPLICATION 1]
             tkt_seq = _der_unwrap(ticket_app) if ticket_app else None
@@ -4516,36 +4522,87 @@ class PcapAnalysis:
             enc = _der_encrypted_part(ep) if ep else None
             if not enc or not realm or not spn:
                 return
-            self._emit_krb_hash("krb5tgs", 13100, enc, user or spn, realm, spn, src, dst, port)
+            self._emit_krb_hash("krb5tgs", enc, user or spn, realm, spn, src, dst, port)
 
-    def _emit_krb_hash(self, label, mode, enc, user, realm, spn, src, dst, port):
-        etype, cipher = enc
-        if etype != 23 or len(cipher) < 17:   # RC4-HMAC: cipher = checksum(16) + edata
+    def _try_krb_preauth(self, src, dst, port, req_kids):
+        """From an AS-REQ, pull the PA-ENC-TIMESTAMP (padata-type 2) EncryptedData
+        and the client principal/realm (req-body). AES (17/18) only — that's where
+        hashcat has a mode ($krb5pa$, -m 19800/19900) and the salt (realm+user) is
+        recoverable straight from the request."""
+        padata_seq = _der_unwrap(_der_find(req_kids, 0xA3) or b"")   # [3] padata SEQUENCE OF
+        body = _der_unwrap(_der_find(req_kids, 0xA4) or b"")         # [4] req-body
+        if padata_seq is None or body is None:
             return
-        checksum = cipher[:16].hex()
-        edata = cipher[16:].hex()
-        if label == "krb5asrep":
-            hashcat = f"$krb5asrep$23${user}@{realm}:{checksum}${edata}"
-        else:  # krb5tgs (kerberoast)
-            hashcat = f"$krb5tgs$23$*{user}${realm}${spn}*${checksum}${edata}"
+        enc = None
+        for _t, pa in _der_children(padata_seq):                     # each PA-DATA SEQUENCE
+            pk = _der_children(pa)
+            ptype_raw = _der_unwrap(_der_find(pk, 0xA1) or b"")      # [1] padata-type INTEGER
+            if ptype_raw is None or int.from_bytes(ptype_raw, "big") != 2:
+                continue                                            # 2 = PA-ENC-TIMESTAMP
+            pval = _der_unwrap(_der_find(pk, 0xA2) or b"")           # [2] padata-value OCTET STRING
+            if pval is not None:                                    # content is EncryptedData SEQUENCE
+                enc = _der_encrypted_part(pval)
+            break
+        if enc is None:
+            return
+        bk = _der_children(body)
+        user = _der_principal(_der_find(bk, 0xA1) or b"")            # [1] cname
+        realm = _der_string(_der_find(bk, 0xA2) or b"")             # [2] realm
+        if not user or not realm:
+            return
+        self._emit_krb_hash("krb5pa", enc, user, realm, None, src, dst, port)
+
+    # hashcat mode + format per (Kerberos message label, encryption type).
+    # AES checksum (HMAC-SHA1-96) is the trailing 12 bytes; RC4 checksum is the
+    # leading 16 bytes. krb5pa carries the whole cipher as one field.
+    _KRB_AES = {17: "aes128", 18: "aes256"}
+
+    def _emit_krb_hash(self, label, enc, user, realm, spn, src, dst, port):
+        etype, cipher = enc
+        mode = None
+        if label == "krb5tgs":
+            if etype == 23 and len(cipher) >= 17:
+                mode = 13100
+                hashcat = f"$krb5tgs$23$*{user}${realm}${spn}*${cipher[:16].hex()}${cipher[16:].hex()}"
+            elif etype in (17, 18) and len(cipher) >= 13:
+                mode = 19600 if etype == 17 else 19700
+                hashcat = f"$krb5tgs${etype}${user}${realm}${cipher[-12:].hex()}${cipher[:-12].hex()}"
+        elif label == "krb5asrep":
+            if etype == 23 and len(cipher) >= 17:   # hashcat has no AES AS-REP mode
+                mode = 18200
+                hashcat = f"$krb5asrep$23${user}@{realm}:{cipher[:16].hex()}${cipher[16:].hex()}"
+        elif label == "krb5pa":
+            if etype in (17, 18) and len(cipher) >= 13:
+                mode = 19800 if etype == 17 else 19900
+                hashcat = f"$krb5pa${etype}${user}${realm}${cipher.hex()}"
+        if mode is None:
+            return
         dkey = (label, hashcat)
         if dkey in self._krb_hash_seen:
             return
         self._krb_hash_seen.add(dkey)
+        is_aes = etype in self._KRB_AES
         self.krb_hashes.append({
             "type": label, "mode": mode, "etype": etype,
+            "enc": self._KRB_AES.get(etype, "rc4"),
             "user": user, "realm": realm, "spn": spn,
             "src": src, "dst": dst, "port": port, "hashcat": hashcat,
         })
-        roast = "AS-REP roastable" if label == "krb5asrep" else "Kerberoastable"
+        kind = {"krb5tgs": "Kerberoastable", "krb5asrep": "AS-REP roastable",
+                "krb5pa": "Pre-auth roastable"}[label]
+        # AES kerberoast salt is realm+service-account; we only have the requesting
+        # cname, so flag that the user field may need correcting before cracking.
+        salt_note = (" Note: AES kerberoast salt is derived from the *service account* "
+                     "name — set the hash's user field to its sAMAccountName if it differs "
+                     f"from '{user}'." if (label == "krb5tgs" and is_aes) else "")
         self._add_finding("high", "kerberos-weak",
-            f"{roast} hash captured — {spn or user}@{realm}",
-            f"RC4 {label} extracted from {src} → {dst}:{port}. Crack offline with "
-            f"hashcat -m {mode}. Ready-to-crack string is in the AD/hashes tab and loot export.",
+            f"{kind} hash captured ({self._KRB_AES.get(etype, 'RC4').upper()}) — {spn or user}@{realm}",
+            f"{label} (etype {etype}) extracted from {src} → {dst}:{port}. Crack offline with "
+            f"hashcat -m {mode}. Ready-to-crack string is in the AD/hashes tab and loot export." + salt_note,
             hosts=[src, dst], port=port, evidence=f"{user}@{realm}" + (f" SPN={spn}" if spn else ""),
-            remediation="Use AES-only service accounts (disable RC4); long random gMSA/service passwords; "
-                        "set DONT_REQ_PREAUTH off for AS-REP roast exposure.",
-            key=(label, user, realm, spn))
+            remediation="Use AES-only service accounts with long random gMSA passwords; require Kerberos "
+                        "pre-auth (clear DONT_REQ_PREAUTH); rotate exposed service-account secrets.",
+            key=(label, etype, user, realm, spn))
 
     def _d_smb(self, src, dst, port, payload):
         if port not in (139, 445):
@@ -5600,9 +5657,21 @@ class PcapAnalysis:
     # (filename, mimetype, bytes); export_all_zip() bundles everything. All read
     # under self.lock so exports are consistent against a live capture.
 
+    # Kerberos export files are split by hashcat mode — you can't mix modes in
+    # one cracking run. (hashcat mode, file stem, human label).
+    KRB_MODES = (
+        (13100, "krb5tgs_rc4",    "Kerberoast RC4"),
+        (19600, "krb5tgs_aes128", "Kerberoast AES128"),
+        (19700, "krb5tgs_aes256", "Kerberoast AES256"),
+        (18200, "krb5asrep_rc4",  "AS-REP roast RC4"),
+        (19800, "krb5pa_aes128",  "Pre-auth AES128"),
+        (19900, "krb5pa_aes256",  "Pre-auth AES256"),
+    )
+
     EXPORT_KINDS = (
-        "netntlmv2", "netntlmv1", "krb5tgs", "krb5asrep", "users",
-        "relay-targets", "credentials.csv", "findings.csv", "hosts.csv", "report.md",
+        ("netntlmv2", "netntlmv1")
+        + tuple(stem for _m, stem, _l in KRB_MODES)
+        + ("users", "relay-targets", "credentials.csv", "findings.csv", "hosts.csv", "report.md")
     )
 
     def _build_relay_targets(self):
@@ -5621,9 +5690,9 @@ class PcapAnalysis:
                  if h.get("mode") == mode]
         return "\n".join(lines) + ("\n" if lines else "")
 
-    def _build_krb(self, label):
+    def _build_krb_mode(self, mode):
         lines = [h["hashcat"] for h in getattr(self, "krb_hashes", [])
-                 if h.get("type") == label]
+                 if h.get("mode") == mode]
         return "\n".join(lines) + ("\n" if lines else "")
 
     def _build_users(self):
@@ -5734,22 +5803,31 @@ class PcapAnalysis:
             out.append("")
         return "\n".join(out) + "\n"
 
+    def _export_builders(self):
+        """kind -> (builder, filename, mimetype). Krb files are generated per mode."""
+        b = {
+            "netntlmv2":        (lambda: self._build_netntlm(5600),  "netntlmv2.txt", "text/plain"),
+            "netntlmv1":        (lambda: self._build_netntlm(5500),  "netntlmv1.txt", "text/plain"),
+            "users":            (self._build_users,            "users.txt",        "text/plain"),
+            "relay-targets":    (self._build_relay_targets,    "relay-targets.txt","text/plain"),
+            "credentials.csv":  (self._build_credentials_csv,  "credentials.csv",  "text/csv"),
+            "findings.csv":     (self._build_findings_csv,     "findings.csv",     "text/csv"),
+            "hosts.csv":        (self._build_hosts_csv,        "hosts.csv",         "text/csv"),
+            "report.md":        (self._build_report_md,        "report.md",        "text/markdown"),
+        }
+        for mode, stem, _label in self.KRB_MODES:
+            b[stem] = ((lambda m=mode: self._build_krb_mode(m)), stem + ".txt", "text/plain")
+        return b
+
+    # Artifacts that are list-shaped and pointless to write when empty.
+    _EXPORT_SKIP_IF_EMPTY = frozenset(
+        {"netntlmv2", "netntlmv1", "users", "relay-targets"}
+        | {stem for _m, stem, _l in KRB_MODES})
+
     def export_artifact(self, kind):
         """Return (filename, mimetype, data_bytes) for a single artifact, or None."""
         with self.lock:
-            builders = {
-                "netntlmv2":        (lambda: self._build_netntlm(5600),  "netntlmv2.txt", "text/plain"),
-                "netntlmv1":        (lambda: self._build_netntlm(5500),  "netntlmv1.txt", "text/plain"),
-                "krb5tgs":          (lambda: self._build_krb("krb5tgs"),  "krb5tgs.txt",   "text/plain"),
-                "krb5asrep":        (lambda: self._build_krb("krb5asrep"),"krb5asrep.txt", "text/plain"),
-                "users":            (self._build_users,            "users.txt",        "text/plain"),
-                "relay-targets":    (self._build_relay_targets,    "relay-targets.txt","text/plain"),
-                "credentials.csv":  (self._build_credentials_csv,  "credentials.csv",  "text/csv"),
-                "findings.csv":     (self._build_findings_csv,     "findings.csv",     "text/csv"),
-                "hosts.csv":        (self._build_hosts_csv,        "hosts.csv",         "text/csv"),
-                "report.md":        (self._build_report_md,        "report.md",        "text/markdown"),
-            }
-            spec = builders.get(kind)
+            spec = self._export_builders().get(kind)
             if not spec:
                 return None
             build, fname, mime = spec
@@ -5760,38 +5838,23 @@ class PcapAnalysis:
         label = self._export_label()
         buf = io.BytesIO()
         with self.lock:
+            builders = self._export_builders()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for kind in self.EXPORT_KINDS:
-                    art = None
-                    builders = {
-                        "netntlmv2": lambda: self._build_netntlm(5600),
-                        "netntlmv1": lambda: self._build_netntlm(5500),
-                        "krb5tgs":   lambda: self._build_krb("krb5tgs"),
-                        "krb5asrep": lambda: self._build_krb("krb5asrep"),
-                        "users":           self._build_users,
-                        "relay-targets":   self._build_relay_targets,
-                        "credentials.csv": self._build_credentials_csv,
-                        "findings.csv":    self._build_findings_csv,
-                        "hosts.csv":       self._build_hosts_csv,
-                        "report.md":       self._build_report_md,
-                    }
-                    data = builders[kind]()
-                    # Skip empty hash/user/target lists; always include CSVs + report.
-                    if not data.strip() and kind in (
-                            "netntlmv2", "netntlmv1", "krb5tgs", "krb5asrep", "users", "relay-targets"):
-                        continue
-                    fname = kind if "." in kind else kind + ".txt"
+                    build, fname, _mime = builders[kind]
+                    data = build()
+                    if not data.strip() and kind in self._EXPORT_SKIP_IF_EMPTY:
+                        continue  # always include CSVs + report, even if empty
                     zf.writestr(f"{label}/{fname}", data)
         return (f"deadfall-loot-{label}.zip", buf.getvalue())
 
     def export_counts(self):
         """Per-artifact line/row counts for the export UI."""
         with self.lock:
-            return {
+            krb = getattr(self, "krb_hashes", [])
+            counts = {
                 "netntlmv2": sum(1 for h in getattr(self, "ntlm_hashes", []) if h.get("mode") == 5600),
                 "netntlmv1": sum(1 for h in getattr(self, "ntlm_hashes", []) if h.get("mode") == 5500),
-                "krb5tgs":   sum(1 for h in getattr(self, "krb_hashes", []) if h.get("type") == "krb5tgs"),
-                "krb5asrep": sum(1 for h in getattr(self, "krb_hashes", []) if h.get("type") == "krb5asrep"),
                 "users":     len(set(filter(None, (
                                  [h.get("user") for h in getattr(self, "ntlm_hashes", [])]
                                  + [m.get("user") for m in self.ntlm_messages if m.get("type") == 3]
@@ -5803,6 +5866,9 @@ class PcapAnalysis:
                 "hosts":     sum(1 for ip, h in self.hosts.items()
                                  if not h.get("is_multicast") and ip not in ("0.0.0.0", "255.255.255.255", "::")),
             }
+            for mode, stem, _label in self.KRB_MODES:
+                counts[stem] = sum(1 for h in krb if h.get("mode") == mode)
+            return counts
 
     def _finalize(self):
         # Roll up device identity for every host.
@@ -6454,16 +6520,19 @@ def api_auth():
             "src": m.get("src"), "dst": m.get("dst"), "port": m.get("port"),
             "has_hash": (m["user"], m.get("domain", "")) in have,
         })
-    krb5tgs = [h for h in krb if h["type"] == "krb5tgs"]
-    krb5asrep = [h for h in krb if h["type"] == "krb5asrep"]
+    # Group Kerberos hashes by hashcat mode (each cracks with a different -m).
+    krb_groups = []
+    for mode, _stem, label in PcapAnalysis.KRB_MODES:
+        items = [h for h in krb if h["mode"] == mode]
+        if items:
+            krb_groups.append({"mode": mode, "label": label, "hashes": items})
     return jsonify({
         "ntlmv2": ntlmv2, "ntlmv1": ntlmv1,
-        "krb5tgs": krb5tgs, "krb5asrep": krb5asrep,
+        "krb_groups": krb_groups,
         "users": users, "poisonable": poison,
         "counts": {
             "ntlmv2": len(ntlmv2), "ntlmv1": len(ntlmv1),
-            "krb5tgs": len(krb5tgs), "krb5asrep": len(krb5asrep),
-            "users": len(users), "poisonable": len(poison),
+            "krb": len(krb), "users": len(users), "poisonable": len(poison),
         },
     })
 

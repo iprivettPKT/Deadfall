@@ -68,8 +68,8 @@ a prioritized list of pentester-relevant findings in one pass.
   or host IP.
 - **Engagement loot export** — one-click `📦 export loot` tab (and API) that
   pulls everything in tool-ready formats: hashcat-ready hash files
-  (`netntlmv2.txt` `-m 5600`, `netntlmv1.txt` `-m 5500`, `krb5tgs.txt`
-  `-m 13100`, `krb5asrep.txt` `-m 18200`), `users.txt` for spraying,
+  (NetNTLMv2/v1, and Kerberos split per mode — `krb5tgs_rc4`/`aes128`/`aes256`,
+  `krb5asrep_rc4`, `krb5pa_aes128`/`aes256`), `users.txt` for spraying,
   `relay-targets.txt` for `ntlmrelayx -tf`, credentials/findings/host-inventory
   CSVs, a Markdown engagement report, or all of it as a single zip.
 - **Multi-PCAP / directory ingest** — point Deadfall at several captures or a
@@ -155,11 +155,21 @@ evidence, and a remediation suggestion.
 - **ARP spoofing** — duplicate IP→MAC bindings.
 - **Kerberos weak enctypes** — RC4-HMAC / DES in AS-REP/TGS-REP
   (Kerberoasting / AS-REP roasting).
-- **Kerberos roasting extraction** — pulls roastable RC4 hashes out of the
-  wire: AS-REP (`$krb5asrep$`, hashcat `-m 18200`) and service-ticket TGS-REP
-  (`$krb5tgs$`, `-m 13100`) with username / realm / SPN, surfaced in the
-  AD/hashes tab and loot export. TGS-REP tickets that span multiple TCP
-  segments are reassembled before parsing.
+- **Kerberos roasting extraction** — pulls crackable hashes out of the wire and
+  emits hashcat-ready strings, RC4 **and** AES:
+  - **Kerberoast** from TGS-REP service tickets — RC4 (`$krb5tgs$23$`, `-m 13100`),
+    AES128 (`$17$`, `-m 19600`), AES256 (`$18$`, `-m 19700`), with realm / SPN.
+  - **AS-REP roast** from AS-REP (`$krb5asrep$23$`, `-m 18200`; RC4 only — hashcat
+    has no AES AS-REP mode).
+  - **Pre-auth roast** from AS-REQ `PA-ENC-TIMESTAMP` — AES128 (`$krb5pa$17$`,
+    `-m 19800`) and AES256 (`$18$`, `-m 19900`); here the salt (realm + client
+    name) comes straight off the request, so these crack reliably.
+
+  All surfaced in the AD/hashes tab and loot export (one file per hashcat mode,
+  since modes can't be mixed in a run). TGS-REP tickets spanning multiple TCP
+  segments are reassembled first. Note: AES kerberoast salt derives from the
+  *service account* name, which isn't on the wire — the hash's user field may
+  need correcting to the account's sAMAccountName before it will crack.
 - **SMBv1 traffic** — EternalBlue / MS17-010 class.
 - **SMB2/3 signing posture** — parses the SMB2 NEGOTIATE `SecurityMode` to
   classify each server as signing-required or **relayable**; relayable servers

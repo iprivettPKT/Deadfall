@@ -2735,16 +2735,16 @@ async function showAuthLoot() {
         <button class="btn" style="flex-shrink:0;" onclick='copyText(${JSON.stringify(h.hashcat)}, this)'>copy</button>
       </div>
     </div>`;
-  const krbSection = (title, mode, list) => {
-    if (!list.length) return '';
-    const all = list.map(h => h.hashcat).join('\n');
+  const krbSection = g => {
+    const all = g.hashes.map(h => h.hashcat).join('\n');
     return `
       <div style="display:flex; align-items:center; justify-content:space-between; margin:14px 0 6px;">
-        <h3 style="margin:0;">${title} <span style="color:var(--text-faint); font-weight:400;">— hashcat -m ${mode} (${list.length})</span></h3>
+        <h3 style="margin:0;">${escapeHtml(g.label)} <span style="color:var(--text-faint); font-weight:400;">— hashcat -m ${g.mode} (${g.hashes.length})</span></h3>
         <button class="btn" onclick='copyText(${JSON.stringify(all)}, this)'>copy all</button>
       </div>
-      ${list.map(krbCard).join('')}`;
+      ${g.hashes.map(krbCard).join('')}`;
   };
+  const krbGroups = data.krb_groups || [];
 
   // Usernames seen in Type 3 messages we couldn't complete into a hash.
   const orphanUsers = (data.users || []).filter(u => !u.has_hash);
@@ -2773,23 +2773,22 @@ async function showAuthLoot() {
         </div>`).join('')}
       </div>`).join('')}` : '';
 
-  const empty = (!c.ntlmv2 && !c.ntlmv1 && !c.krb5tgs && !c.krb5asrep && !orphanUsers.length && !poison.length)
-    ? `<div style="color:var(--text-faint); padding:14px 0;">no NTLM/Kerberos auth or poisonable name-resolution traffic captured. SMB/HTTP NTLM handshakes, Kerberos AS-REP/TGS-REP, and LLMNR/NBT-NS/mDNS queries appear here.</div>`
+  const empty = (!c.ntlmv2 && !c.ntlmv1 && !c.krb && !orphanUsers.length && !poison.length)
+    ? `<div style="color:var(--text-faint); padding:14px 0;">no NTLM/Kerberos auth or poisonable name-resolution traffic captured. SMB/HTTP NTLM handshakes, Kerberos AS-REP/TGS-REP/AS-REQ, and LLMNR/NBT-NS/mDNS queries appear here.</div>`
     : '';
 
   panel.innerHTML = `
     <div class="ip-header"><div class="ip" style="color:var(--danger);">🔓 AD / hashes</div></div>
     <div style="color:var(--text-dim); font-size:11px; margin-bottom:6px;">
-      ${c.ntlmv2 || 0} NetNTLMv2 · ${c.ntlmv1 || 0} NetNTLMv1 · ${c.krb5tgs || 0} Kerberoast · ${c.krb5asrep || 0} AS-REP · ${orphanUsers.length} bare usernames · ${c.poisonable || 0} poisonable queries
+      ${c.ntlmv2 || 0} NetNTLMv2 · ${c.ntlmv1 || 0} NetNTLMv1 · ${c.krb || 0} Kerberos (RC4/AES) · ${orphanUsers.length} bare usernames · ${c.poisonable || 0} poisonable queries
     </div>
     <div style="color:var(--text-faint); font-size:10px; margin-bottom:10px;">
-      crack offline: <code>-m 5600</code> (NTLMv2) · <code>-m 5500</code> (NTLMv1) · <code>-m 13100</code> (kerberoast) · <code>-m 18200</code> (AS-REP)
+      crack offline: <code>-m 5600/5500</code> (NTLM) · <code>-m 13100/19600/19700</code> (kerberoast) · <code>-m 18200</code> (AS-REP) · <code>-m 19800/19900</code> (pre-auth)
     </div>
     ${empty}
     ${hashSection('NetNTLMv2', 5600, data.ntlmv2 || [])}
     ${hashSection('NetNTLMv1', 5500, data.ntlmv1 || [])}
-    ${krbSection('Kerberoast (TGS-REP)', 13100, data.krb5tgs || [])}
-    ${krbSection('AS-REP roast', 18200, data.krb5asrep || [])}
+    ${krbGroups.map(krbSection).join('')}
     ${usersHtml}
     ${poisonHtml}
   `;
@@ -2808,16 +2807,20 @@ async function showExport() {
   }
   // [endpoint, label, count, hashcat/usage hint]
   const items = [
-    ['netntlmv2',       'NetNTLMv2 hashes',  c.netntlmv2,  'hashcat -m 5600'],
-    ['netntlmv1',       'NetNTLMv1 hashes',  c.netntlmv1,  'hashcat -m 5500'],
-    ['krb5tgs',         'Kerberoast (TGS)',  c.krb5tgs,    'hashcat -m 13100'],
-    ['krb5asrep',       'AS-REP roast',      c.krb5asrep,  'hashcat -m 18200'],
-    ['users',           'usernames',         c.users,      'spray / enum list'],
-    ['relay-targets',   'SMB relay targets', c.relay_targets, 'ntlmrelayx -tf'],
-    ['credentials.csv', 'credentials',       c.credentials,'CSV'],
-    ['findings.csv',    'findings',          c.findings,   'CSV'],
-    ['hosts.csv',       'host inventory',    c.hosts,      'CSV'],
-    ['report.md',       'engagement report', null,         'Markdown'],
+    ['netntlmv2',       'NetNTLMv2 hashes',     c.netntlmv2,      'hashcat -m 5600'],
+    ['netntlmv1',       'NetNTLMv1 hashes',     c.netntlmv1,      'hashcat -m 5500'],
+    ['krb5tgs_rc4',     'Kerberoast RC4',       c.krb5tgs_rc4,    'hashcat -m 13100'],
+    ['krb5tgs_aes128',  'Kerberoast AES128',    c.krb5tgs_aes128, 'hashcat -m 19600'],
+    ['krb5tgs_aes256',  'Kerberoast AES256',    c.krb5tgs_aes256, 'hashcat -m 19700'],
+    ['krb5asrep_rc4',   'AS-REP roast RC4',     c.krb5asrep_rc4,  'hashcat -m 18200'],
+    ['krb5pa_aes128',   'Pre-auth AES128',      c.krb5pa_aes128,  'hashcat -m 19800'],
+    ['krb5pa_aes256',   'Pre-auth AES256',      c.krb5pa_aes256,  'hashcat -m 19900'],
+    ['users',           'usernames',            c.users,          'spray / enum list'],
+    ['relay-targets',   'SMB relay targets',    c.relay_targets,  'ntlmrelayx -tf'],
+    ['credentials.csv', 'credentials',          c.credentials,    'CSV'],
+    ['findings.csv',    'findings',             c.findings,       'CSV'],
+    ['hosts.csv',       'host inventory',       c.hosts,          'CSV'],
+    ['report.md',       'engagement report',    null,             'Markdown'],
   ];
   const rows = items.map(([kind, label, count, hint]) => {
     const dim = (count === 0);
