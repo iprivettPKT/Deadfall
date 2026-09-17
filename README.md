@@ -109,6 +109,18 @@ a prioritized list of pentester-relevant findings in one pass.
 - **HTTP transaction feed** — a global, searchable feed of paired
   request/response transactions across every host, filterable by substring
   or host IP.
+- **HTTP repeater** — captured plaintext HTTP requests can be modified and
+  **resent** with the response shown inline (Burp-Repeater-style): every
+  transaction in the http feed has a `➤ replay` button that loads it into
+  the repeater tab; edit the request, flip scheme/host/port or override the
+  Host header, and send (Ctrl+Enter). Hop-by-hop headers are stripped,
+  Content-Length is recomputed, and redirects are followed **without DNS**
+  — the connection stays on the captured host's IP (like `curl --resolve`)
+  — so vhost routing can be tested by editing the Host header alone.
+  Works over HTTPS too (TLS, certificate validation disabled for replay
+  targets). Every send is recorded in a clickable history. This is an
+  *active* feature: it transmits, so only replay to targets you are
+  authorized to test.
 - **Engagement loot export** — one-click `📦 export loot` tab (and API) that
   pulls everything in tool-ready formats: hashcat-ready hash files
   (NetNTLMv2/v1, and Kerberos split per mode — `krb5tgs_rc4`/`aes128`/`aes256`,
@@ -401,6 +413,8 @@ vulnerability evidence with no access control.
 | `GET /api/inventory` | local device inventory with per-device discovery sources (active vs silent); `?include_public=1` to add remote IPs |
 | `GET /api/capture-position` | inferred capture vantage (endpoint / SPAN / un-mirrored / gateway) + evidence |
 | `GET /api/http` | global feed of paired HTTP request/response transactions (`?q=`, `?host=`, `?limit=`) |
+| `POST /api/repeater/send` | body `{request, scheme?, host?, port?, host_header?, follow?}` — resend a (possibly edited) captured HTTP request and return the response |
+| `GET /api/repeater/history` | recent replays (newest first, last 100) |
 | `GET /api/export/counts` | per-artifact counts for the export tab |
 | `GET /api/export/<kind>` | download one loot artifact (`netntlmv2`, `krb5tgs`, `users`, `relay-targets`, `findings.csv`, `report.md`, …) |
 | `GET /api/export/all.zip` | download all non-empty loot artifacts as a zip |
@@ -466,6 +480,7 @@ vulnerability evidence with no access control.
 Deadfall is intended for analyzing traffic you are authorized to
 examine — pentesting engagements, CTFs, lab captures, your own
 network. Credential extractors look at plaintext bytes only; nothing
-is ever decrypted. Analysis is otherwise passive; the **active ARP
-sweep** is the one feature that transmits — only run it on networks
-you are authorized to probe.
+is ever decrypted. Analysis is otherwise passive; three features
+actively transmit — the **ARP sweep**, the **Responder-style poisoner**,
+and the **HTTP repeater** — only use them against networks and targets
+you are authorized to test.

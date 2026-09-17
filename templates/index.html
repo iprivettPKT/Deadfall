@@ -1291,6 +1291,9 @@
       <button class="btn" id="btn-http-feed" style="width:100%; text-align:left; margin-bottom:4px;">
         🌐 http requests / responses
       </button>
+      <button class="btn" id="btn-repeater" style="width:100%; text-align:left; margin-bottom:4px;">
+        📨 http repeater
+      </button>
       <button class="btn" id="btn-auth-loot" style="width:100%; text-align:left; margin-bottom:4px;">
         🔓 AD / hashes
       </button>
@@ -2900,7 +2903,9 @@ function renderHttpTxn(t) {
         <span style="color:var(--amber); cursor:pointer;" onclick="_httpFilter.host='${t.client}'; showHttpFeed();">${t.client}:${t.client_port}</span>
         <span style="color:var(--text-faint);">→</span>
         <span style="color:var(--amber); cursor:pointer;" onclick="_httpFilter.host='${t.server}'; showHttpFeed();">${t.server}:${t.server_port}</span>
-        <span style="margin-left:auto; color:var(--text-dim); font-size:10px;">${escapeHtml(reqFirst.slice(0,80))} — ${escapeHtml(resFirst.slice(0,60))}</span>
+        <button class="btn" style="padding:1px 8px; font-size:10px; margin-left:auto; border-color:var(--accent-dim); color:var(--accent);"
+          onclick='sendToRepeater(${escapeHtml(JSON.stringify(t))})'>➤ replay</button>
+        <span style="color:var(--text-dim); font-size:10px;">${escapeHtml(reqFirst.slice(0,80))} — ${escapeHtml(resFirst.slice(0,60))}</span>
       </div>
       <div class="http-txn-body">
         <div class="http-side">
@@ -2913,6 +2918,175 @@ function renderHttpTxn(t) {
         </div>
       </div>
     </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP repeater — edit & resend captured requests, see the response.
+// ---------------------------------------------------------------------------
+
+// Repeater state survives tab switches.
+let _repeater = { request: "", scheme: "http", host: "", port: "", hostHeader: "", follow: true };
+
+// Prefill the repeater from a captured transaction (the ➤ replay buttons).
+function sendToRepeater(t) {
+  _repeater.request = t.request || "";
+  _repeater.host = t.server || "";
+  _repeater.port = String(t.server_port || "");
+  _repeater.scheme = "http";
+  _repeater.hostHeader = "";
+  showRepeater();
+}
+
+async function showRepeater() {
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  panel.innerHTML = `
+    <div class="ip-header"><div class="ip" style="color:var(--accent);">📨 http repeater</div></div>
+    <div style="color:var(--text-dim); font-size:11px; margin-bottom:10px;">
+      edit a captured request (or write your own), hit <b>send</b> (or Ctrl+Enter), inspect the response.
+      requests are re-sent to the destination below — <span style="color:var(--amber);">this transmits</span>, only use on networks you're authorized to test.
+      hop-by-hop headers are stripped, content-length is recomputed, and redirects are followed without DNS (same IP, like <code>curl --resolve</code>).
+    </div>
+    <div style="display:flex; gap:6px; margin-bottom:6px; flex-wrap:wrap; align-items:center;">
+      <select id="rep-scheme" style="background:var(--bg-3); border:1px solid var(--border); color:var(--text); padding:5px 6px; font-size:11px;">
+        <option value="http">http</option>
+        <option value="https">https</option>
+      </select>
+      <input id="rep-host" placeholder="destination host / ip" value="${escapeHtml(_repeater.host)}"
+             style="width:170px; background:var(--bg-3); border:1px solid var(--border); color:var(--text); padding:5px 8px; font-size:11px; font-family:inherit;">
+      <input id="rep-port" placeholder="port" value="${escapeHtml(_repeater.port)}"
+             style="width:70px; background:var(--bg-3); border:1px solid var(--border); color:var(--text); padding:5px 8px; font-size:11px; font-family:inherit;">
+      <input id="rep-host-header" placeholder="Host header override (optional)" value="${escapeHtml(_repeater.hostHeader)}"
+             style="flex:1; min-width:160px; background:var(--bg-3); border:1px solid var(--border); color:var(--text); padding:5px 8px; font-size:11px; font-family:inherit;">
+      <label style="color:var(--text-dim); font-size:11px; display:flex; align-items:center; gap:4px;">
+        <input type="checkbox" id="rep-follow" ${_repeater.follow ? "checked" : ""}> follow redirects
+      </label>
+      <button class="btn" id="rep-send" style="border-color:var(--accent-dim); color:var(--accent);">▶ send</button>
+    </div>
+    <div class="http-txn-body" style="margin-bottom:8px;">
+      <div class="http-side">
+        <div class="http-side-label">REQUEST <span style="color:var(--text-faint);">(editable)</span></div>
+        <textarea id="rep-request" spellcheck="false"
+          style="width:100%; min-height:220px; resize:vertical; background:var(--bg-3); border:1px solid var(--border); color:var(--text); padding:8px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11px; line-height:1.5;">${escapeHtml(_repeater.request)}</textarea>
+      </div>
+      <div class="http-side">
+        <div class="http-side-label">RESPONSE <span id="rep-resp-meta" style="color:var(--text-faint);"></span></div>
+        <pre class="http-pre" id="rep-response" style="min-height:220px; max-height:480px; overflow:auto; color:var(--text-faint);">— no response yet —</pre>
+      </div>
+    </div>
+    <div style="margin-top:10px;">
+      <div class="http-side-label">RECENT SENDS <span style="color:var(--text-faint);">(click to reload)</span></div>
+      <div id="rep-history" style="color:var(--text-faint); font-size:11px;">loading…</div>
+    </div>
+  `;
+  document.getElementById('rep-scheme').value = _repeater.scheme;
+  const persist = () => {
+    _repeater.scheme = document.getElementById('rep-scheme').value;
+    _repeater.host = document.getElementById('rep-host').value.trim();
+    _repeater.port = document.getElementById('rep-port').value.trim();
+    _repeater.hostHeader = document.getElementById('rep-host-header').value.trim();
+    _repeater.follow = document.getElementById('rep-follow').checked;
+    _repeater.request = document.getElementById('rep-request').value;
+  };
+  ['rep-scheme','rep-host','rep-port','rep-host-header','rep-follow'].forEach(id => {
+    const el = document.getElementById(id);
+    el.addEventListener('change', persist);
+    if (el.type === 'text') el.addEventListener('keyup', persist);
+  });
+  document.getElementById('rep-request').addEventListener('keyup', persist);
+  document.getElementById('rep-request').addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doRepeaterSend(); }
+  });
+  document.getElementById('rep-send').onclick = doRepeaterSend;
+  loadRepeaterHistory();
+}
+
+async function doRepeaterSend() {
+  const btn = document.getElementById('rep-send');
+  const out = document.getElementById('rep-response');
+  const meta = document.getElementById('rep-resp-meta');
+  persistRepeaterState();
+  const reqText = document.getElementById('rep-request').value;
+  if (!reqText.trim()) { out.textContent = 'write or load a request first (➤ replay in the http feed loads one).'; return; }
+  btn.disabled = true; btn.textContent = '⏳ sending…';
+  out.textContent = 'sending…'; meta.textContent = '';
+  try {
+    const res = await fetch('/api/repeater/send', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        request: reqText,
+        scheme: document.getElementById('rep-scheme').value,
+        host: document.getElementById('rep-host').value.trim() || null,
+        port: document.getElementById('rep-port').value.trim() || null,
+        host_header: document.getElementById('rep-host-header').value.trim() || null,
+        follow: document.getElementById('rep-follow').checked,
+      }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      out.textContent = data.raw || '(empty response body)';
+      out.style.color = 'var(--text)';
+      const hops = (data.chain || []).length;
+      meta.innerHTML = `<span style="color:${data.status < 400 ? 'var(--accent)' : 'var(--danger)'};">${escapeHtml(data.status_line || '')}</span> · ${data.elapsed_ms}ms${hops > 1 ? ` · ${hops - 1} redirect${hops > 2 ? 's' : ''}` : ''}${data.tls ? ' · tls' : ''}`;
+    } else {
+      out.textContent = data.error || 'send failed';
+      out.style.color = 'var(--danger)';
+      meta.textContent = '';
+    }
+  } catch (e) {
+    out.textContent = 'send failed: ' + String(e);
+    out.style.color = 'var(--danger)';
+  } finally {
+    btn.disabled = false; btn.textContent = '▶ send';
+    loadRepeaterHistory();
+  }
+}
+
+function persistRepeaterState() {
+  _repeater.scheme = document.getElementById('rep-scheme').value;
+  _repeater.host = document.getElementById('rep-host').value.trim();
+  _repeater.port = document.getElementById('rep-port').value.trim();
+  _repeater.hostHeader = document.getElementById('rep-host-header').value.trim();
+  _repeater.follow = document.getElementById('rep-follow').checked;
+  _repeater.request = document.getElementById('rep-request').value;
+}
+
+// Reload a request from history into the editor (called from history rows).
+function _repeaterLoad(reqJson) {
+  try {
+    _repeater.request = JSON.parse(reqJson);
+  } catch (e) {
+    _repeater.request = String(reqJson);
+  }
+  showRepeater();
+}
+
+async function loadRepeaterHistory() {
+  const el = document.getElementById('rep-history');
+  if (!el) return;
+  try {
+    const data = await fetch('/api/repeater/history').then(r => r.json());
+    const rows = (data.history || []).slice(0, 20);
+    if (!rows.length) { el.innerHTML = '<span style="color:var(--text-faint);">no sends yet.</span>'; return; }
+    el.innerHTML = rows.map(h => {
+      const ts = new Date((h.ts || 0) * 1000).toISOString().replace('T',' ').replace(/\.\d+Z$/,'');
+      const status = h.ok
+        ? `<span style="color:${(h.status||0) < 400 ? 'var(--accent)' : 'var(--danger)'};">${h.status || '?'}</span>`
+        : `<span style="color:var(--danger);">error</span>`;
+      return `<div style="padding:3px 0; border-bottom:1px solid var(--border); cursor:pointer;"
+        onclick='_repeaterLoad(${escapeHtml(JSON.stringify(JSON.stringify(h.request || "")))})'
+        title="click to reload this request">
+        <span style="color:var(--text-faint); font-size:10px;">${ts}</span>
+        ${status}
+        <span style="color:var(--amber);">${escapeHtml(h.host || '')}${h.port ? ':' + h.port : ''}</span>
+        <span style="color:var(--text-dim);">${escapeHtml((h.request_line || '').slice(0, 70))}</span>
+        <span style="color:var(--text-faint);">${h.elapsed_ms || 0}ms${(h.hops || 0) > 1 ? ' · ' + (h.hops - 1) + ' redirects' : ''}</span>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = '<span style="color:var(--text-faint);">history unavailable</span>';
+  }
 }
 
 // Copy text to clipboard with a brief "copied ✓" flash on the triggering button.
@@ -3322,6 +3496,7 @@ document.getElementById('btn-creds-report').addEventListener('click', () => { _v
 document.getElementById('btn-findings-report').addEventListener('click', () => { _viewMode = 'report'; showFindingsReport(null); });
 document.getElementById('btn-attack-paths').addEventListener('click', () => { _viewMode = 'report'; showAttackPaths(); });
 document.getElementById('btn-http-feed').addEventListener('click', () => { _viewMode = 'report'; showHttpFeed(); });
+document.getElementById('btn-repeater').addEventListener('click', () => { _viewMode = 'report'; showRepeater(); });
 document.getElementById('btn-auth-loot').addEventListener('click', () => { _viewMode = 'report'; showAuthLoot(); });
 document.getElementById('btn-export').addEventListener('click', () => { _viewMode = 'report'; showExport(); });
 document.getElementById('btn-inventory').addEventListener('click', () => { _viewMode = 'report'; showInventory(); });

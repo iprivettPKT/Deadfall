@@ -23,6 +23,7 @@ import os
 import pickle
 import re
 import socket
+import ssl
 import struct
 import sys
 import tempfile
@@ -7466,11 +7467,366 @@ class Responder:
             return
 
 
+class HttpRepeater:
+    """Resend (optionally modified) captured HTTP requests and show the response.
+
+    Burp-Repeater-style manual resend for captured plaintext HTTP requests.
+    The request text from the http feed (or a hand-written one) is normalized
+    (hop-by-hop headers stripped, Content-Length recomputed, Connection: close)
+    and sent to the destination over a fresh socket — plain or TLS. Redirects
+    are followed without DNS resolution (the IP stays the dialed target, like
+    `curl --resolve`), so replay stays pointed at the captured host.
+    """
+
+    MAX_RESPONSE_BYTES = 512 * 1024
+    MAX_HISTORY = 100
+    _REDIRECT_CODES = (301, 302, 303, 307, 308)
+    _HOP_BY_HOP = {
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailer", "trailers", "transfer-encoding", "upgrade", "proxy-connection",
+    }
+    _BODY_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "PROPFIND", "REPORT")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.history = []
+        self._seq = 0
+
+    # ---------------- request parsing ----------------
+
+    @staticmethod
+    def _split_request(text):
+        """Split raw request text into (method, target, version, headers, body).
+
+        Accepts CRLF or LF endings; body is whatever follows the first blank
+        line. Header lines are (name, value) pairs; obs-fold continuations are
+        joined onto the previous header. Returns None if unparseable.
+        """
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        text = text.replace("\r\n", "\n")
+        parts = text.split("\n\n", 1)
+        if len(parts) == 2:
+            head_text, body = parts[0], parts[1]
+        else:
+            # No blank line: last line might still be a header; treat the text
+            # as headers-only and let Content-Length be 0. Safe default.
+            head_text, body = text, ""
+        head_lines = head_text.split("\n")
+        if not head_lines or not head_lines[0].strip():
+            return None
+        m = re.match(r"^([A-Za-z!#$%&'*+.^_`|~0-9-]+)\s+(\S+)\s+(HTTP/\d\.\d)$", head_lines[0].strip())
+        if not m:
+            return None
+        method, target, version = m.group(1).upper(), m.group(2), m.group(3)
+        headers = []
+        for ln in head_lines[1:]:
+            if ln.startswith((" ", "\t")) and headers:      # obs-fold continuation
+                headers[-1] = (headers[-1][0], headers[-1][1] + " " + ln.strip())
+            elif ":" in ln:
+                name, _, value = ln.partition(":")
+                headers.append((name.strip(), value.strip()))
+        return method, target, version, headers, body
+
+    def _normalize(self, raw_text, scheme, host, port, host_header):
+        """Normalize a request for resend.
+
+        Returns (request_bytes, send_host, send_port, use_tls) or raises
+        ValueError with a user-facing message.
+        """
+        parsed = self._split_request(raw_text)
+        if parsed is None:
+            raise ValueError("could not parse request line (expected 'METHOD path HTTP/1.x')")
+        method, target, version, headers, body = parsed
+
+        # Destination resolution order:
+        #   explicit host/port fields > absolute-form target > error
+        use_tls = str(scheme or "").lower() == "https"
+        host = (host or "").strip()
+        if host.startswith("[") and "]" in host:          # bare IPv6 literal
+            host = host[1:host.index("]")]
+        try:
+            port = int(port) if port not in (None, "") else 0
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid port: {port!r}")
+
+        send_host, send_port, path = host, port, target
+        if target.lower().startswith(("http://", "https://")):
+            # Absolute-form target (proxy-style request): extract destination
+            # and path from it when no explicit host was given.
+            u = re.match(r"^(https?)://([^/:]+|\[[0-9a-fA-F:]+\])(?::(\d+))?(\S*)$", target, re.IGNORECASE)
+            if not u:
+                raise ValueError(f"unparseable absolute target: {target[:80]}")
+            if not send_host:
+                hh = u.group(2)
+                send_host = hh[1:-1] if hh.startswith("[") else hh
+                send_port = int(u.group(3)) if u.group(3) else (443 if u.group(1).lower() == "https" else 80)
+            use_tls = use_tls or u.group(1).lower() == "https"
+            path = u.group(4) or "/"
+
+        # Host header value: explicit override > original Host header > dialed host.
+        host_value = (host_header or "").strip() or None
+        if not host_value:
+            for k, v in headers:
+                if k.lower() == "host":
+                    host_value = v
+                    break
+        if not host_value:
+            host_value = send_host
+
+        if not send_host:
+            raise ValueError("no destination: set a destination host or use an absolute-form request target")
+        if not send_port:
+            send_port = 443 if use_tls else 80
+
+        # Rebuild the header block: strip hop-by-hop + framing headers, keep
+        # the rest in original order, then add our framing headers.
+        if not path.startswith("/"):
+            path = "/" + path
+        out = ["%s %s %s" % (method, path, version), "Host: %s" % host_value]
+        for k, v in headers:
+            lk = k.lower()
+            if lk in self._HOP_BY_HOP or lk in ("content-length", "host"):
+                continue
+            out.append("%s: %s" % (k, v))
+        body_bytes = (body or "").encode("utf-8")
+        if method in ("POST", "PUT", "PATCH") or body_bytes:
+            out.append("Content-Length: %d" % len(body_bytes))
+        out.append("Accept-Encoding: identity")
+        out.append("Connection: close")
+        req = ("\r\n".join(out) + "\r\n\r\n").encode("utf-8") + body_bytes
+        return req, send_host, send_port, use_tls
+
+    # ---------------- transport ----------------
+
+    def _recv_response(self, sock):
+        """Read one HTTP response: until EOF, Content-Length satisfied, or timeout."""
+        buf = b""
+        deadline = time.time() + 20
+        while len(buf) < self.MAX_RESPONSE_BYTES:
+            if time.time() > deadline:
+                break
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                break
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            head_end = buf.find(b"\r\n\r\n")
+            if head_end < 0:
+                continue
+            head = buf[:head_end]
+            m = re.match(rb"HTTP/\d\.\d\s+(\d{3})", head)
+            code = int(m.group(1)) if m else 0
+            if 100 <= code < 200 or code in (204, 304):
+                continue    # no body by definition
+            chunked = False
+            cl = None
+            for ln in head.split(b"\r\n")[1:]:
+                low = ln.lower()
+                if low.startswith(b"content-length:"):
+                    try:
+                        cl = int(ln.split(b":", 1)[1].strip())
+                    except ValueError:
+                        cl = None
+                elif low.startswith(b"transfer-encoding:") and b"chunked" in low:
+                    chunked = True
+            if cl is not None and len(buf) >= head_end + 4 + cl:
+                break
+            if chunked and re.search(rb"(\r\n0\r\n\r\n|\r\n0;[^\r]*\r\n(\r\n)?)$", buf):
+                break
+        return buf
+
+    def _send_once(self, host, port, use_tls, req_bytes):
+        """One request over one fresh connection. Returns (raw_bytes_or_None, error_or_None, elapsed_ms)."""
+        t0 = time.time()
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=10)
+            if use_tls:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE   # replay targets are lab/engagement hosts
+                sock = ctx.wrap_socket(sock, server_hostname=host if re.match(r"^[A-Za-z0-9.-]+$", host) else None)
+            sock.settimeout(10)
+            sock.sendall(req_bytes)
+            raw = self._recv_response(sock)
+            return raw, None, int((time.time() - t0) * 1000)
+        except ssl.SSLError as e:
+            return None, "TLS handshake failed: %s" % e, int((time.time() - t0) * 1000)
+        except socket.timeout:
+            return None, "timeout", int((time.time() - t0) * 1000)
+        except OSError as e:
+            return None, "connect/send failed: %s" % e, int((time.time() - t0) * 1000)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def send(self, raw_text, scheme="http", host=None, port=None, host_header=None,
+             follow=True, max_redirects=5, timeout=10):
+        """Replay a request; follows redirects without DNS resolution.
+
+        Returns a dict: {ok, status, status_line, raw, chain, elapsed_ms,
+        host, port, tls} or {ok: False, error, chain}.
+        """
+        try:
+            req_bytes, send_host, send_port, use_tls = self._normalize(
+                raw_text, scheme, host, port, host_header)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        raw_text = str(raw_text)
+
+        chain = []
+        current_host, current_port, current_tls = send_host, send_port, use_tls
+        current_method = req_bytes.split(b" ", 1)[0].decode("latin-1") if req_bytes else "GET"
+        current_req = req_bytes
+        status_line, code, raw = "", 0, b""
+        for hop in range(int(max_redirects) + 1):
+            raw, err, ms = self._send_once(current_host, current_port, current_tls, current_req)
+            chain.append({"host": current_host, "port": current_port, "tls": current_tls,
+                          "status": None, "elapsed_ms": ms})
+            if raw is None:
+                chain[-1]["error"] = err
+                result = {"ok": False, "error": "%s:%s — %s" % (current_host, current_port, err), "chain": chain}
+                self._record(result, current_req, raw_text)
+                return result
+            status_line, code, head_text, _body = self._split_response(raw)
+            chain[-1]["status"] = code
+            chain[-1]["status_line"] = status_line
+            if code in self._REDIRECT_CODES and follow and hop < int(max_redirects):
+                loc = None
+                for ln in head_text.split("\r\n")[1:]:
+                    if ln.lower().startswith("location:"):
+                        loc = ln.split(":", 1)[1].strip()
+                        break
+                if not loc:
+                    break
+                nxt = self._retarget(current_req, current_method, loc, current_host, current_port, current_tls, code)
+                if nxt is None:
+                    chain[-1]["error"] = "unparseable Location: %s" % loc[:80]
+                    break
+                current_req, current_method, current_host, current_port, current_tls = nxt
+                chain[-1]["location"] = loc
+                continue
+            break
+
+        result = {
+            "ok": True,
+            "status": code,
+            "status_line": status_line,
+            "raw": raw.decode("utf-8", "replace")[:self.MAX_RESPONSE_BYTES],
+            "chain": chain,
+            "elapsed_ms": chain[-1]["elapsed_ms"] if chain else 0,
+            "host": current_host,
+            "port": current_port,
+        }
+        self._record(result, current_req, raw_text)
+        return result
+
+    @staticmethod
+    def _split_response(raw):
+        """Split a raw response into (status_line, code, head_text, body_text)."""
+        txt = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else (raw or "")
+        head, _, body = txt.partition("\r\n\r\n")
+        status_line = head.split("\r\n", 1)[0] if head else ""
+        m = re.match(r"HTTP/\d\.\d\s+(\d{3})", status_line)
+        code = int(m.group(1)) if m else 0
+        return status_line, code, head, body
+
+    def _retarget(self, req_bytes, method, loc, host, port, use_tls, code):
+        """Rewrite the request for a redirect Location. Returns
+        (new_req_bytes, new_method, host, port, tls) or None if unsupported.
+
+        The Location host is honored for the Host header but NOT dialed — the
+        connection stays on the captured host (no DNS), like `curl --resolve`.
+        """
+        if loc.startswith("/"):
+            new_host, new_port, new_tls, path = host, port, use_tls, loc
+        elif loc.lower().startswith(("http://", "https://")):
+            u = re.match(r"^(https?)://([^/:]+|\[[0-9a-fA-F:]+\])(?::(\d+))?(\S*)$", loc, re.IGNORECASE)
+            if not u:
+                return None
+            new_tls = u.group(1).lower() == "https"
+            hh = u.group(2)
+            loc_host = hh[1:-1] if hh.startswith("[") else hh
+            new_host, new_port = host, port          # keep dialing the same IP
+            path = u.group(4) or "/"
+        else:
+            return None    # resource-relative Location — not supported
+        parsed = self._split_request(req_bytes.decode("utf-8", "replace"))
+        if parsed is None:
+            return None
+        _m, _t, version, headers, body = parsed
+        # 303 (and de-facto 302) -> GET, drop body; 307/308 preserve method+body.
+        new_method = method
+        new_body = body
+        if code in (301, 302, 303) and method not in ("GET", "HEAD"):
+            new_method = "GET"
+            new_body = ""
+        # Host header: use the Location's authority when absolute, else keep original.
+        if loc.lower().startswith(("http://", "https://")):
+            default_port = 443 if new_tls else 80
+            authority = loc_host if (not u.group(3) or int(u.group(3)) == default_port) else "%s:%s" % (loc_host, u.group(3))
+        else:
+            authority = None
+        out = ["%s %s %s" % (new_method, path, version)]
+        if authority:
+            out.append("Host: %s" % authority)
+        for k, v in headers:
+            lk = k.lower()
+            if lk in self._HOP_BY_HOP or lk in ("content-length", "accept-encoding"):
+                continue
+            if lk == "host" and authority:
+                continue    # replaced by the Location authority above
+            out.append("%s: %s" % (k, v))
+        body_bytes = (new_body or "").encode("utf-8")
+        if new_method in ("POST", "PUT", "PATCH") or body_bytes:
+            out.append("Content-Length: %d" % len(body_bytes))
+        out.append("Accept-Encoding: identity")
+        out.append("Connection: close")
+        req = ("\r\n".join(out) + "\r\n\r\n").encode("utf-8") + body_bytes
+        return req, new_method, new_host, new_port, new_tls
+    def _record(self, result, req_bytes=None, raw_text=None):
+        entry = {
+            "ts": time.time(),
+            "ok": result.get("ok"),
+            "status": result.get("status"),
+            "status_line": result.get("status_line"),
+            "error": result.get("error"),
+            "host": result.get("host"),
+            "port": result.get("port"),
+            "elapsed_ms": result.get("elapsed_ms"),
+            "hops": len(result.get("chain") or []),
+        }
+        if raw_text:
+            entry["request"] = raw_text[:4000]
+            first = raw_text.replace("\r\n", "\n").split("\n", 1)[0]
+            entry["request_line"] = first.strip()[:200]
+        elif req_bytes is not None:
+            first_line = req_bytes.split(b"\r\n", 1)[0]
+            entry["request_line"] = first_line.decode("utf-8", "replace")[:200]
+        with self.lock:
+            self.history.append(entry)
+            if len(self.history) > self.MAX_HISTORY:
+                self.history = self.history[-self.MAX_HISTORY:]
+
+    def get_history(self):
+        with self.lock:
+            return list(reversed(self.history))
+
+
 analysis = None
 whois_cache = WhoisCache()
 live_capture = LiveCapture()
 arp_sweep = ArpSweep()
 responder = Responder()
+http_repeater = HttpRepeater()
 
 
 @app.route("/")
@@ -7836,6 +8192,45 @@ def api_responder_stop():
 @app.route("/api/responder/status")
 def api_responder_status():
     return jsonify(responder.status())
+
+
+@app.route("/api/repeater/send", methods=["POST"])
+def api_repeater_send():
+    """Replay an HTTP request and return the response.
+
+    Body: {request: raw text (required), scheme: http|https, host, port,
+    host_header, follow: bool, max_redirects}. The request is the captured
+    (possibly edited) text from the http feed; host/port default to the
+    transaction's server. This actively transmits — only use on networks
+    you are authorized to test.
+    """
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    data = request.get_json(silent=True) or {}
+    raw = data.get("request")
+    if not raw or not str(raw).strip():
+        return jsonify({"error": "request text required"}), 400
+    follow = data.get("follow", True)
+    try:
+        max_redirects = max(0, min(10, int(data.get("max_redirects", 5))))
+    except (TypeError, ValueError):
+        max_redirects = 5
+    result = http_repeater.send(
+        raw,
+        scheme=data.get("scheme") or "http",
+        host=data.get("host"),
+        port=data.get("port"),
+        host_header=data.get("host_header"),
+        follow=bool(follow),
+        max_redirects=max_redirects,
+    )
+    return jsonify(result), (200 if result.get("ok") else 502)
+
+
+@app.route("/api/repeater/history")
+def api_repeater_history():
+    """Recent replays (newest first), bounded to the last 100 sends."""
+    return jsonify({"history": http_repeater.get_history()})
 
 
 @app.route("/api/live/start", methods=["POST"])
