@@ -453,6 +453,10 @@ vulnerability evidence with no access control.
 
 ## Design constraints (for contributors)
 
+- **Every commit updates the README.** If a commit changes behavior —
+  new feature, detector, endpoint, UI tab, flag, or fix — the same commit
+  updates `README.md` to match (feature list, API table, detection
+  sections, options). A change that isn't documented didn't happen.
 - Single-file backend, single-file frontend. Don't split into
   modules unless there's a strong reason.
 - In-memory analysis, one PCAP per process. Not multi-tenant.
