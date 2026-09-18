@@ -171,8 +171,15 @@ a prioritized list of pentester-relevant findings in one pass.
   pulls everything in tool-ready formats: hashcat-ready hash files
   (NetNTLMv2/v1, and Kerberos split per mode — `krb5tgs_rc4`/`aes128`/`aes256`,
   `krb5asrep_rc4`, `krb5pa_aes128`/`aes256`), `users.txt` for spraying,
-  `relay-targets.txt` for `ntlmrelayx -tf`, credentials/findings/host-inventory
-  CSVs, a Markdown engagement report, or all of it as a single zip.
+  `domain-map.txt`, `relay-targets.txt` for `ntlmrelayx -tf`,
+  credentials/findings/host-inventory CSVs, a Markdown engagement report,
+  or all of it as a single zip.
+- **Attack-path playbooks in the report** — `report.md` embeds the ranked,
+  evidence-counted playbooks from the attack-paths engine (the same ones
+  as the `▲ attack paths` tab), plus SMB relay targets and the
+  captured-username list. Playbooks reference both the external tool
+  chain (Responder/ntlmrelayx/CME) and Deadfall's built-in equivalents
+  (poisoner/relay/coercer, PTH post-auth actions).
 - **Multi-PCAP / directory ingest** — point Deadfall at several captures or a
   whole directory and they merge into one host graph. Save the parsed analysis
   with `--save-state` and reload it later with `--load-state` so a multi-day

