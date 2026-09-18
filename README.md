@@ -149,7 +149,9 @@ a prioritized list of pentester-relevant findings in one pass.
   SchRpcRun → SchRpcDelete. Leaves a transient task instead of a service.
 - **SAMR dump** — local account reconnaissance over `\pipe\samr`:
   SamrConnect5 → EnumerateDomains → LookupDomain → OpenDomain →
-  EnumerateUsersInDomain. Walks local users per domain for follow-on
+  EnumerateUsersInDomain (following the server's resume handle across
+  STATUS_MORE_ENTRIES pages, so large user bases dump completely).
+  Walks local users per domain for follow-on
   targeting (spray, kerberoast-ables, service accounts).
 - **Bait drop** — writes an `.scf` or `.url` file (IconFile pointing at your
   listener) to a writable share via SMB2 CREATE+WRITE. Windows Explorer
@@ -413,8 +415,10 @@ MySQL v10 handshake server-version extraction, HTTP Server header.
   **public→public** sensitive ports.
 - **Public-exposed sensitive listeners** accepting connections from
   multiple external peers.
-- **IRC commands on any TCP port** (NICK/JOIN/PRIVMSG/…) — severity
-  raised on non-standard ports.
+- **IRC commands on any TCP port** (NICK/JOIN/PRIVMSG on any port; generic
+  verbs like USER/PING only on IRC ports) — severity raised on non-standard
+  ports. FTP-family control ports are excluded to avoid FTP `USER` logins
+  false-positiving as IRC.
 
 ### Behavioral
 

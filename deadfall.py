@@ -5247,6 +5247,11 @@ class PcapAnalysis:
                 except ValueError:
                     pass
 
+    # Verbs shared with FTP/SMTP-style protocols — only trustworthy as IRC
+    # evidence on actual IRC ports. NICK/JOIN/PRIVMSG are IRC-specific.
+    _IRC_STRONG = ("NICK", "JOIN", "PRIVMSG")
+    _FTP_PORTS = (20, 21, 115, 990, 2121)
+
     def _d_irc_c2(self, src, dst, port, payload):
         if len(payload) < 6 or payload[0] > 0x7f:
             return
@@ -5254,7 +5259,15 @@ class PcapAnalysis:
             text = payload[:512].decode("utf-8", errors="replace")
         except Exception:
             return
-        if not re.search(r"(?m)^(NICK|JOIN|PRIVMSG|USER|PING|PONG)\s+\S", text):
+        m = re.search(r"(?m)^(NICK|JOIN|PRIVMSG|USER|PING|PONG)\s+\S", text)
+        if not m:
+            return
+        # FTP control channels speak USER (and clients PING-ish keepalives on
+        # other protocols); never flag FTP-family ports, and only accept the
+        # generic verbs when the port itself says IRC.
+        if port in self._FTP_PORTS:
+            return
+        if m.group(1) not in self._IRC_STRONG and port not in (6667, 6697):
             return
         sev = "medium" if port in (6667, 6697) else "high"
         self._add_finding(sev, "suspicious-traffic",
@@ -7860,15 +7873,24 @@ class SamrDump:
                     if d.resp_error(resp):
                         continue
                     dom_handle = resp[24 + 4:24 + 24 + 4]
-                    # SamrEnumerateUsersInDomain loop
+                    # SamrEnumerateUsersInDomain loop — follow the resume
+                    # handle the server returns until it hands back 0
+                    # (STATUS_MORE_ENTRIES paging; cap pages as a safety net).
                     resume = 0
-                    while True:
+                    seen_pages = 0
+                    while seen_pages < 100:
+                        seen_pages += 1
                         resp = d.call(13, _samr_enum_users(dom_handle, resume))
                         if d.resp_error(resp):
                             break
                         users += _samr_parse_names(resp)
-                        resume = 0  # verifier returns single page; real servers set resume ptr
-                        break
+                        stub = resp[24:] if resp else b""
+                        # stub tail: ... NumberOfEntries(4) ResumeHandle(4) Error(4)
+                        next_resume = (struct.unpack_from("<I", stub, len(stub) - 8)[0]
+                                       if len(stub) >= 8 else 0)
+                        if not next_resume or next_resume == resume:
+                            break
+                        resume = next_resume
                     d.call(1, dom_handle)  # SamrCloseHandle
                 self._log("dump", f"{target}: domains {domains}, {len(users)} users")
                 with self.lock:
