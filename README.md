@@ -121,6 +121,22 @@ a prioritized list of pentester-relevant findings in one pass.
   targets). Every send is recorded in a clickable history. This is an
   *active* feature: it transmits, so only replay to targets you are
   authorized to test.
+- **NTLM relay** — an `ntlmrelayx`-class transparent relay with a capture
+  tap: victims connect to Deadfall (after poisoning or coercion), every byte
+  is forwarded to the chosen target, and the NTLMSSP exchange is tapped in
+  flight — the victim's Type-3 + target's Type-2 pair is assembled into a
+  hashcat-ready NetNTLMv2 hash in the AD/hashes tab, and a relayed
+  authentication that the target *accepts* fires a **critical** finding and
+  webhook alert (`RELAYED: victim → target`). Targets default to the
+  capture's known no-signing SMB servers (`relay-targets.txt`). Round-robins
+  multiple targets; listens on SMB (and optionally HTTP) ports.
+- **Coercion** — PetitPotam (MS-EFSR `EfsRpcOpenFileRaw`) and PrinterBug
+  (MS-RPRN `RemoteFindFirstPrinterChangeNotification`) triggers, built on a
+  hand-rolled pure-stdlib SMB2 + NTLMv2 + DCERPC client (MD4 included —
+  OpenSSL 3 dropped it). Give it credentials for the target and a listener
+  IP, and the target machine authenticates back to your relay/responder —
+  machine-account NetNTLM ready to relay or crack. Every trigger is logged
+  and raises a finding.
 - **Engagement loot export** — one-click `📦 export loot` tab (and API) that
   pulls everything in tool-ready formats: hashcat-ready hash files
   (NetNTLMv2/v1, and Kerberos split per mode — `krb5tgs_rc4`/`aes128`/`aes256`,
@@ -415,6 +431,11 @@ vulnerability evidence with no access control.
 | `GET /api/http` | global feed of paired HTTP request/response transactions (`?q=`, `?host=`, `?limit=`) |
 | `POST /api/repeater/send` | body `{request, scheme?, host?, port?, host_header?, follow?}` — resend a (possibly edited) captured HTTP request and return the response |
 | `GET /api/repeater/history` | recent replays (newest first, last 100) |
+| `POST /api/coerce` | body `{target, method, listener, user, password, domain?}` — fire a PetitPotam/PrinterBug coercion trigger |
+| `GET /api/coerce/status` | coercion counters + recent events |
+| `POST /api/relay/start` | body `{targets: [host:port], ports?}` — start the NTLM relay (defaults to known no-signing targets) |
+| `POST /api/relay/stop` | stop the relay |
+| `GET /api/relay/status` | relay counters, targets, recent hash/RELAYED events |
 | `GET /api/export/counts` | per-artifact counts for the export tab |
 | `GET /api/export/<kind>` | download one loot artifact (`netntlmv2`, `krb5tgs`, `users`, `relay-targets`, `findings.csv`, `report.md`, …) |
 | `GET /api/export/all.zip` | download all non-empty loot artifacts as a zip |
@@ -484,7 +505,7 @@ vulnerability evidence with no access control.
 Deadfall is intended for analyzing traffic you are authorized to
 examine — pentesting engagements, CTFs, lab captures, your own
 network. Credential extractors look at plaintext bytes only; nothing
-is ever decrypted. Analysis is otherwise passive; three features
+is ever decrypted. Analysis is otherwise passive; five features
 actively transmit — the **ARP sweep**, the **Responder-style poisoner**,
-and the **HTTP repeater** — only use them against networks and targets
-you are authorized to test.
+the **HTTP repeater**, the **NTLM relay**, and **coercion** — only use
+them against networks and targets you are authorized to test.

