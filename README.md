@@ -137,6 +137,24 @@ a prioritized list of pentester-relevant findings in one pass.
   IP, and the target machine authenticates back to your relay/responder —
   machine-account NetNTLM ready to relay or crack. Every trigger is logged
   and raises a finding.
+- **Pass-the-hash** — every post-auth action accepts either a password or a
+  raw NT hash (`aad3b…` hex or `LM:NT` form). The NTLMv2 proof is built
+  directly from the hash, so captured hashes from the AD tab go straight
+  into command execution without cracking.
+- **SCMR exec (psexec-class)** — authenticated MS-SCMR over `\pipe\svcctl`:
+  OpenSCManager → CreateService (binary path = your command) → StartService
+  → DeleteService → close. The `psexec`/`smbexec` pattern in pure stdlib.
+- **atexec (MS-TSCH)** — scheduled-task execution over `\pipe\atsvc`:
+  RegisterTask (UTF-16 XML task running your command as LocalSystem) →
+  SchRpcRun → SchRpcDelete. Leaves a transient task instead of a service.
+- **SAMR dump** — local account reconnaissance over `\pipe\samr`:
+  SamrConnect5 → EnumerateDomains → LookupDomain → OpenDomain →
+  EnumerateUsersInDomain. Walks local users per domain for follow-on
+  targeting (spray, kerberoast-ables, service accounts).
+- **Bait drop** — writes an `.scf` or `.url` file (IconFile pointing at your
+  listener) to a writable share via SMB2 CREATE+WRITE. Windows Explorer
+  browsing the share triggers an SMB authentication back to your
+  responder/relay — hash capture without coercion primitives.
 - **Engagement loot export** — one-click `📦 export loot` tab (and API) that
   pulls everything in tool-ready formats: hashcat-ready hash files
   (NetNTLMv2/v1, and Kerberos split per mode — `krb5tgs_rc4`/`aes128`/`aes256`,
@@ -436,6 +454,11 @@ vulnerability evidence with no access control.
 | `POST /api/relay/start` | body `{targets: [host:port], ports?}` — start the NTLM relay (defaults to known no-signing targets) |
 | `POST /api/relay/stop` | stop the relay |
 | `GET /api/relay/status` | relay counters, targets, recent hash/RELAYED events |
+| `POST /api/exec/scmr` | body `{target, command, user, password \| nthash, domain?, port?, timeout?, service?}` — psexec-class command execution via MS-SCMR (pass-the-hash supported) |
+| `POST /api/exec/at` | body `{target, command, user, password \| nthash, domain?, port?, timeout?, task?}` — scheduled-task execution via MS-TSCH |
+| `POST /api/samr/dump` | body `{target, user, password \| nthash, domain?, port?, timeout?}` — enumerate local domains + users via MS-SAMR |
+| `POST /api/bait/drop` | body `{target, listener, user, password \| nthash, kind: scf \| url, fname?, share?, …}` — drop hash-capture bait on a writable share |
+| `GET /api/exec/status` | post-auth attack counters + recent events (scmr/atexec/samr/bait) |
 | `GET /api/export/counts` | per-artifact counts for the export tab |
 | `GET /api/export/<kind>` | download one loot artifact (`netntlmv2`, `krb5tgs`, `users`, `relay-targets`, `findings.csv`, `report.md`, …) |
 | `GET /api/export/all.zip` | download all non-empty loot artifacts as a zip |
@@ -505,7 +528,8 @@ vulnerability evidence with no access control.
 Deadfall is intended for analyzing traffic you are authorized to
 examine — pentesting engagements, CTFs, lab captures, your own
 network. Credential extractors look at plaintext bytes only; nothing
-is ever decrypted. Analysis is otherwise passive; five features
+is ever decrypted. Analysis is otherwise passive; nine features
 actively transmit — the **ARP sweep**, the **Responder-style poisoner**,
-the **HTTP repeater**, the **NTLM relay**, and **coercion** — only use
-them against networks and targets you are authorized to test.
+the **HTTP repeater**, the **NTLM relay**, **coercion**, the **post-auth
+executors (SCMR/atexec)**, **SAMR enumeration**, and the **bait drop** —
+only use them against networks and targets you are authorized to test.

