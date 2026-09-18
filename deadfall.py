@@ -3078,6 +3078,14 @@ class PcapAnalysis:
         # LLMNR / NBT-NS / mDNS query names — the resolution traffic Responder poisons.
         self.poisonable_queries = []
         self._poison_seen = set()
+        # AD domain identity map, fused from every naming leak on the wire:
+        # NTLM Type-2 target-info AV pairs, NTLM Type-3 domain/workstation
+        # fields, Kerberos realms (KDC endpoint = DC candidate), DC-locator
+        # DNS SRV queries, cleartext LDAP bind DNs, DHCP option 15/119.
+        # Aliases (NetBIOS name, FQDN, forest root) share one record object.
+        self.domain_map = {}
+        self._domain_evidence = []
+        self._domain_seen = set()
         self.smb1_flows = set()
         # SMB2 servers keyed by IP -> {signing_required: bool, port}. Servers with
         # signing not required are NTLM-relay targets (exported as relay-targets.txt).
@@ -3358,7 +3366,7 @@ class PcapAnalysis:
         "scan_pairs", "scan_dport_by_dst", "icmp_targets", "flow_ts", "_reasm",
         "_dhcp_by_mac", "_ntlm_challenges",
         "_finding_seen", "_cred_seen", "_sni_seen",
-        "_ntlm_hash_seen", "_krb_hash_seen", "_poison_seen",
+        "_ntlm_hash_seen", "_krb_hash_seen", "_poison_seen", "_domain_seen",
     )
 
     def __getstate__(self):
@@ -3385,7 +3393,7 @@ class PcapAnalysis:
         self._dhcp_by_mac = {}
         self._ntlm_challenges = {}
         for s in ("_finding_seen", "_cred_seen", "_sni_seen",
-                  "_ntlm_hash_seen", "_krb_hash_seen", "_poison_seen"):
+                  "_ntlm_hash_seen", "_krb_hash_seen", "_poison_seen", "_domain_seen"):
             setattr(self, s, set())
 
     def save_state(self, path):
@@ -4318,7 +4326,8 @@ class PcapAnalysis:
                 rr = rr.payload if hasattr(rr, "payload") else None
 
     def _d_dhcp(self, pkt, src):
-        """Pull DHCP option 12 (hostname) and option 60 (vendor class id)."""
+        """Pull DHCP option 12 (hostname), 60 (vendor class), 15 (domain name),
+        and 119 (domain search list)."""
         if BOOTP is None or DHCP is None or BOOTP not in pkt or DHCP not in pkt:
             return
         # client MAC from BOOTP chaddr — useful when src IP is 0.0.0.0 (DISCOVER)
@@ -4331,6 +4340,7 @@ class PcapAnalysis:
         hostname = None
         vendor_class = None
         is_client = False
+        self._domain_from_dhcp(pkt, src)
         for o in opts:
             if not isinstance(o, tuple) or not o:
                 continue
@@ -4628,6 +4638,7 @@ class PcapAnalysis:
                     key=("ntlm2", src, dst, challenge.hex()))
             except Exception:
                 pass
+            self._domain_from_ntlm2(blob, src, dst)
         elif mtype == 3 and len(blob) >= 64:
             def sec_buf(off):
                 ln, _mx, boff = struct.unpack_from("<HHI", blob, off)
@@ -4665,6 +4676,7 @@ class PcapAnalysis:
                                      f"NTLMv{2 if ntlmv2 else 1}-Response",
                                      username=f"{domain}\\{username}",
                                      extra=f"workstation={workstation} nt={nt_resp.hex()[:48]}…")
+                self._domain_from_ntlm3(domain, username, workstation, src, dst)
             except Exception:
                 pass
         self.ntlm_messages.append(info)
@@ -4701,6 +4713,238 @@ class PcapAnalysis:
         self._alert("hash", f"{label} captured (-m {mode})",
                     f"{domain}\\{username}", host=src, severity="critical")
 
+    # ----- AD domain identity fusion ---------------------------------------
+    #
+    # The wire leaks the AD domain identity in many places. Each leak is weak
+    # alone; fused, they converge on the real domain, its aliases (NetBIOS
+    # name / FQDN / forest root), its controllers, and joined hosts.
+    # MS-NLMP AV-pair ids: 1/2 = server's NetBIOS name / domain, 3/4 = the
+    # server's FQDN / the AD domain FQDN, 5 = forest root. (6 is Flags, not DC.)
+
+    _AV_FLAG = 0x00008000          # NEGOTIATE_TARGET_INFO — Type-2 carries TargetInfo
+    _AV_NAMES = {1: "nb_computer", 2: "nb_domain", 3: "dns_computer",
+                 4: "dns_domain", 5: "dns_tree", 9: "target_name"}
+    _NON_AD = {"", "workgroup", "local", "localhost", "nt authority",
+               "local service", "network service", "anonymous", "unknown",
+               "msa"}
+
+    def _domain_record_for(self, name):
+        """Get-or-create the fused record for a domain name. Aliases (NetBIOS
+        label vs FQDN vs forest root) share one record via label matching."""
+        if not name:
+            return None
+        name = str(name).strip().rstrip(".")
+        if not name or len(name) > 255:
+            return None
+        low = name.lower()
+        rec = self.domain_map.get(low)
+        if rec is not None:
+            return rec
+        label = low.split(".")[0]
+        for k, r in self.domain_map.items():
+            if k.split(".")[0] == label:
+                return r          # alias of an already-known domain
+        rec = {"names": set(), "fqdn": None, "netbios": None, "forest": None,
+               "dc_candidates": {}, "member_hosts": set(), "users": set(),
+               "machine_accounts": set(), "servers": set(), "sources": set()}
+        self.domain_map[low] = rec
+        return rec
+
+    def _record_domain_name(self, name, field, src, dst, via):
+        """Fold a domain-bearing string into the map (screens non-AD noise)."""
+        if not name:
+            return
+        name = str(name).strip().rstrip(".")
+        if not name or name.lower() in self._NON_AD:
+            return
+        rec = self._domain_record_for(name)
+        if rec is None:
+            return
+        if "." in name and not rec["fqdn"]:
+            rec["fqdn"] = name
+        if "." not in name and not rec["netbios"]:
+            rec["netbios"] = name
+        rec["names"].add(name)
+        rec["sources"].add(via)
+        self._domain_evidence.append({
+            "domain": name, "field": field, "via": via, "src": src, "dst": dst})
+
+    def _record_dc_candidate(self, rec, host, via):
+        """Mark a host as a domain-controller candidate for a domain record."""
+        if not rec or not host:
+            return
+        key = str(host).lower()
+        entry = rec["dc_candidates"].setdefault(
+            key, {"host": str(host), "sources": set()})
+        entry["sources"].add(via)
+
+    def _parse_av_pairs(self, av):
+        """Decode MS-NLMP AV_PAIRs → [(field, value)] until MsvAvEOL."""
+        out, i = [], 0
+        while i + 4 <= len(av):
+            try:
+                aid, alen = struct.unpack_from("<HH", av, i)
+            except Exception:
+                break
+            if aid == 0:
+                break
+            raw = av[i + 4:i + 4 + alen]
+            try:
+                val = raw.decode("utf-16-le") if alen else ""
+            except Exception:
+                val = ""
+            out.append((self._AV_NAMES.get(aid, f"av{aid}"), val))
+            i += 4 + alen
+        return out
+
+    def _domain_from_ntlm2(self, blob, src, dst):
+        """NTLMSSP Type-2: TargetName field + TargetInfo AV pairs."""
+        if len(blob) < 44:
+            return
+        try:
+            ln, _mx, boff = struct.unpack_from("<HHI", blob, 12)
+            target = blob[boff:boff + ln].decode("utf-16-le", errors="replace")
+            if target and target.lower() not in self._NON_AD:
+                self._record_domain_name(target, "ntlm2-target-name", src, dst, "NTLM")
+            flags = struct.unpack_from("<I", blob, 20)[0]
+            if not (flags & self._AV_FLAG) or len(blob) < 48:
+                return
+            ln2, _mx2, boff2 = struct.unpack_from("<HHI", blob, 40)
+            av = blob[boff2:boff2 + ln2]
+        except Exception:
+            return
+        vals = {}
+        for pair, val in self._parse_av_pairs(av):
+            if val and pair not in vals:
+                vals[pair] = val
+        if vals.get("nb_domain"):
+            self._record_domain_name(vals["nb_domain"], "MsvAvNbDomainName",
+                                     src, dst, "NTLM")
+        if vals.get("dns_domain"):
+            self._record_domain_name(vals["dns_domain"], "MsvAvDnsDomainName",
+                                     src, dst, "NTLM")
+        if vals.get("dns_tree"):
+            self._record_domain_name(vals["dns_tree"], "MsvAvDnsTreeName",
+                                     src, dst, "NTLM")
+            tree_rec = self._domain_record_for(vals["dns_tree"])
+            if tree_rec is not None:
+                tree_rec["forest"] = vals["dns_tree"]
+        dom = vals.get("dns_domain") or vals.get("nb_domain") or target or ""
+        if not dom or dom.lower() in self._NON_AD:
+            return
+        rec = self._domain_record_for(dom)
+        if rec is None:
+            return
+        if vals.get("dns_tree") and not rec.get("forest"):
+            # The tree name is this domain's forest root.
+            rec["forest"] = vals["dns_tree"]
+        # The server that issued this challenge is a domain-joined host; its
+        # names feed the member/servers inventory. Not necessarily a DC.
+        for field in ("nb_computer", "dns_computer"):
+            if vals.get(field):
+                rec["servers"].add(vals[field])
+                rec["member_hosts"].add(vals[field].split(".")[0])
+
+    def _domain_from_ntlm3(self, domain, username, workstation, src, dst):
+        """NTLMSSP Type-3 auth response: DOMAIN\\user from workstation."""
+        dom_ok = bool(domain) and domain.lower() not in self._NON_AD
+        if dom_ok:
+            self._record_domain_name(domain, "ntlm3-domain", src, dst, "NTLM")
+            rec = self._domain_record_for(domain)
+            if rec is None:
+                return
+            if username:
+                if username.endswith("$"):
+                    rec["machine_accounts"].add(username[:-1])
+                else:
+                    rec["users"].add(username)
+            if workstation:
+                rec["member_hosts"].add(workstation.split(".")[0])
+
+    def _domain_from_krb(self, src, dst, payload):
+        """Kerberos: realm → domain; client principal → user/machine; the KDC
+        endpoint of an AS/TGS exchange is a domain controller."""
+        starts = [s for s in (0, 4) if s < len(payload) and payload[s] in (0x6A, 0x6B, 0x6C, 0x6D)]
+        for start in starts:
+            app = _der_tlv(payload, start)
+            if app is None:
+                continue
+            tag, val, _ = app
+            body = _der_unwrap(val)
+            if body is None:
+                continue
+            kids = _der_children(body)
+            realm = user = None
+            if tag in (0x6A, 0x6C):          # AS-REQ / TGS-REQ: realm in req-body [3]
+                req_body = _der_unwrap(_der_find(kids, 0xA3) or b"")
+                if req_body is None:
+                    continue
+                bk = _der_children(req_body)
+                realm = _der_string(_der_find(bk, 0xA2) or b"")   # [2] realm
+                user = _der_principal(_der_find(bk, 0xA1) or b"")  # [1] cname
+                kdc = dst                     # request: client → KDC
+            else:                             # AS-REP / TGS-REP
+                realm = _der_string(_der_find(kids, 0xA2) or b"")   # [2] crealm
+                user = _der_principal(_der_find(kids, 0xA3) or b"")  # [3] cname
+                kdc = src                      # reply: KDC → client
+            if not realm or realm.lower() in self._NON_AD:
+                continue
+            self._record_domain_name(realm, "kerberos-realm", src, dst, "Kerberos")
+            rec = self._domain_record_for(realm)
+            if rec is None:
+                continue
+            if user:
+                if user.endswith("$"):
+                    rec["machine_accounts"].add(user[:-1])
+                else:
+                    rec["users"].add(user)
+            # The KDC side of the exchange is a domain controller.
+            self._record_dc_candidate(rec, kdc, "KDC (Kerberos)")
+
+    def _domain_from_dns(self, qname, src):
+        """DC-locator SRV queries: _ldap._tcp.dc._msdcs.<domain> etc."""
+        if not qname:
+            return
+        low = qname.lower().rstrip(".")
+        m = re.search(r"(?:^|\.)_msdcs\.(.+)$", low)
+        if m:
+            self._record_domain_name(m.group(1), "dc-locator-srv", src, None, "DNS")
+            return
+        m = re.match(r"^_(?:ldap|kerberos|kpasswd|gc|gcssl)\._tcp\.(.+)$", low)
+        if m:
+            rest = re.sub(r"^[^.]+\._sites\.", "", m.group(1))
+            self._record_domain_name(rest, "srv-lookup", src, None, "DNS")
+
+    def _domain_from_ldap_bind(self, src, dst, payload):
+        """Cleartext LDAP bind DN: dc=corp,dc=example,dc=com → FQDN."""
+        try:
+            text = payload[:512].decode("utf-8", errors="replace")
+        except Exception:
+            return
+        parts = re.findall(r"(?i)dc=([A-Za-z0-9_-]+)", text)
+        if len(parts) >= 2:
+            fq = ".".join(parts)
+            if 4 <= len(fq) <= 255 and ".." not in fq:
+                self._record_domain_name(fq, "ldap-bind-dn", src, dst, "LDAP")
+
+    def _domain_from_dhcp(self, pkt, src):
+        """DHCP option 15 (domain name) and 119 (search list)."""
+        if DHCP is None or DHCP not in pkt:
+            return
+        for o in pkt[DHCP].options or []:
+            if not isinstance(o, tuple) or not o:
+                continue
+            k, v = o[0], (o[1] if len(o) > 1 else None)
+            if not v:
+                continue
+            if isinstance(v, (bytes, bytearray)):
+                v = v.decode("utf-8", errors="replace")
+            if k == "domain":
+                self._record_domain_name(v, "dhcp-opt15", src, None, "DHCP")
+            elif k in ("search", "searchlist", "domain_search"):
+                for dom in str(v).split():
+                    self._record_domain_name(dom, "dhcp-opt119", src, None, "DHCP")
+
     def _d_kerberos(self, src, dst, port, payload):
         # ASN.1 tag [0] INTEGER for enctype: a0 03 02 01 XX. 0x01/0x03=DES, 0x17=RC4 — all roastable.
         weak_enctypes = {0x17: "RC4-HMAC", 0x01: "DES-CBC-CRC", 0x03: "DES-CBC-MD5"}
@@ -4725,6 +4969,7 @@ class PcapAnalysis:
                 hosts=[src, dst], port=port,
                 remediation="Audit userAccountControl for DONT_REQ_PREAUTH flag.",
                 key=("asrep", src, dst))
+        self._domain_from_krb(src, dst, payload)
         self._d_krb_roast(src, dst, port, payload)
 
     def _d_krb_roast(self, src, dst, port, payload):
@@ -5061,6 +5306,7 @@ class PcapAnalysis:
                 hosts=[src, dst], port=389,
                 remediation="Require LDAPS (636) or STARTTLS on LDAP; disable simple binds without TLS.",
                 key=("ldap-simple", src, dst))
+        self._domain_from_ldap_bind(src, dst, payload)
 
     def _d_suspicious_port(self, src, dst, dport):
         if dport in SUSPICIOUS_CLIENT_PORTS:
@@ -5905,6 +6151,7 @@ class PcapAnalysis:
                         })
                         src_host["dns_names"].add(qname)
                         self._d_dns_extras(qname, src)
+                        self._domain_from_dns(qname, src)
                         self._d_dns_query_vuln(qname, qtype, src)
                     except Exception:
                         pass
@@ -5962,7 +6209,7 @@ class PcapAnalysis:
     EXPORT_KINDS = (
         ("netntlmv2", "netntlmv1")
         + tuple(stem for _m, stem, _l in KRB_MODES)
-        + ("users", "relay-targets", "credentials.csv", "findings.csv", "hosts.csv", "report.md")
+        + ("users", "relay-targets", "domain-map", "credentials.csv", "findings.csv", "hosts.csv", "report.md")
     )
 
     def _build_relay_targets(self):
@@ -6000,6 +6247,54 @@ class PcapAnalysis:
                 users.add(u.split("\\", 1)[-1])  # strip DOMAIN\ prefix
         users = sorted(u for u in users if u and u not in ("*", ""))
         return "\n".join(users) + ("\n" if users else "")
+
+    def _build_domain_map(self):
+        """Human-readable AD domain map: identity, aliases, DCs, members,
+        users, and every evidence item that fed the inference."""
+        lines = []
+        if not self.domain_map:
+            return ""
+        lines.append("AD domain map (passively inferred from captured traffic)")
+        lines.append("=" * 60)
+        for key, rec in sorted(self.domain_map.items()):
+            fq = rec.get("fqdn") or key
+            lines.append("")
+            lines.append(f"Domain: {fq}")
+            if rec.get("netbios"):
+                lines.append(f"  NetBIOS name:  {rec['netbios']}")
+            if rec.get("forest"):
+                lines.append(f"  Forest root:   {rec['forest']}")
+            if rec.get("names") and len(rec["names"]) > 1:
+                lines.append(f"  Aliases:       {', '.join(sorted(rec['names']))}")
+            if rec.get("dc_candidates"):
+                lines.append(f"  DC candidates:")
+                for e in rec["dc_candidates"].values():
+                    srcs = ", ".join(sorted(e["sources"]))
+                    lines.append(f"    - {e['host']}  (via {srcs})")
+            if rec.get("member_hosts"):
+                hosts = ", ".join(sorted(rec["member_hosts"]))
+                lines.append(f"  Joined hosts:  {hosts}")
+            if rec.get("servers"):
+                lines.append(f"  Servers:       {', '.join(sorted(rec['servers']))}")
+            if rec.get("users"):
+                lines.append(f"  Users seen:    {', '.join(sorted(rec['users']))}")
+            if rec.get("machine_accounts"):
+                lines.append(f"  Machine accts: {', '.join(sorted(rec['machine_accounts']))}")
+            lines.append(f"  Sources: {', '.join(sorted(rec.get('sources', set())))}")
+        ev = getattr(self, "_domain_evidence", [])
+        if ev:
+            lines.append("")
+            lines.append("Evidence trail")
+            lines.append("-" * 60)
+            for e in ev:
+                where = ""
+                if e.get("src"):
+                    where = f"  [{e['src']}"
+                    if e.get("dst"):
+                        where += f" → {e['dst']}"
+                    where += "]"
+                lines.append(f"- {e['domain']}  ({e['field']} via {e['via']}){where}")
+        return "\n".join(lines) + "\n"
 
     def _build_credentials_csv(self):
         buf = io.StringIO()
@@ -6068,6 +6363,27 @@ class PcapAnalysis:
                    + ", ".join(f"{len(by_sev[s])} {s}" for s in sev_order if by_sev.get(s)))
         out.append(f"- Captured credentials: {len(self.credentials)}")
         out.append(f"- NetNTLM hashes: {n_v2} v2, {n_v1} v1 · Kerberos roast: {n_krb}\n")
+        if getattr(self, "domain_map", None):
+            out.append("## AD domain map\n")
+            out.append("Domain identity passively inferred from captured traffic "
+                       "(NTLM type-2/type-3, Kerberos realms, DC-locator DNS, "
+                       "LDAP bind DNs, DHCP):\n")
+            for key, rec in sorted(self.domain_map.items()):
+                fq = rec.get("fqdn") or key
+                bits = []
+                if rec.get("netbios"):
+                    bits.append(f"NetBIOS {rec['netbios']}")
+                if rec.get("forest"):
+                    bits.append(f"forest {rec['forest']}")
+                if rec.get("dc_candidates"):
+                    bits.append("DCs: " + ", ".join(sorted(
+                        e["host"] for e in rec["dc_candidates"].values())))
+                if rec.get("member_hosts"):
+                    bits.append(f"{len(rec['member_hosts'])} joined hosts")
+                if rec.get("users"):
+                    bits.append(f"{len(rec['users'])} users")
+                out.append(f"- **{fq}** — " + "; ".join(bits) if bits else f"- **{fq}**")
+            out.append("")
         out.append("## Findings\n")
         for s in sev_order:
             items = by_sev.get(s) or []
@@ -6103,6 +6419,7 @@ class PcapAnalysis:
             "netntlmv1":        (lambda: self._build_netntlm(5500),  "netntlmv1.txt", "text/plain"),
             "users":            (self._build_users,            "users.txt",        "text/plain"),
             "relay-targets":    (self._build_relay_targets,    "relay-targets.txt","text/plain"),
+            "domain-map":       (self._build_domain_map,       "domain-map.txt",   "text/plain"),
             "credentials.csv":  (self._build_credentials_csv,  "credentials.csv",  "text/csv"),
             "findings.csv":     (self._build_findings_csv,     "findings.csv",     "text/csv"),
             "hosts.csv":        (self._build_hosts_csv,        "hosts.csv",         "text/csv"),
@@ -6114,7 +6431,7 @@ class PcapAnalysis:
 
     # Artifacts that are list-shaped and pointless to write when empty.
     _EXPORT_SKIP_IF_EMPTY = frozenset(
-        {"netntlmv2", "netntlmv1", "users", "relay-targets"}
+        {"netntlmv2", "netntlmv1", "users", "relay-targets", "domain-map"}
         | {stem for _m, stem, _l in KRB_MODES})
 
     def export_artifact(self, kind):
@@ -6154,6 +6471,7 @@ class PcapAnalysis:
                                  + [(c.get("username") or "").split("\\", 1)[-1] for c in self.credentials])))),
                 "relay_targets": sum(1 for s in getattr(self, "smb_servers", {}).values()
                                      if not s.get("signing_required")),
+                "domain_map": len(getattr(self, "domain_map", {})),
                 "credentials": len(self.credentials),
                 "findings":  len(self.findings),
                 "hosts":     sum(1 for ip, h in self.hosts.items()
@@ -9382,6 +9700,41 @@ def api_auth():
             "ntlmv2": len(ntlmv2), "ntlmv1": len(ntlmv1),
             "krb": len(krb), "users": len(users), "poisonable": len(poison),
         },
+    })
+
+
+@app.route("/api/domains")
+def api_domains():
+    """Fused AD domain identity map: domain names, aliases, DC candidates,
+    joined hosts, users, and the evidence trail behind each inference."""
+    if not analysis:
+        return jsonify({"error": "no pcap loaded"}), 404
+    with analysis.lock:
+        domains = []
+        for key, rec in analysis.domain_map.items():
+            domains.append({
+                "domain": key,
+                "fqdn": rec.get("fqdn"),
+                "netbios": rec.get("netbios"),
+                "forest": rec.get("forest"),
+                "names": sorted(rec.get("names", set())),
+                "dc_candidates": [
+                    {"host": e["host"], "sources": sorted(e["sources"])}
+                    for e in rec.get("dc_candidates", {}).values()],
+                "member_hosts": sorted(rec.get("member_hosts", set())),
+                "servers": sorted(rec.get("servers", set())),
+                "users": sorted(rec.get("users", set())),
+                "machine_accounts": sorted(rec.get("machine_accounts", set())),
+                "sources": sorted(rec.get("sources", set())),
+            })
+        domains.sort(key=lambda d: (-len(d["dc_candidates"]), -len(d["users"]),
+                                    -len(d["member_hosts"]), d["domain"]))
+        evidence = list(analysis._domain_evidence)
+    return jsonify({
+        "domains": domains,
+        "evidence": evidence,
+        "counts": {"domains": len(domains),
+                   "evidence": len(evidence)},
     })
 
 

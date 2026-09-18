@@ -157,6 +157,16 @@ a prioritized list of pentester-relevant findings in one pass.
   listener) to a writable share via SMB2 CREATE+WRITE. Windows Explorer
   browsing the share triggers an SMB authentication back to your
   responder/relay — hash capture without coercion primitives.
+- **Passive AD domain mapping** — the domain identity is fused from every
+  naming leak already on the wire: NTLM type-2 TargetName + TargetInfo AV
+  pairs (NetBIOS name, FQDN, forest root), NTLM type-3 `DOMAIN\user` +
+  workstation, Kerberos realms (with the KDC endpoint marked as a DC
+  candidate and the client principal as user/machine), DC-locator SRV
+  queries (`_ldap._tcp.dc._msdcs.<domain>`), cleartext LDAP bind DNs, and
+  DHCP options 15/119. Aliases (NetBIOS label / FQDN / forest) collapse
+  into one record with DC candidates, joined hosts, users, machine
+  accounts, and a per-inference evidence trail. Surfaced as the `🗺 domain
+  map` tab, `GET /api/domains`, and the `domain-map.txt` loot artifact.
 - **Engagement loot export** — one-click `📦 export loot` tab (and API) that
   pulls everything in tool-ready formats: hashcat-ready hash files
   (NetNTLMv2/v1, and Kerberos split per mode — `krb5tgs_rc4`/`aes128`/`aes256`,
@@ -448,6 +458,7 @@ vulnerability evidence with no access control.
 | `GET /api/plaintext` | all plaintext flows + captured payload samples |
 | `GET /api/credentials` | all extracted credential artifacts |
 | `GET /api/auth` | assembled NetNTLM + Kerberos roast hashes, usernames, and poisonable LLMNR/NBT-NS/mDNS queries |
+| `GET /api/domains` | passive AD domain map: fused domain records (NetBIOS/FQDN/forest aliases, DC candidates, joined hosts, users) + evidence trail |
 | `GET /api/inventory` | local device inventory with per-device discovery sources (active vs silent); `?include_public=1` to add remote IPs |
 | `GET /api/capture-position` | inferred capture vantage (endpoint / SPAN / un-mirrored / gateway) + evidence |
 | `GET /api/http` | global feed of paired HTTP request/response transactions (`?q=`, `?host=`, `?limit=`) |
@@ -464,7 +475,7 @@ vulnerability evidence with no access control.
 | `POST /api/bait/drop` | body `{target, listener, user, password \| nthash, kind: scf \| url, fname?, share?, …}` — drop hash-capture bait on a writable share |
 | `GET /api/exec/status` | post-auth attack counters + recent events (scmr/atexec/samr/bait) |
 | `GET /api/export/counts` | per-artifact counts for the export tab |
-| `GET /api/export/<kind>` | download one loot artifact (`netntlmv2`, `krb5tgs`, `users`, `relay-targets`, `findings.csv`, `report.md`, …) |
+| `GET /api/export/<kind>` | download one loot artifact (`netntlmv2`, `krb5tgs`, `users`, `relay-targets`, `domain-map`, `findings.csv`, `report.md`, …) |
 | `GET /api/export/all.zip` | download all non-empty loot artifacts as a zip |
 | `GET /api/findings` | all findings, filterable by `?severity=`, `?category=`, `?host=` |
 | `GET /api/attack-paths` | ranked attack-path playbooks derived from current findings |

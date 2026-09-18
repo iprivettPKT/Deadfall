@@ -1387,6 +1387,9 @@
       <button class="btn" id="btn-auth-loot" style="width:100%; text-align:left; margin-bottom:4px;">
         🔓 AD / hashes
       </button>
+      <button class="btn" id="btn-domain-map" style="width:100%; text-align:left; margin-bottom:4px;">
+        🗺 domain map
+      </button>
       <button class="btn" id="btn-export" style="width:100%; text-align:left; margin-bottom:4px;">
         📦 export loot
       </button>
@@ -3408,6 +3411,86 @@ function srcChip(s) {
   return `<span class="tag" style="background:${SRC_COLOR[s] || 'var(--bg-3)'};color:var(--bg);border:0;">${escapeHtml(s)}</span>`;
 }
 
+async function showDomainMap() {
+  const panel = document.getElementById('detail');
+  panel.className = 'detail';
+  panel.innerHTML = '<div style="color:var(--text-faint); font-size:11px;">building domain map…</div>';
+  let data;
+  try {
+    data = await fetch('/api/domains').then(r => r.json());
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--danger);">domain map load failed: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  const domains = data.domains || [];
+  const evidence = data.evidence || [];
+  if (!domains.length) {
+    panel.innerHTML = `
+      <div class="ip-header"><div class="ip" style="color:var(--accent);">🗺 domain map</div></div>
+      <div style="color:var(--text-faint); padding:14px 0;">
+        no AD domain identity recovered from this capture. Domain leaks light up here from:
+        NTLM type-2 target-info / type-3 DOMAIN\\user, Kerberos realms (KDC = DC candidate),
+        DC-locator SRV queries (_ldap._tcp.dc._msdcs.&lt;domain&gt;), cleartext LDAP bind DNs,
+        and DHCP options 15/119.
+      </div>`;
+    return;
+  }
+  const viaColor = { NTLM: 'var(--danger)', Kerberos: 'var(--amber)', DNS: '#5e9fc0', LDAP: '#5a8f6a', DHCP: '#3e8f6a' };
+  const viaChip = v => `<span class="tag" style="background:${viaColor[v] || 'var(--bg-3)'};color:var(--bg);border:0;">${escapeHtml(v)}</span>`;
+  const nameList = (label, names, color) => names && names.length ? `
+    <div style="margin-top:5px;">
+      <span style="color:var(--text-faint); font-size:10px;">${label}</span>
+      ${names.map(n => `<span style="color:${color}; font-size:11px; margin-right:8px;">${escapeHtml(n)}</span>`).join('')}
+    </div>` : '';
+  const card = d => `
+    <div style="border:1px solid var(--border); border-left:3px solid var(--accent); padding:10px 12px; margin-bottom:10px;">
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <span style="color:var(--text); font-weight:700; font-size:13px;">${escapeHtml(d.fqdn || d.domain)}</span>
+        ${d.netbios ? `<span style="color:var(--text-dim); font-size:11px;">(NetBIOS: ${escapeHtml(d.netbios)})</span>` : ''}
+        ${d.forest ? `<span style="color:var(--amber); font-size:10px; border:1px solid var(--amber); padding:0 4px; border-radius:2px;">forest: ${escapeHtml(d.forest)}</span>` : ''}
+        <span style="margin-left:auto;">${d.sources.map(viaChip).join('')}</span>
+      </div>
+      ${d.dc_candidates && d.dc_candidates.length ? `
+        <div style="margin-top:6px;">
+          <span style="color:var(--danger); font-size:10px; font-weight:600;">DC candidates</span>
+          ${d.dc_candidates.map(dc => `
+            <div style="margin-top:2px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+              ${/^\d+\.\d+\.\d+\.\d+$/.test(dc.host)
+                ? `<a class="ac-host-link" data-ip="${dc.host}" style="color:var(--amber); cursor:pointer; font-weight:600;">${dc.host}</a>`
+                : `<span style="color:var(--text-dim); font-weight:600;">${escapeHtml(dc.host)}</span>`}
+              <span style="color:var(--text-faint); font-size:10px;">via ${dc.sources.map(escapeHtml).join(', ')}</span>
+            </div>`).join('')}
+        </div>` : ''}
+      ${nameList('joined hosts', d.member_hosts, 'var(--text-dim)')}
+      ${nameList('users', d.users, 'var(--text)')}
+      ${nameList('machines', d.machine_accounts, 'var(--text-dim)')}
+    </div>`;
+  const evRow = e => {
+    const where = e.src ? ` <span style="color:var(--text-faint);">[${e.src}${e.dst ? ' → ' + e.dst : ''}]</span>` : '';
+    return `<div style="padding:3px 0; font-size:10px; color:var(--text-dim);">
+      ${viaChip(e.via)} <span style="color:var(--text);">${escapeHtml(e.domain)}</span>
+      <span style="color:var(--text-faint);">${escapeHtml(e.field)}</span>${where}
+    </div>`;
+  };
+  panel.innerHTML = `
+    <div class="ip-header"><div class="ip" style="color:var(--accent);">🗺 domain map</div></div>
+    <div style="color:var(--text-dim); font-size:11px; margin-bottom:10px;">
+      ${domains.length} domain${domains.length > 1 ? 's' : ''} passively inferred from captured traffic ·
+      ${evidence.length} evidence items · export as <code>domain-map.txt</code> in 📦 export loot
+    </div>
+    ${domains.map(card).join('')}
+    ${evidence.length ? `
+      <div style="margin-top:12px;">
+        <div style="color:var(--text-faint); font-size:10px; margin-bottom:4px;">evidence trail</div>
+        ${evidence.map(evRow).join('')}
+      </div>` : ''}
+  `;
+  panel.querySelectorAll('.ac-host-link').forEach(a => a.addEventListener('click', () => {
+    const node = graph.nodes.find(n => n.id === a.dataset.ip);
+    if (node) selectNode(node);
+  }));
+}
+
 async function showInventory() {
   const panel = document.getElementById('detail');
   panel.className = 'detail';
@@ -3507,6 +3590,7 @@ async function showExport() {
     ['krb5pa_aes256',   'Pre-auth AES256',      c.krb5pa_aes256,  'hashcat -m 19900'],
     ['users',           'usernames',            c.users,          'spray / enum list'],
     ['relay-targets',   'SMB relay targets',    c.relay_targets,  'ntlmrelayx -tf'],
+    ['domain-map',      'AD domain map',        c.domain_map,     'domains / DCs / users'],
     ['credentials.csv', 'credentials',          c.credentials,    'CSV'],
     ['findings.csv',    'findings',             c.findings,       'CSV'],
     ['hosts.csv',       'host inventory',       c.hosts,          'CSV'],
@@ -3681,6 +3765,7 @@ document.getElementById('btn-attack-paths').addEventListener('click', () => { _v
 document.getElementById('btn-http-feed').addEventListener('click', () => { _viewMode = 'report'; showHttpFeed(); });
 document.getElementById('btn-repeater').addEventListener('click', () => { _viewMode = 'report'; showRepeater(); });
 document.getElementById('btn-auth-loot').addEventListener('click', () => { _viewMode = 'report'; showAuthLoot(); });
+document.getElementById('btn-domain-map').addEventListener('click', () => { _viewMode = 'report'; showDomainMap(); });
 document.getElementById('btn-export').addEventListener('click', () => { _viewMode = 'report'; showExport(); });
 document.getElementById('btn-inventory').addEventListener('click', () => { _viewMode = 'report'; showInventory(); });
 // LAN-only is a toggle: first press hides public/multicast; second press restores
