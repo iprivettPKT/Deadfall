@@ -3219,6 +3219,25 @@ class PcapAnalysis:
                      "MKCOL ", "MOVE ", "COPY ", "LOCK ", "UNLOCK ", "SUBSCRIBE ",
                      "UNSUBSCRIBE ", "NOTIFY ", "M-SEARCH ")
 
+    # Disabling WinHttpAutoProxySvc outright is unsupported and breaks VPN/ZTNA agents
+    # that fetch an explicit PAC through WinHTTP — turn off *discovery* instead.
+    WPAD_REMEDIATION = (
+        "Disable WPAD auto-discovery: set HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
+        "Internet Settings\\WinHttp\\DisableWpad=1 (Win10 1809+/Server 2019+) and turn off "
+        "'Automatically detect settings' via GPO. Leave WinHttpAutoProxySvc at its default "
+        "(Manual) — disabling it breaks VPN/ZTNA agents and isn't required. Back this up by "
+        "keeping 'wpad' on the DNS Global Query Block List, not serving DHCP option 252, and "
+        "disabling LLMNR/NBT-NS.")
+
+    # Ports where HTTP proxy auth (Proxy-Authorization) commonly travels.
+    HTTP_NTLM_PORTS = (80, 8080, 8000, 8888, 3128)
+
+    @staticmethod
+    def _is_wpad_name(name):
+        """'wpad', 'wpad.corp.local', 'wpad.local' — the names WPAD discovery resolves."""
+        low = (name or "").strip().rstrip(".").lower()
+        return low == "wpad" or low.startswith("wpad.")
+
     def _d_http_transaction(self, ts, src, dst, sport, dport, http_text):
         """Record an HTTP request/response pair into the global feed.
 
@@ -4352,6 +4371,9 @@ class PcapAnalysis:
         hostname = None
         vendor_class = None
         is_client = False
+        msg_type = None
+        param_req = []
+        wpad_url = None
         self._domain_from_dhcp(pkt, src)
         for o in opts:
             if not isinstance(o, tuple) or not o:
@@ -4364,8 +4386,16 @@ class PcapAnalysis:
             elif k == "vendor_class_id" and v:
                 try: vendor_class = v.decode("utf-8", errors="replace") if isinstance(v, (bytes, bytearray)) else str(v)
                 except Exception: vendor_class = None
-            elif k == "message-type" and v in (1, 3, 8):
-                is_client = True  # DISCOVER/REQUEST/INFORM come from the client
+            elif k == "message-type":
+                msg_type = v
+                if v in (1, 3, 8):
+                    is_client = True  # DISCOVER/REQUEST/INFORM come from the client
+            elif k == "param_req_list" and v:
+                param_req = list(v) if isinstance(v, (list, tuple)) else [v]
+            elif k == 252 and v:
+                try: wpad_url = v.decode("utf-8", errors="replace").rstrip("\x00") if isinstance(v, (bytes, bytearray)) else str(v)
+                except Exception: wpad_url = None
+        self._d_dhcp_wpad(pkt, src, msg_type, param_req, wpad_url, client_mac)
         # Attribute to source IP if routable; else to the client MAC's host record (best-effort).
         # The hostname/vendor-class options belong to the *client*, so only fold them into
         # src for client-originated messages (DISCOVER/REQUEST/INFORM) — never the server.
@@ -4400,6 +4430,37 @@ class PcapAnalysis:
                     lease["dhcp_hostname"] = hostname
                 if vendor_class and not lease.get("dhcp_vendor_class"):
                     lease["dhcp_vendor_class"] = vendor_class
+
+    def _d_dhcp_wpad(self, pkt, src, msg_type, param_req, wpad_url, client_mac):
+        """DHCP option 252 (WPAD URL). Windows lists 252 in every DISCOVER/REQUEST, so only a
+        DHCPINFORM asking for it is evidence of WinHTTP auto-discovery actually running."""
+        if msg_type == 8 and 252 in param_req:
+            host = src if (src and src != "0.0.0.0") else (client_mac or src)
+            self._add_finding("high", "spoofable-resolution",
+                "WPAD discovery via DHCP (INFORM for option 252)",
+                f"{host} sent a DHCPINFORM requesting option 252 — WinHTTP proxy auto-discovery is "
+                f"enabled. A rogue DHCP responder on the segment can hand back an attacker wpad.dat URL; "
+                f"if DHCP returns nothing, the client falls back to DNS/LLMNR/NBT-NS WPAD lookups.",
+                hosts=[src] if src and src != "0.0.0.0" else [], port=67,
+                evidence="DHCPINFORM param_req_list includes 252",
+                remediation=self.WPAD_REMEDIATION,
+                key=("wpad-dhcp-inform", host))
+        if wpad_url and msg_type in (2, 5):  # OFFER / ACK carrying a WPAD URL
+            try:
+                client = pkt[BOOTP].ciaddr if pkt[BOOTP].ciaddr != "0.0.0.0" else pkt[BOOTP].yiaddr
+            except Exception:
+                client = None
+            hosts = [src] + ([client] if client and client != "0.0.0.0" else [])
+            self._add_finding("medium", "spoofable-resolution",
+                "DHCP server supplies WPAD URL (option 252)",
+                f"DHCP server {src} hands clients the proxy auto-config URL '{wpad_url}'. Confirm this "
+                f"server and URL are legitimate — a rogue DHCP server setting option 252 redirects "
+                f"client web traffic and proxy NTLM auth to an attacker. If WPAD isn't intended, "
+                f"remove the option.",
+                hosts=hosts, port=67, evidence=wpad_url,
+                remediation="Remove option 252 if WPAD isn't required (configure proxies explicitly); "
+                            "enable DHCP snooping on access switches to block rogue DHCP servers.",
+                key=("wpad-dhcp-offer", src, wpad_url))
 
     def _record_poisonable(self, src, proto, name):
         """Track a name-resolution query an attacker could answer (Responder targets)."""
@@ -4436,7 +4497,8 @@ class PcapAnalysis:
 
     def _d_name_resolution(self, src, dst, dport, payload):
         if dport == 5355:
-            self._record_poisonable(src, "LLMNR", self._dns_first_qname(payload))
+            qname = self._dns_first_qname(payload)
+            self._record_poisonable(src, "LLMNR", qname)
             self._add_finding("high", "spoofable-resolution",
                 "LLMNR queries observed",
                 f"{src} performs LLMNR name resolution. Responder/Inveigh can trivially answer these "
@@ -4444,6 +4506,15 @@ class PcapAnalysis:
                 hosts=[src], port=5355,
                 remediation="Disable LLMNR via GPO (Computer Config → Admin Templates → Network → DNS Client → Turn off multicast name resolution).",
                 key=("llmnr", src))
+            if self._is_wpad_name(qname):
+                self._add_finding("critical", "spoofable-resolution",
+                    "WPAD lookup via LLMNR",
+                    f"{src} multicast an LLMNR query for '{qname}' — proxy auto-discovery is enabled and "
+                    f"fell back to LLMNR. Responder -w answers it, serves a rogue wpad.dat, and the host "
+                    f"authenticates to the attacker proxy with NTLM.",
+                    hosts=[src], port=5355, evidence=qname,
+                    remediation=self.WPAD_REMEDIATION,
+                    key=("wpad-llmnr", src))
         elif dport == 137:
             qname = None
             if payload and len(payload) >= 14:
@@ -4469,7 +4540,7 @@ class PcapAnalysis:
                     f"{src} is broadcasting for WPAD. Classic NTLM-relay foothold: Responder -r "
                     f"→ ntlmrelayx → SMB or LDAP relay.",
                     hosts=[src], port=137, evidence=qname,
-                    remediation="Create an authoritative internal WPAD DNS entry pointing to a dead IP or disable WinHTTP auto-proxy.",
+                    remediation=self.WPAD_REMEDIATION,
                     key=("wpad-nbns", src))
             # NBT-NS name registration / refresh queries reveal the host's own NetBIOS name.
             # Filter out wildcard / empty registrations ("*"/blank) and the broadcast WORKGROUP name.
@@ -4511,18 +4582,19 @@ class PcapAnalysis:
                 remediation="Enable RA Guard on access switches; lock down IPv6 RA to authorized routers.",
                 key=("ra", src))
 
-    def _d_dns_extras(self, qname, src):
+    def _d_dns_extras(self, qname, src, via="DNS"):
         if not qname:
             return
         low = qname.lower().rstrip(".")
-        if low == "wpad" or low.startswith("wpad.") or ".wpad." in low:
+        if self._is_wpad_name(low) or ".wpad." in low:
             self._add_finding("critical", "spoofable-resolution",
-                "WPAD DNS query",
-                f"{src} queried DNS for '{qname}'. If WPAD isn't authoritatively blocked, "
-                f"Responder/Inveigh can claim it and relay NTLM (ntlmrelayx).",
+                f"WPAD {via} query",
+                f"{src} queried {via} for '{qname}' — proxy auto-discovery is enabled. If WPAD isn't "
+                f"authoritatively blocked (or DNS is hijacked via mitm6), an attacker can claim it, "
+                f"serve a rogue wpad.dat, and relay the proxy NTLM auth (ntlmrelayx).",
                 hosts=[src], evidence=qname,
-                remediation="Create an internal WPAD record that returns NXDOMAIN or a dead IP.",
-                key=("wpad-dns", src))
+                remediation=self.WPAD_REMEDIATION,
+                key=("wpad-" + via.lower(), src))
         if low.startswith("isatap.") or low == "isatap":
             self._add_finding("medium", "ipv6-takeover",
                 "ISATAP lookup",
@@ -4611,17 +4683,66 @@ class PcapAnalysis:
         Authorization/Proxy-Authorization carry Type 1/3 (client→server);
         WWW-Authenticate/Proxy-Authenticate carry Type 2 (server→client)."""
         for m in re.finditer(
-                r'(?im)^(?:Authorization|WWW-Authenticate|Proxy-Authorization|Proxy-Authenticate):'
+                r'(?im)^(Authorization|WWW-Authenticate|Proxy-Authorization|Proxy-Authenticate):'
                 r'\s*(?:NTLM|Negotiate)\s+([A-Za-z0-9+/=]{8,})\s*$', http_text):
             try:
-                blob = base64.b64decode(m.group(1), validate=False)
+                blob = base64.b64decode(m.group(2), validate=False)
             except Exception:
                 continue
             i = blob.find(b"NTLMSSP\x00")
             if i < 0:
                 continue
+            is_proxy = m.group(1).lower().startswith("proxy-")
+            proto = "HTTP-Proxy" if is_proxy else "HTTP"
+            # Server-originated headers (Type 2) arrive with the proxy as src.
+            port = sport if m.group(1).lower() in ("www-authenticate", "proxy-authenticate") else dport
             connkey = self._conn_key(src, sport, dst, dport)
-            self._ingest_ntlm(connkey, src, dst, dport, "HTTP", blob[i:])
+            self._ingest_ntlm(connkey, src, dst, port, proto, blob[i:])
+            if is_proxy and m.group(1).lower() == "proxy-authorization":
+                self._add_finding("high", "ntlm-capture",
+                    "NTLM authentication to HTTP proxy",
+                    f"{src} authenticates to proxy {dst}:{dport} with NTLM. This is what WPAD poisoning "
+                    f"harvests: an attacker who wins WPAD becomes the proxy and receives these "
+                    f"credentials for cracking or relay.",
+                    hosts=[src, dst], port=dport,
+                    remediation="Prefer Kerberos for proxy auth; on Win11/Server 2022 restrict schemes via "
+                                "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\"
+                                "DisableProxyAuthenticationSchemes (test first — breaks NTLM-only proxies). "
+                                + self.WPAD_REMEDIATION,
+                    key=("proxy-ntlm", src, dst))
+
+    _PAC_REQ_RE = re.compile(
+        r'^(?:GET|HEAD) (\S*?/(?:wpad\.dat|[^/\s?]+\.pac))(?:\?\S*)? HTTP/1\.[01]\r?\n', re.I)
+    _HOST_HDR_RE = re.compile(r'(?im)^Host:\s*([^\s:]+)')
+
+    def _d_wpad_http(self, src, dst, dport, http_text):
+        """Proxy auto-config fetches. wpad.dat or a 'wpad' Host means discovery *succeeded*
+        and the client loaded a proxy config; any other .pac is an explicitly configured PAC."""
+        m = self._PAC_REQ_RE.match(http_text)
+        if not m:
+            return
+        path = m.group(1)
+        hm = self._HOST_HDR_RE.search(http_text)
+        host_hdr = hm.group(1) if hm else dst
+        if path.lower().endswith("/wpad.dat") or self._is_wpad_name(host_hdr):
+            self._add_finding("critical", "spoofable-resolution",
+                "WPAD proxy config fetched (wpad.dat)",
+                f"{src} downloaded http://{host_hdr}{path} from {dst}:{dport} — WPAD auto-discovery "
+                f"resolved and the client is loading a proxy configuration. Verify {dst} is the "
+                f"legitimate WPAD host; if not, the client's web traffic and proxy NTLM auth are "
+                f"being redirected to it.",
+                hosts=[src, dst], port=dport, evidence=f"Host: {host_hdr} GET {path}",
+                remediation=self.WPAD_REMEDIATION,
+                key=("wpad-fetch", src, dst))
+        else:
+            self._add_finding("info", "proxy-config",
+                "PAC file fetched (explicit proxy auto-config)",
+                f"{src} fetched proxy auto-config http://{host_hdr}{path} from {dst}:{dport}. An "
+                f"explicitly configured PAC URL (e.g. pushed by VPN/ZTNA agents) is not WPAD "
+                f"discovery, but over plain HTTP it can be tampered with in transit.",
+                hosts=[src, dst], port=dport, evidence=f"Host: {host_hdr} GET {path}",
+                remediation="Serve PAC files over HTTPS from a trusted host.",
+                key=("pac-fetch", src, dst, path.lower()))
 
     def _ingest_ntlm(self, connkey, src, dst, port, proto, blob):
         """Process one NTLMSSP message (blob starts at the 'NTLMSSP\\x00' signature).
@@ -6051,12 +6172,20 @@ class PcapAnalysis:
                             http_port = dport if dport in (80, 8080, 8000, 8888) else sport
                             self._d_http_payload(src, dst, http_port, http_text)
                             self._d_http_ntlm(src, dst, sport, dport, http_text)
+                            self._d_wpad_http(src, dst, dport, http_text)
                             self._d_binary_secrets(src, dst, http_port, payload_bytes[:8192])
                             # Responses originate from the server; key hygiene checks off the server side.
                             if http_text.startswith("HTTP/"):
                                 self._d_http_response(src, dst, sport if sport in (80,8080,8000,8888) else dport, http_text)
                             # Global HTTP req/resp pair feed.
                             self._d_http_transaction(ts, src, dst, sport, dport, http_text)
+                        except Exception:
+                            pass
+                    elif dport == 3128 or sport == 3128:
+                        # Proxy-only port: just the proxy-auth NTLM check, not the web detectors.
+                        try:
+                            self._d_http_ntlm(src, dst, sport, dport,
+                                              payload_bytes[:4096].decode("utf-8", errors="replace"))
                         except Exception:
                             pass
                     if dport == 3389 or sport == 3389:
@@ -6091,7 +6220,7 @@ class PcapAnalysis:
                             self._d_ntlm(src, dst, sport, dport, full)
                             if dport == 88 or sport == 88:
                                 self._d_krb_roast(src, dst, 88, full)
-                            if dport in (80, 8080, 8000, 8888) or sport in (80, 8080, 8000, 8888):
+                            if dport in self.HTTP_NTLM_PORTS or sport in self.HTTP_NTLM_PORTS:
                                 self._d_http_ntlm(src, dst, sport, dport,
                                                   full[:16384].decode("utf-8", errors="replace"))
                         except Exception:
@@ -6111,7 +6240,9 @@ class PcapAnalysis:
             src_host["ports_connecting"].add(dport)
             dst_host["ports_listening"].add(dport)
 
-            payload = bytes(pkt[Raw].load) if Raw in pkt else b""
+            # Fall back to the UDP payload bytes when scapy dissected it (e.g. an LLMNR layer
+            # loaded elsewhere), so the wire-format parsers below still see the query.
+            payload = bytes(pkt[Raw].load) if Raw in pkt else bytes(pkt[UDP].payload)
 
             if dport in (5355, 137, 5353):
                 self._d_name_resolution(src, dst, dport, payload)
@@ -6162,7 +6293,8 @@ class PcapAnalysis:
                             "ts": ts, "src": src, "query": qname, "qtype": qtype,
                         })
                         src_host["dns_names"].add(qname)
-                        self._d_dns_extras(qname, src)
+                        self._d_dns_extras(qname, src,
+                                           via="mDNS" if 5353 in (sport, dport) else "DNS")
                         self._domain_from_dns(qname, src)
                         self._d_dns_query_vuln(qname, qtype, src)
                     except Exception:

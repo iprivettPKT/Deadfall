@@ -251,14 +251,27 @@ evidence, and a remediation suggestion.
 
 - **NTLMSSP capture + hash assembly** — NTLMv1/v2 Type 2 (challenge) and
   Type 3 (response) with `DOMAIN\user@workstation` extraction, over SMB,
-  LDAP, MSSQL, and HTTP (base64 `Authorization`/`WWW-Authenticate: NTLM`).
+  LDAP, MSSQL, and HTTP (base64 `Authorization`/`WWW-Authenticate: NTLM`,
+  plus `Proxy-Authorization`/`Proxy-Authenticate`, tagged `HTTP-Proxy`).
   Type 2 and Type 3 are paired per connection into complete,
   hashcat-crackable NetNTLMv2 (`-m 5600`) / NetNTLMv1 (`-m 5500`) strings,
   surfaced in the **AD / hashes** tab. Messages that span multiple TCP
   segments are reassembled, so large handshakes aren't missed.
 - **LLMNR / NBT-NS / mDNS poisoning opportunities** — any broadcast
   name resolution from a client, flagged with Responder guidance.
-- **WPAD lookups** (DNS and NBT-NS) — classic NTLM-relay foothold.
+- **WPAD auto-discovery** — classic NTLM-relay foothold. Flags `wpad` lookups
+  over DNS, mDNS, LLMNR, and NBT-NS; DHCPINFORM requests for option 252
+  (WinHTTP discovery actually running — option 252 in a routine
+  DISCOVER/REQUEST is ignored); DHCP servers handing out a WPAD URL
+  (option 252 in OFFER/ACK); and `wpad.dat` downloads (discovery succeeded
+  and the client loaded a proxy config). Fetches of other `.pac` files are
+  reported as info — an explicitly configured PAC (e.g. pushed by a
+  VPN/ZTNA agent) is not WPAD. Remediation recommends `DisableWpad=1` +
+  turning off "Automatically detect settings" rather than disabling
+  `WinHttpAutoProxySvc`, which is unsupported and breaks VPN/ZTNA agents.
+- **NTLM to HTTP proxies** — `Proxy-Authorization` NTLM (ports 80, 8080,
+  8000, 8888, 3128) is flagged and its hashes are labelled `HTTP-Proxy`
+  in the AD / hashes tab, separating WPAD/proxy captures from web auth.
 - **DHCPv6 solicit** — mitm6 target.
 - **IPv6 router advertisement** — SLAAC/rogue-RA risk.
 - **ARP spoofing** — duplicate IP→MAC bindings.
